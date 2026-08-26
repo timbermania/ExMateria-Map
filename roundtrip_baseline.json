@@ -1,0 +1,51 @@
+{
+ "coverage": {
+  "mesh": 796,
+  "gns": 121,
+  "texture": 658
+ },
+ "total": {
+  "mesh": 796,
+  "gns": 121,
+  "texture": 658
+ },
+ "total_bytes": {
+  "mesh": 7548151,
+  "gns": 98720,
+  "texture": 86245376
+ },
+ "carry_total": {
+  "mesh": 1103791,
+  "gns": 98720,
+  "texture": 2359296
+ },
+ "carry_by_region": {
+  "mesh": {
+   "AnimatedMesh1": 44476,
+   "AnimatedMesh2": 18168,
+   "AnimatedMesh3": 3824,
+   "AnimatedMesh4": 4504,
+   "AnimatedMesh5": 4188,
+   "AnimatedMesh6": 452,
+   "AnimatedMesh7": 132,
+   "AnimatedMesh8": 132,
+   "AnimatedMeshInstructions": 350880,
+   "GrayscalePalettes": 69632,
+   "Header:pointer-table": 156016,
+   "Lighting": 35781,
+   "PaletteAnimations": 43008,
+   "PolygonRenderProperties": 28672,
+   "PrimaryMesh": 200,
+   "Terrain": 233902,
+   "TextureAnimations": 67840,
+   "TexturePalettes": 9216,
+   "slot0x4C": 32768
+  },
+  "gns": {
+   "GNS records": 98720
+  },
+  "texture": {
+   "Texture": 2359296
+  }
+ }
+}

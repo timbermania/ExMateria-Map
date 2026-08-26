@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "exmateria-map"
+version = "0.1.0"
+description = "FFT PSX map resources: read, write, and prove byte-exactness against the disc."
+readme = "README.md"
+# 3.11 satisfies fft-iso-patcher (3.11), the godot-learning tools venv (3.13)
+# and Blender 5.2's system Python (3.14) at once.
+requires-python = ">=3.11"
+# GPL-3.0, matching the monorepo's own LICENSE. Not incidental: decision 1 makes
+# this a PORT, and both prior implementations of an FFT map writer -- GaneshaDx (C#)
+# and the Ganesha Python line it was ported from -- are GPL-3.0. ADR-0004 decision 18.
+license = { text = "GPL-3.0-or-later" }
+# Stdlib only on purpose. A Blender addon cannot pip-install, and the round-trip
+# instrument must run anywhere the corpus does. Don't add numpy, pydantic, etc.
+dependencies = []
+
+[project.scripts]
+exmateria-map-roundtrip = "exmateria_map.roundtrip:main"
+exmateria-map-dump = "exmateria_map.cli:dump_main"
+exmateria-map-build = "exmateria_map.cli:build_main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+include = ["exmateria_map*"]

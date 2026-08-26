@@ -1,0 +1,36 @@
+{
+ "_": "AXIS 2 of the Blender leg (ADR-0004 decisions 8 and 14) -- expected counts in git.",
+ "_binding": "There is no CI. What makes this binding is that a regression is a diff in a tracked file that someone has to explain -- the same mechanism as the writer's roundtrip_baseline.json. This is a FIXED expectation, not a ratchet: the residue is a property of the frozen 1997 PSX data, not of the addon, so nothing here legitimately moves. roundtrip426.py has deliberately NO --update flag; a baseline the instrument can rewrite is not a binding.",
+ "_derivation": "Every count below was derived OFFLINE by exmateria-map/workspace/expect474.py (stdlib, 1.3 s, no Blender) so that the instrument is not its own oracle -- except verts/corners/distinct_positions/unwelded_verts, which are #426's already-published live measurement and are invariant under a bijective axis map.",
+ "_scope": "Primary mesh only (AnimatedMesh1-8 unmeasured, as everywhere on map #355). The winding evidence covers TEXTURED polygons only -- untextured ones carry no authored normal and so have no second path.",
+ "arrangements": 148,
+ "axis_map": {
+  "blender_from_fft": ["x", "z", "-y"],
+  "reverse_ring": true,
+  "_": "ADR-0004 decision 14. det = +1, so it does not mirror. The 90-degree rotation about up has NO data assertion available -- #460 left four unmirrored survivors tied at the top -- so this constant IS its ratification."
+ },
+ "expect": {
+  "verts": 73485,
+  "corners": 281096,
+  "distinct_positions": 73485,
+  "unwelded_verts": 0,
+
+  "textured_quads": 54416,
+  "aligned": 51734,
+  "anti": 0,
+  "ambiguous": 2448,
+  "degenerate": 234,
+
+  "pre_aligned": 50480,
+  "pre_anti": 1254,
+  "pre_ambiguous": 2448,
+  "pre_degenerate": 234,
+
+  "flipped": 1353,
+  "flipped_tri": 99,
+  "flipped_quad": 1254,
+
+  "floor": 16670,
+  "floor_up": 16209
+ }
+}

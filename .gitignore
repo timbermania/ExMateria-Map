@@ -1,0 +1,13 @@
+.venv/
+.pytest_cache/
+*.egg-info/
+__pycache__/
+*.pyc
+tests/.blender_rt/
+tests/.blender_corpus/
+tests/.blender_calib/
+tests/.blender_reload/
+tests/.blender_debug/
+tests/.blender_bake/
+tests/.blender_authored_rig/
+tests/.blender_live_push/
