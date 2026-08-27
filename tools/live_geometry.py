@@ -1,9 +1,18 @@
 """Push map GEOMETRY into a running battle — a direct RAM write, no savestate.
 
-The texture leg (`live_push.py`) has to round-trip a savestate, because this
-fork cannot write VRAM. Geometry needs no such trick: the map's vertices live
-in **main RAM**, and `PCSX.getMemPtr()` is a writable pointer into it. A poke
-lands on the next frame. It is the faster of the two legs, not the harder one.
+Geometry lives in **main RAM**, and `PCSX.getMemPtr()` is a writable pointer
+into it, so a poke lands on the next frame.
+
+This paragraph used to open "the texture leg has to round-trip a savestate,
+because this fork cannot write VRAM". **That was false**, and it is corrected
+here rather than only superseded elsewhere because the addon's own `CLAUDE.md`
+records a previous false premise in this area that outlived the code by four
+months. The fork writes VRAM perfectly well: `POST /api/v1/gpu/vram/raw` needs
+the rectangle in the QUERY STRING, and a bare POST -- which is what was tried
+-- is a 400 for that reason and no other. Measured [LIVE] 2026-08-26 by A/B/A
+on a Gariland battle. The savestate rig and `tools/vram_swap_sheet.py` are
+deleted; the sheet is pushed by the addon's own button now
+(`addons/exmateria_map/live_vram.py`).
 
     python3 tools/live_geometry.py --map 22 --arrangement 0 [--document doc.json]
 

@@ -794,6 +794,14 @@ def _authority_update(self, context):
         _LIVE_RUNS += 1
         rep = bake_normals(self, context)
         self["exmateria_map/last_bake"] = json.dumps(rep.lines)
+        # The Log records GESTURES, not the continuous solve.  `_live_handler`
+        # bakes on every lamp change and writing an entry per depsgraph update
+        # would bury every export and push in the same pane -- besides putting
+        # a datablock write inside a depsgraph handler, which is where this
+        # module already has four guards against re-entering itself.  Flipping
+        # the authority switch is one gesture, so it gets one line.
+        from .report_log import record
+        record("Lamp authority", self.name, rep.lines)
         _LIVE_SIG[live_key(self)] = lamp_signature(context.scene, self)
     finally:
         _LIVE_BUSY = False
@@ -932,29 +940,28 @@ class MAP_OT_restore_imported_normals(bpy.types.Operator):
 
 
 def _bake_report(layout, ob):
-    """The last bake's lines, in the export leg's shape."""
-    try:
-        lines = json.loads(ob.get("exmateria_map/last_bake") or "[]")
-    except (ValueError, TypeError):
-        return
-    if not lines:
-        return
-    box = layout.box()
-    box.label(text="Last bake:", icon="INFO")
-    for line in lines[:12]:
-        box.label(text=line[:90], icon="INFO")
-    if len(lines) > 12:
-        box.label(text=f"... and {len(lines) - 12} more")
+    """The last bake's lines -- the export leg's renderer, not a third copy.
+
+    It used to be one, and it truncated at 90 where `_stored_report` then
+    wrapped at 88, so the same line read complete under the push panel and cut
+    under this one. Sharing it also gives the bake the status row, the
+    refusals-in-full rule and the clipboard button for free -- and when
+    ADR-0185 decision 5 retired the wrap and the disclosure triangle, the bake
+    followed without an edit, which is the whole point of there being one
+    renderer.
+    """
+    from .import_document import _stored_report
+    _stored_report(layout, ob, "exmateria_map/last_bake", "Last bake:")
 
 
 class MAP_PT_lighting_bake(bpy.types.Panel):
-    """N-panel: seed the lamps, bake them back into the map."""
-    bl_space_type = "PROPERTIES"
-    bl_region_type = "WINDOW"
-    bl_context = "object"
+    """`Map` sidebar, 3D viewport: seed the lamps, bake them back into the
+    map."""
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
     bl_category = "Map"
-    bl_label = "ExMateria Map Lighting Bake"
-    bl_order = 1
+    bl_label = "Lighting Bake"
+    bl_order = 4
 
     @classmethod
     def poll(cls, context):

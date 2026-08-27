@@ -3,7 +3,7 @@
 The chain this grades is the whole point of the decision and no other harness
 covers any of it:
 
-    dump -> the addon's real import operator -> mint a rig Override -> edit it
+    dump -> the addon's real import operator -> edit the state's exposed rig
     -> the addon's real export operator -> `build` -> the resource's 45 bytes
 
 Five checks, and each one names a way the pipe can be built and still be wrong:
@@ -25,14 +25,14 @@ Five checks, and each one names a way the pipe can be built and still be wrong:
    at exactly 4096, so an i16 can move a couple of LSB. The bar is the picture
    -- the angle between the written direction and the one the artist aimed,
    under 0.05 degrees.
-5. **NOT EXPORTED**  an Override on a state that can hold no rig (a texture row,
-   or a mesh row whose `0x64` is zero) is WARNED about and left preview-only.
-   Decision 25 allows minting on a borrowing state deliberately, so refusing
-   would turn an ordinary preview action into a failed export.
+5. **NOT EXPORTED**  an AUTHORED rig on a state that can hold none (a texture
+   row, or a mesh row whose `0x64` is zero) is WARNED about and left
+   preview-only. The rig is exposed on every state, borrowing ones included, so
+   refusing would turn an ordinary preview action into a failed export.
 
-The seed arm is check 1's "no other state": the same run mints on exactly one
-state of 21, so a leg that declared blindly fails here rather than reading green
-on a document nobody compared.
+The seed arm is check 1's "no other state": all 21 states are exposed and the
+run edits exactly one, so a leg that declared on exposure rather than on an edit
+fails here rather than reading green on a document nobody compared.
 
 Run:  python3 tests/blender_authored_rig.py [blender-binary]
       (needs EXMATERIA_ASSETS_DIR, like the corpus harness)
@@ -119,15 +119,18 @@ else:
     # unless the artist hands them the map -- which this harness never does.
     # The old `live_bake = False` here was guarding against a default of True.
 
-    def mint(i):
+    def expose(i):
+        """Select state `i` and hand back the rig it is ALREADY exposed with.
+
+        There is no gesture in between any more: `ensure_rig_exposure` seeded
+        every state at import."""
         ob["exmateria_map/preview_state"] = i
-        r = bpy.ops.exmateria_map.mint_rig_override()
-        return r, mod.find_override(ob, i)
+        return mod.find_override(ob, i)
 
     # 1. the state that CAN receive bytes
-    r, ov = mint(RIG_STATE)
+    ov = expose(RIG_STATE)
     if ov is None:
-        fail("minting an Override on state %d did nothing: %r" % (RIG_STATE, r))
+        fail("state %d was not exposed by the import" % RIG_STATE)
     else:
         ov.ambient = AMBIENT
         for k, name in enumerate(mod.MAP_PG_rig_override.GAINS):
@@ -137,18 +140,27 @@ else:
         # Push the Override's gradient OFF the state's own. Seeded from this
         # state it is identical, and then "the export echoed the state's
         # gradient" is satisfied by an export that echoed the OVERRIDE's -- an
-        # inert check that reads exactly like a live one. This is the shape an
-        # Override minted on a BORROWING state arrives in: decision 25 seeds it
-        # from the lender, gradient included.
+        # inert check that reads exactly like a live one. This is the shape a
+        # BORROWING state's exposed rig arrives in: it is seeded from the
+        # lender, gradient included.
         ov.gradient = tuple((g + 7) % 256 for g in ov.gradient)
         report["typed"] = mod.override_rig(ov)
 
-    # 2 and 3. states that CANNOT -- decision 25 lets the artist mint on both,
-    # and export must warn rather than refuse.
+    # 2 and 3. states that CANNOT -- the artist may author on both, and export
+    # must warn rather than refuse.
+    #
+    # These are EDITED, not merely exposed.  Every state carries an Override
+    # now, so existence warns about nothing; what the artist MOVED is the
+    # signal, and moving something is what has to draw the warning.  Without
+    # the edit this arm grades an export that never warns at all.
     for i in (TEXTURE_STATE, CHUNKLESS_STATE):
-        r, ov = mint(i)
+        ov = expose(i)
         if ov is None:
-            fail("minting an Override on state %d did nothing: %r" % (i, r))
+            fail("state %d has no exposed rig to author on" % i)
+        else:
+            ov.ambient = tuple(min(1.0, c + 0.25) for c in ov.ambient)
+            if not mod.rig_is_dirty(ov):
+                fail("editing state %d's ambient left it reading clean" % i)
 
     report["overrides"] = sorted(o.state_index
                                  for o in ob.exmateria_map_rig_overrides)
@@ -202,6 +214,8 @@ else:
             ob2.select_set(True)
             report["reimport_overrides"] = sorted(
                 o.state_index for o in ob2.exmateria_map_rig_overrides)
+            report["reimport_dirty"] = sorted(
+                o.state_index for o in mod.dirty_overrides(ob2))
             try:
                 res3 = bpy.ops.export_map.document(filepath=OUTDIR2)
             except RuntimeError as e:
@@ -315,7 +329,7 @@ def main():
         check("the_scene_leg_completed", False, "; ".join(r["errors"]))
         return verdict()
 
-    print(f"minted Overrides on states {r['overrides']}")
+    print(f"exposed on states {r['overrides']}")
     for line in r.get("export_lines", []):
         print(f"  export: {line}")
 
@@ -421,9 +435,20 @@ def main():
     # --- 6. REOPENED ------------------------------------------------------
     check("reimport_accepts_the_v2_document",
           r.get("reimport_result") == ["FINISHED"], str(r.get("reimport_result")))
-    check("reimport_seeds_no_override", r.get("reimport_overrides") == [],
-          f"{r.get('reimport_overrides')} -- an Override re-seeded from an "
-          f"authored rig re-emits its directions and breaks the identity")
+    # Reopening exposes the rig on every state, as any import does.  What must
+    # NOT come back is a DIRTY one: an Override that read as edited would be
+    # re-emitted through `override_rig`, whose directions do not survive the
+    # unit vector, and the artist's lighting would drift a little every time
+    # they opened the file.  Clean means the authored rig is CARRIED out of the
+    # document's own `map_states` snapshot instead, byte for byte -- which is
+    # what `the_v2_document_is_a_fixed_point` below then proves end to end.
+    check("reimport_exposes_every_state",
+          len(r.get("reimport_overrides") or []) == len(states),
+          f"{r.get('reimport_overrides')} for {len(states)} states")
+    check("reimport_seeds_no_dirty_override", r.get("reimport_dirty") == [],
+          f"{r.get('reimport_dirty')} came back reading as edited -- an "
+          f"Override re-seeded from an authored rig re-emits its directions "
+          f"and breaks the identity")
     again = out_dir2 / f"{name}.json"
     check("the_v2_document_is_a_fixed_point",
           again.exists() and json.loads(again.read_text()) == doc,

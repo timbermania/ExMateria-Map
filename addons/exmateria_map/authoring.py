@@ -314,19 +314,26 @@ _ACTIVE_FACE = {}
 
 
 def _paint_trigger(scene):
-    """§3.3's face-select trigger.
+    """§3.3's face-select trigger: select a face and the paint image re-colours
+    under THAT face's CLUT row, so the artist edits in the palette the face
+    actually reads.
 
     Before the depsgraph's change list, because a selection change need not
-    report as geometry.  Costs one integer read per marker when no sheet is
-    open for painting, which is every scene that is not painting one."""
-    from .paint import on_trigger, paint_image_name, sheet_of_state
+    report as geometry.  The whole body is behind the no-paint-image early-out,
+    so a scene that is not painting pays one dictionary lookup per marker."""
+    from .paint import (active_face_index, on_trigger, paint_image_name,
+                        sheet_of_state)
     for ob in markers(scene):
         try:
             sheet = sheet_of_state(
                 ob, int(ob.get("exmateria_map/preview_state") or 0))
             if not sheet or bpy.data.images.get(paint_image_name(sheet)) is None:
                 continue
-            active = ob.data.polygons.active
+            # NOT `ob.data.polygons.active`: it FREEZES in Edit Mode, which is
+            # the only mode that can select a face, so this trigger could never
+            # fire where it was meant to and the paint image never re-coloured
+            # to the face the artist had just clicked.
+            active = active_face_index(ob)
         except (AttributeError, ReferenceError):
             continue
         if _ACTIVE_FACE.get(ob.name) == active:
@@ -612,12 +619,12 @@ class MAP_OT_apply_growth(Operator):
 # ---------------------------------------------------------------------------
 
 class MAP_PT_terrain(Panel):
-    """N-panel: the grid extent, the growth preview, and the drift count."""
-    bl_space_type = "PROPERTIES"
-    bl_region_type = "WINDOW"
-    bl_context = "object"
+    """`Map` sidebar, 3D viewport: the grid extent, the growth preview, and
+    the drift count."""
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
     bl_category = "Map"
-    bl_label = "ExMateria Map Terrain"
+    bl_label = "Terrain"
     bl_order = 3
 
     def draw(self, context):

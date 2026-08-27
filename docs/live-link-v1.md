@@ -65,19 +65,23 @@ holds. *Locate by what is there, write what you aim at.* Graded by `tests/test_l
 (9, `bpy`-free), whose savestates are synthetic because Gariland boots into one state and a
 cross-state aim cannot be staged on it at all.
 
-**What that opens, and it is named on every push rather than fixed here.** Before the fix a
-cross-group aim refused; now it lands, and it moves the sheet without the CLUTs — the exact
-half of decision 9's `(texture_sheet, palettes)` atom that leg 3 exists to close. It is not
-hypothetical: 559 of the corpus's 774 groups carry palettes of their own, so a sheet aimed
-across groups is read through the loaded state's CLUTs. `describe()` prints `UNPUSHED`'s
-palette entry on every push for exactly this reason. **Aim within one group until leg 3
-lands**, or expect garbage rather than a stale picture.
+**That gap is closed (2026-08-26).** It used to say *"aim within one group until leg 3
+lands, or expect garbage rather than a stale picture"* — a cross-group aim moved the sheet
+without the CLUTs, half of decision 9's `(texture_sheet, palettes)` atom, and 559 of the
+corpus's 774 groups carry palettes of their own. The warning is deleted rather than softened
+because **its reason is gone**: the button now pushes both halves, planning each before
+applying either, so an aim that cannot resolve one does not move the other. Neither field is
+in `UNPUSHED` any more.
 
-`tools/live_push.py` needed **nothing** *of the thinning ADR-0005 asked for*. The handoff expected the same duplication there;
-it has none — it carries no addresses, no strides and no write path, only the savestate
-round trip and `vram_swap_sheet`. Its transport stays `pcsx-agent`, which buys it automatic
-screenshots the core's client has no reason to grow. What ADR-0005 still wants from it is a
-*port* of the VRAM leg into the addon, which is a different job from thinning.
+`tools/live_push.py` and `tools/vram_swap_sheet.py` are **deleted**. ADR-0005 wanted the VRAM
+leg *ported* into the addon; what actually happened is that the thing to port turned out not
+to be needed. The savestate round trip existed solely because two docstrings held that this
+fork cannot write VRAM, and **that was false** — `POST /api/v1/gpu/vram/raw` writes perfectly
+well, and a bare POST is a 400 only because the rectangle belongs in the query string.
+Measured [LIVE] by A/B/A on a Gariland battle, 2026-08-26. What survived the move is the
+geometry (`locate`, `identify`, `diff`, the page stride and row pitch), which was always
+about VRAM; the savestate was only ever the container it was read through. The origin drift,
+the search window, the live cache and the size-settling poll went with the container.
 
 One thing the button settled for free. Every earlier proof pushed a document from `dump`;
 the button pushes one **assembled out of Blender**, so `export(import(doc)) == doc` — 148/148
@@ -357,6 +361,81 @@ The control that works is **three screenshots and a pixel diff** — a live batt
 ~6,500-subpixel floor, a dead one is byte-identical — and it is worth spending before any
 rendering claim. Launch with `-iso <cue> -run` and let the game reach the shell first.
 
+### 2.3 The picture: the sheet is VRAM, the palettes are RAM
+
+The two halves of decision 9's `(texture_sheet, palettes)` atom live in different memories,
+and the obvious guess about the second one is wrong.
+
+**Both addresses are derived, not assumed.** The engine's own packets carry the VRAM
+addresses it is rendering from, so the sheet and the CLUT block can be located without
+reading a pixel. On MAP022 a0, measured [LIVE] 2026-08-26:
+
+    live_tpage_low4 - doc_texture_page  = 12       385 of 385 polygons
+    live_clut       - doc_palette_id    = 0x7800   385 of 385 polygons
+
+A TPAGE's low nibble is the x base in 64-pixel units, so 12 is x = 768 with the y bit clear;
+a CLUT attribute packs `(y << 6) | (x >> 4)`, so 0x7800 is y = 480, x = 0. A content scan of
+a VRAM GET agrees independently — the sheet's own rows locate at byte offset 1536, which is
+exactly (768, 0) — and `identify` names `MAP022.8` at 0 bytes different while all nine other
+sheet-sized `MAP022.*` resources differ. **One disagreeing witness is a refusal, not a vote**
+(`live_vram.derive_addresses`): 385 agreeing is what makes the address knowledge, and writing
+131,072 bytes on the strength of 384 is how a rig corrupts VRAM with confidence.
+
+Note a constraint that falls out of the nibble: the four pages must all fit, so `base + 3 ≤
+15` and **x = 768 is the rightmost a four-page sheet can sit.**
+
+**The sheet is written to VRAM, in four rectangles.** `POST .../vram/raw?x&y&width&height`,
+one per page, at `(768 + p*64, 0)` 64×256. Each body is a *contiguous slice* of the packed
+blob — the sheet is page-major and a rectangle's body is row-major at the same 128 bytes a
+row, so no reshaping is involved. A single 256-wide rectangle would interleave the four pages
+a row at a time, which is why four POSTs are the cheap shape and one is the expensive one.
+
+**The palettes are NOT written to VRAM, and this is the finding.** Their address is right and
+it is not a sink. Measured by writing one CLUT row and reading it back at four delays, with a
+sheet write made in the same session as the control:
+
+    VRAM (x=80, y=480)      written, 0/32 differ immediately
+                            32/32 back to the ORIGINAL bytes at 50 ms, 0.2 s and 1 s
+    VRAM sheet row          written, 0/128 differ immediately AND after 1 s
+    RAM 0x800E4EA4 + 160    written, 0/32 differ after 1 s, and VRAM's row 5
+                            moved to match within 0.3 s
+
+The engine re-uploads the whole CLUT block from main RAM every frame and does **not**
+re-upload the sheet. So a palette push aimed at VRAM works for one frame — long enough to
+read back as a success, far too short for the artist to see. `0x800E4EA4` is the block that
+feeds it; it matched the live VRAM CLUT rows 0 of 512 bytes different.
+
+**A second copy of those 512 bytes sits at `0x80099D76`, and a push into it does not reach
+the screen** — writing row 5 there moved 0 of 32 VRAM bytes. A content scan finds both, so
+the address is not trusted for being written down: `live_link.check_clut_block` compares the
+block against what the GPU is actually showing before a byte of it is written, which is
+decision 2's locate-by-verify at the one address here a scan cannot settle.
+
+That block was first written up here as an *"inert twin"*, which was right about its
+behaviour and **wrong about what it is** (corrected 2026-08-27, #624). It is the map's own
+`0x44` chunk as the loader left it, and it is not idle: the palette-animation routine writes
+every animated frame into **both** blocks in one loop body — `0x800926AC` into this one,
+`0x8009269C` into `CLUT_BLOCK`, same function, `ra = 0x80092794`, confirmed by watchpoint
+(60 and 20 hits, one writer each). A push into it is ineffective because nothing re-uploads a
+*static* row from either block after map load, not because the block is dead. Anything that
+later wants to hold an **animated** row has to contend with both.
+
+**Some CLUT rows are engine-animated and cannot be pushed.** Writing all 16 and reading back
+named rows 13, 14 and 15 as reverted on MAP022 a0. That set is *reported from the readback,
+never predicted* (decision 3): the period is unknown, and a probe short enough to run inside
+a press can report "nothing animated" on a map that animates. It is also why no disc resource
+matches all 16 live rows — the live block differs from `MAP022.9`'s own `0x44` chunk by 35
+bytes over rows 0, 7, 8, 10, 13 and 14. That is the palette **animation**, whose source chunk
+`mapfile.PALETTE_ANIM_PTR` (`0x70`) is populated and still has no reader.
+
+**Where the bytes come from.** `export_document.export_sheets` already computes
+`png_indexed.pack_4bpp(indices)` — exactly the 131,072-byte blob the push needs — and used to
+discard it after hashing. `assemble()` surfaces it on the report now, so push and disc are the
+same bytes *by construction*: the sidecar's name **is** that blob's SHA-256. PNG-encoding here
+and decoding again in the pusher would be two more chances to differ and no more truth.
+
+---
+
 ## 3. Coverage of the document
 
 | document field | live sink | state |
@@ -368,8 +447,8 @@ rendering claim. Launch with `-iso <cue> -run` and let the game reach the shell 
 | `polygons[].texture_page` | packet TPAGE field | **built** — 385/385 [LIVE] |
 | `polygons[].visible_angles` | vertex 1's 4th short | **located** [LIVE] |
 | `polygons[].terrain` (binding) | vertex 0's 4th short | **located** [LIVE] |
-| `map_states[].texture_sheet` | VRAM | **built** — `live_push.py` [LIVE] |
-| `map_states[].palettes` | VRAM CLUT rows | same leg, unverified |
+| `map_states[].texture_sheet` | VRAM, four page rectangles at the derived column | **built** — the addon's button, `live_vram.py`, A/B/A screenshot [LIVE] |
+| `map_states[].palettes` | `0x800E4EA4` in **main RAM** — *not* the VRAM CLUT rows | **built** — the addon's button, `live_link.py`, A/B/A screenshot [LIVE] |
 | `map_states[].light_rig` | `0x800F5AF4` + `0x800F5B14` + `0x800F5B40`,
   **and** GTE `cnt13-15` / `cnt16-20` | **built** — §2.2, 20/20 fake-RAM, A/B/A [LIVE] |
 | `terrain` | terrain chunk in RAM | **not located** — decision 4 |
@@ -1002,11 +1081,13 @@ all**, so the original order pushed data the artist could not change.
 
 The order is therefore **the rig, then palette authoring, then the sheet**:
 
-1. **The rig.** The one thing on the list the artist can fully author today — mint an
-   Override, export promotes it, `build` writes 45 bytes (decision 27, proven to reach a
-   disc) — and the one whose edit is currently **invisible in PCSX**. Smallest of the three.
-2. **Palette authoring**, its own ticket and its own ADR decision: a CLUT editor plus one
-   write-back in `assemble`.
+1. **The rig.** The one thing on the list the artist can fully author today — every
+   state's rig is exposed, export promotes the ones edited, `build` writes 45 bytes
+   (decision 27, proven to reach a disc) — and the one whose edit is currently
+   **invisible in PCSX**. Smallest of the three.
+2. **Palette authoring** — **built**: the 16×16 CLUT image is the edit surface and
+   `export_palettes` re-emits `map_states[].palettes` from it. What is left here is the
+   *push*, not the authoring.
 3. **The sheet + palette push**, once there is something to push.
 
 *"Follow the previewed state"* is not a fourth piece. It is a parameter to 1 and 3 and ships

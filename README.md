@@ -19,6 +19,22 @@ uv run exmateria-map-dump  22 0 ./MAP022.a0      # document + PNG sidecars
 uv run exmateria-map-build ./MAP022.a0/MAP022.a0.json ./bundle
 ```
 
+### Or don't run either — the addon vendors this package
+
+An artist installing the Blender addon should never meet those two commands.
+The addon ships a verbatim copy of this package under `_vendor/`, so:
+
+- **File ▸ Import ▸ FFT Map (.GNS)** — pick a `MAP###.GNS` out of the extracted
+  disc tree. The path is the whole address: its folder is the tree and
+  `name[3:6]` is the number, so nothing else is asked for. A sidebar dropdown
+  picks the arrangement on the 20 maps that have more than one.
+- **File ▸ Export ▸ FFT Map bundle** — pick a folder and get the GNS verbatim
+  plus one blob per resource: the same bundle `exmateria-map-build` writes,
+  byte for byte, ready for the patcher.
+
+Patching the ISO is still `fft-iso-patcher`'s job and still a CLI trip;
+authorship is not. ADR-0004 decision 31.
+
 `build`'s whole model is one sentence: **new bytes = base bytes, with the named
 chunks replaced**. The `0x40` primary mesh, the `0x44` palettes, the `0x68`
 terrain grid and the `0xB0` visible-angle table are written from the document;
@@ -137,9 +153,11 @@ Reading `148/148` as `1,575/1,575` is the error the report exists to prevent.
 The **Blender leg** is guarded separately and does not run here:
 `tests/blender_corpus.py` drives the real addon operators over the same 148
 arrangements and asserts `export(import(doc)) == doc` whole-document. Composed
-with this instrument that closes the chain — and it is also checked directly,
-end to end through Blender and back through `build`, on the acceptance map
-(`docs/map-to-disc-gate.md`).
+with this instrument that closes the chain — and `tests/blender_gns_bundle.py`
+checks it directly, end to end: a `MAP###.GNS` imported into Blender and
+exported back out as a bundle, asserted **byte for byte** against what
+`exmateria-map-dump | exmateria-map-build` produces from the same untouched
+map.
 
 ## Origins
 

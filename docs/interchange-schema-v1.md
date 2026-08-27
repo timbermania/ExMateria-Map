@@ -22,6 +22,7 @@ disc bytes. Anything this document does not pin is in the [gaps](#9-gaps-and-the
 |---|---|
 | **Document name** | `<MAP>.a<arrangement>.json` — `MAP001.a0.json` (`schema`) |
 | **Sidecar name** | `<MAP>.a<arrangement>.sheet-<sha256[:8]>.png`, one file per *distinct* texture sheet, deduplicated by the sheet's 131,072-byte sha256 (`schema`; decision 3 makes the sheet external art *per map state*, and 76 of 121 maps carry more than one distinct sheet in an arrangement — up to 8 — so dedup is what keeps the sidecar count sane: `MAP005` a0 has 10 sheet rows, 7 distinct) |
+| **Painting name** | `<MAP>.a<arrangement>.source-<sha256[:8]>.png`, one file per *distinct* painting, deduplicated by the picture's own 786,432 RGB bytes (ADR-0186 decisions 5, 6). Present only on a **converted** map; see §7.3b |
 | **Layout** | document and all sidecars in one directory; `map_states[].texture_sheet` is a bare file name in that directory (`schema`) |
 | **PNG** | 256 × 1024, 8-bit indexed (decision 6; GaneshaDx `TextureResourceData.cs:15-16` — `TextureWidth = 256`, `TextureHeight = 1024`); pixel `v` is the disc row. The PLTE the exporter writes is display-only (majority-vote colours); **indices are authoritative**, `build` ignores PLTE (decision 6) |
 
@@ -66,7 +67,8 @@ them.
   "polygons": [ … ],
   "terrain": [ … ],
   "map_states": [ … ],
-  "carry": { … }
+  "carry": { … },
+  "source_art": { … }
 }
 ```
 
@@ -77,6 +79,7 @@ them.
 | `terrain` | array or `null` | decisions 11, 22, 23 |
 | `map_states` | array, one entry per non-pad GNS row of the arrangement | decisions 3, 4, 6 |
 | `carry` | object | decisions 3, 6 |
+| `source_art` | object, **absent** unless the map has been converted | ADR-0186 decisions 4, 5, 6 |
 
 The polygon **list order is the on-disk order**: buckets in the order
 `textured_triangle`, `textured_quad`, `untextured_triangle`, `untextured_quad`, and within
@@ -369,6 +372,51 @@ naive rule fails). `build` fans the written chunk out to every resource whose ba
 is byte-identical to `terrain_source`'s base payload (decision 2's correspondence
 principle); every other `0x68` chunk — garbage or not — is carried untouched.
 
+### 7.3b `source_art` — the Painting
+
+A map carries **two pictures**: the **Sheet** (`map_states[].texture_sheet`, the
+131,072-byte 4bpp resource the game reads) and the **Painting** (the artist's own
+true-colour picture on the converted authoring path). ADR-0186 Amendment 3 records
+which half survives on which path; this section is the Painting's schema.
+
+```json
+"source_art": {
+  "MAP022.a0.source-0ea1b3c7.png": { "states": [0, 1, 2] },
+  "MAP022.a0.source-9f42d10b.png": { "states": [3] }
+}
+```
+
+| field | type | meaning |
+|---|---|---|
+| *key* | string | a bare sidecar file name in the document's directory (§1) |
+| `states` | array of int | the `map_states` indices this painting is the source for, ascending |
+
+Four properties, each a decision rather than a convenience:
+
+- **It is absent, not empty, on an unconverted map.** ADR-0186 decision 7's shape:
+  *the presence of `source_art` is the declaration*, so a document that never met
+  the compile is byte-for-byte the document it always was — which is what
+  `export(import(doc)) == doc` asserts over all 148 corpus arrangements.
+- **It never sits in `map_states[].texture_sheet`.** `build` reads only what that
+  field names, and never enumerates the document's keys, so it is blind to source
+  art **by construction** rather than by a rule someone has to keep. That is checked
+  rather than asserted: `tests/test_source_art.py` builds the same map with and
+  without the section and compares every resource byte, with a positive control
+  that puts the same name in `texture_sheet` and watches `build` refuse.
+- **It does not raise the `version` floor.** §2's floor names the oldest `build`
+  that can honour the document. A v1 `build` handed source art ignores it and emits
+  the **right** map, because the compile has already written the sheet sidecars
+  `texture_sheet` names — unlike `authored_light_rig`, which a v1 `build` would drop
+  and so emit a wrong one.
+- **The PNG is 8-bit TRUECOLOUR (colour type 2), not indexed.** A painting has no
+  palette; that is the whole point of the path it belongs to. The two sidecar kinds
+  share a directory and a `.png` suffix, so each reader refuses the other's colour
+  type outright (`png_indexed.read_rgb_png` / `read_indexed_png`).
+
+The file name's hash is over the RGB bytes, not over the PNG, so two identical
+paintings share one file whatever the encoder chose — the same rule the sheets use,
+where the name comes from the packed 4bpp rather than from the image.
+
 ## 8. `carry`
 
 The per-resource items `build` takes from the base that are not in the document's data
@@ -532,17 +580,18 @@ instrument names them rather than dropping them.
 bytes at pointer `0x64` of the state's own resource; `mapfile.pack_light_rig` is
 the reader's exact inverse on **776 of 776** rig-bearing mesh resources across
 the corpus. The write is graded end to end by `tests/blender_authored_rig.py` —
-`dump` → the real import operator → mint a rig Override → edit it → the real
-export operator → `build` → the bytes — 20 checks: declared on the writable
+`dump` → the real import operator → edit the state's exposed rig → the real
+export operator → `build` → the bytes — 21 checks: declared on the writable
 state and no other, `version: 2`, the gradient echoed from the state (not from
 the Override, which the harness deliberately pushes off it so the check is not
 inert), ambient and the gains byte-exact, **only that resource and only those 45
 bytes moved**, a direction inside 0.05° of the aim, and
 `export(import(v2 doc)) == v2 doc` so reopening a saved map does not lose the
-artist's lighting. An Override on a state
+artist's lighting. An **authored** rig on a state
 that can hold no rig — a texture row, or a mesh row whose `0x64` is zero — is
-**warned about and left preview-only**, never refused: decision 25 allows minting
-on a borrowing state deliberately.
+**warned about and left preview-only**, never refused: the rig is exposed on
+borrowing states deliberately, so refusing would turn an ordinary preview action
+into a failed export. Exposure alone never warns; only an edit does.
 
 **End to end, on the acceptance map.** `dump` MAP022 a0 → the addon's real import
 operator → the addon's real export operator → `build` → 20 resources + the GNS, all

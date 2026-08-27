@@ -180,11 +180,51 @@ MUTATIONS = [
      "        state[AUTHORED_RIG] = rig",
      "        pass  # MUTANT: the Override stays on screen and never ships",
      "rig"),
-    ("export_promotes_to_every_state", EXPORT,
-     "        ov = find_override(ob, i)\n        if ov is None:\n            continue",
-     "        ov = find_override(ob, i) or next(\n"
-     "            iter(ob.exmateria_map_rig_overrides), None)  # MUTANT\n"
-     "        if ov is None:\n            continue", "rig"),
+    # Replaces `export_promotes_to_every_state`, which is obsolete: every state
+    # carries an Override now, so its "fall back to the first one" mutation
+    # would patch cleanly and change nothing.  The live risk is the opposite --
+    # declaring on EXISTENCE, which is what exposure would resurrect.
+    # The panel's provenance LINE, keyed on existence rather than dirty: it
+    # tells the artist an untouched map is not the ROM's, and makes the four
+    # honest branches unreachable.  Shipped once; caught by nothing until
+    # `panel_clean_rig_is_not_called_edited` existed.
+    ("panel_calls_an_unedited_rig_edited", IMPORT,
+     "        if ov is not None and rig_is_dirty(ov):\n"
+     '            layout.label(text="light: EDITED',
+     "        if ov is not None:  # MUTANT\n"
+     '            layout.label(text="light: EDITED', "rt"),
+    ("export_promotes_an_unedited_rig", EXPORT,
+     "        if ov is None or not rig_is_dirty(ov):",
+     "        if ov is None:  # MUTANT: exposure alone declares",
+     "rt"),
+    # Dirty compared in the PACKED BYTES rather than the editing units: the
+    # trap the whole exposure design turns on.  A direction is re-emitted at
+    # exactly 4096 while the disc runs 4094.4-4096.7, so this calls almost
+    # every untouched rig dirty.
+    ("rig_dirty_measured_in_packed_bytes", IMPORT,
+     "    return editing_units(ov) != ov.seed_units",
+     "    return json.dumps(override_rig(ov)) != ov.seed_units  # MUTANT",
+     "rt"),
+    # --- the palette writer -------------------------------------------------
+    ("export_never_reemits_palettes", EXPORT,
+     '        state["palettes"] = rows_out',
+     "        pass  # MUTANT: the authored colours never leave the image",
+     "rt"),
+    ("export_invents_palettes_for_a_null_state", EXPORT,
+     "        if not rows_in:\n            continue                      # `palettes: null` stays null",
+     '        if not rows_in:\n            rows_in = [{"colors": ["#000000"] * 16,\n'
+     '                        "stp": 0} for _ in range(16)]  # MUTANT',
+     "rt"),
+    ("export_drops_the_stp_mask", EXPORT,
+     "            rows_out.append(dict(ent, colors=colors))",
+     '            rows_out.append({"colors": colors, "stp": 0})  # MUTANT',
+     "rt"),
+    # The cold-cache CLUT-edit refusal.  Only fires on the SECOND session with
+    # a file, which is why it needs a seed rather than a reviewer.
+    ("paint_cold_baseline_uses_the_current_entries", PAINT,
+     "        was = expand(buffer, was_entries)",
+     "        was = expand(buffer, entries)  # MUTANT",
+     "rt"),
     ("export_writes_the_overrides_gradient", EXPORT,
      '        rig["gradient"] = list(base_rig.get("gradient") or [0] * 6)',
      "        pass  # MUTANT: the artist's 6 carried bytes, not the state's",

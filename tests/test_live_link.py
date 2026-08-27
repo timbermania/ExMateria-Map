@@ -743,18 +743,30 @@ def test_the_light_rig_has_left_unpushed_because_it_has_a_sink():
     assert live_link.plan_rig_gte(_rig())
 
 
-@pytest.mark.parametrize("field", ["map_states[].palettes",
-                                   "map_states[].texture_sheet"])
-def test_every_per_state_field_without_a_sink_is_named(field):
-    """Decision 4: push what has a sink and NAME what was skipped, never refuse.
+def test_the_sheet_and_the_palettes_are_no_longer_named_as_unpushed():
+    """The mirror of decision 4's failure, and the ratchet's other arm.
 
-    §3's coverage table lists three per-state data fields; the light rig has a
-    sink of its own now (§2.2) and these two are what is left. The panel reads `UNPUSHED` on every
-    push, so a field missing from it is dropped SILENTLY -- the one thing
-    decision 4 forbids, and the reason the artist's "I changed the preview
-    state and nothing happened" had no answer on screen.
+    Naming a field that IS pushed is as bad as dropping one silently: the
+    artist reads "not pushed: map_states[].texture_sheet" beside a repaint they
+    can see on screen, and stops trusting the box. Both of these left
+    `UNPUSHED` the way the light rig did -- by getting a sink -- and this test
+    is what stops them drifting back in.
+
+    The sinks are in two different memories, which is the whole subtlety of the
+    leg: the sheet's pixels are VRAM and stay there, the palettes are VRAM's
+    CLUT rows and are re-uploaded from main RAM every frame, so the palette
+    push goes to RAM (`CLUT_BLOCK`) and the sheet push goes to VRAM.
     """
-    assert field in live_link.UNPUSHED
+    assert "map_states[].texture_sheet" not in live_link.UNPUSHED
+    assert "map_states[].palettes" not in live_link.UNPUSHED
+    assert live_link.plan_palettes(_palettes())
+
+
+def test_what_is_left_in_unpushed_really_has_no_sink():
+    """The ratchet's first arm: the two that remain are named because nothing
+    writes them, not because nobody revisited the list."""
+    assert set(live_link.UNPUSHED) == {"the terrain grid",
+                                       "polygons[].unknown_untextured"}
 
 
 # --- bytes 6-7: the binding word and VISIBLE_ANGLES (#598) -------------------
@@ -1164,3 +1176,379 @@ def test_a_grown_slots_masked_field_still_keeps_the_engines_bits():
                                     [{"palette_id": 9}, {"palette_id": 9}],
                                     bytes(current))
     assert [struct.unpack("<H", b)[0] for _, b in writes] == [0x7809, 0x7809]
+
+
+# --- the self-check's DIAGNOSIS (#598 follow-up) -----------------------------
+# It used to raise on the FIRST plan whose candidates both mismatched, and it
+# iterated in sorted order -- metadata, normals, positions. So an emulator
+# holding a previous session's baked normals failed at `normals` and reported
+# "the loaded map is not this document's map" while holding, unexamined, the
+# proof that it is. Measured on a live battle: positions 0 of 8,664 differ,
+# metadata 0 of 1,444, normals 7,589 of 8,664.
+
+def _results(**kw):
+    """`{(bucket, field): (matched, differ, total)}`, the shape the UI builds."""
+    return {("textured_quad", f): spec for f, spec in kw.items()}
+
+
+def test_a_clean_selfcheck_passes_and_names_what_it_found():
+    ok, lines = live_link.diagnose_selfcheck(_results(
+        positions=("the base map's own bytes", 0, 8664),
+        normals=("the base map's own bytes", 0, 8664),
+        metadata=("the base map's own bytes", 0, 1444)))
+    assert ok
+    assert any("base map" in ln for ln in lines)
+
+
+def test_normals_alone_differing_is_a_PREVIOUS_PUSH_and_proceeds():
+    """The whole point. Positions and metadata matching at the addresses this
+    module computed IS the arithmetic proof the check exists to get; normals
+    differing on top of that says somebody pushed lighting here, which is the
+    one cause that is harmless. Refusing walls the artist in, because
+    `_LAST_PUSH` is only recorded on a SUCCESSFUL push -- so a refusal can
+    never establish the memory that would let the next press through."""
+    ok, lines = live_link.diagnose_selfcheck(_results(
+        positions=("the base map's own bytes", 0, 8664),
+        metadata=("the base map's own bytes", 0, 1444),
+        normals=(None, 7589, 8664)))
+    assert ok, lines
+    said = " ".join(lines)
+    assert "normals" in said
+    assert "already" in said.lower() or "previous" in said.lower()
+
+
+def test_it_does_NOT_claim_the_wrong_map_when_positions_matched_exactly():
+    """The sentence that sent this back. Positions and metadata matching to the
+    byte is incompatible with 'the loaded map is not this document's map', and
+    saying it anyway sends the artist to reload a savestate that was never the
+    problem."""
+    _ok, lines = live_link.diagnose_selfcheck(_results(
+        positions=("the base map's own bytes", 0, 8664),
+        metadata=("the base map's own bytes", 0, 1444),
+        normals=(None, 7589, 8664)))
+    said = " ".join(lines).lower()
+    assert "not this document's map" not in said
+    assert "arithmetic is wrong" not in said
+
+
+def test_positions_differing_is_still_refused():
+    """Geometry at the computed addresses not holding the document's own bytes
+    is the case the check was built for, and it stays a refusal."""
+    ok, lines = live_link.diagnose_selfcheck(_results(
+        positions=(None, 4000, 8664),
+        metadata=(None, 900, 1444),
+        normals=(None, 7589, 8664)))
+    assert not ok
+    said = " ".join(lines)
+    assert "arithmetic" in said and "reload the savestate" in said
+
+
+def test_the_refusal_reports_EVERY_plan_not_the_first_one_to_fail():
+    """Three fields, three different stories. Reporting only the first meant
+    the pessimistic one won on alphabetical order."""
+    ok, lines = live_link.diagnose_selfcheck(_results(
+        positions=(None, 4000, 8664),
+        metadata=("the base map's own bytes", 0, 1444),
+        normals=(None, 7589, 8664)))
+    said = " ".join(lines)
+    assert not ok
+    assert "4,000" in said and "7,589" in said and "1,444" in said
+
+
+# ---------------------------------------------------------------------------
+# The palette leg: `map_states[].palettes`, and its sink is main RAM.
+# ---------------------------------------------------------------------------
+
+def _palettes(n=16, entries=16):
+    """The DOCUMENT's shape, from `docs/interchange-schema-v1.md` §6.4:
+    `{"colors": ["#RRGGBB" x 16], "stp": u16}` per CLUT -- **not** the raw
+    BGR555 words `mapfile.read_palettes` returns.
+
+    Getting this wrong is not hypothetical: the first version of these tests
+    invented the disc reader's shape, every one of them passed, and the button
+    raised `int() argument must be a string...` on the first real document. A
+    fixture is only an oracle if it comes from the spec.
+    """
+    return [{"colors": [f"#{(r * 16 + c) * 3 % 256:02X}0000"
+                        for c in range(entries)], "stp": 0}
+            for r in range(n)]
+
+
+def _raw_palettes(n=16, entries=16):
+    """The DISC's shape -- what `mapfile.read_palettes` returns."""
+    return [[(r * 16 + c) | 0x8000 for c in range(entries)] for r in range(n)]
+
+
+def test_the_palette_block_is_planned_as_one_write_per_declared_row():
+    """The CLUT block is 16 rows of 16 BGR555 words at `CLUT_BLOCK`, and the
+    engine re-uploads it to VRAM's y=480 every frame. Measured [LIVE] on a
+    Gariland battle 2026-08-26: a write to VRAM's CLUT rows is reverted within
+    50 ms, and the identical write to this RAM block holds and reaches the
+    screen. Row-at-a-time rather than one 512-byte write because a row is what
+    a refusal, a readback and an animation all happen to."""
+    writes = live_link.plan_palettes(_palettes())
+    assert [a for a, _ in writes] == [
+        live_link.CLUT_BLOCK + i * 32 for i in range(16)]
+    assert all(len(d) == 32 for _, d in writes)
+    # The expected bytes come from the vendored writer `build` itself uses,
+    # not from a second implementation of the hex->BGR555 packing here.
+    from _vendor.exmateria_map.document import clut_from_json
+    assert writes[0][1] == b"".join(
+        w.to_bytes(2, "little") for w in clut_from_json(_palettes()[0]))
+
+
+def test_a_state_that_declares_no_palettes_plans_nothing():
+    """Decision 10. 38.5% of corpus states carry no palettes of their own and
+    render with a keyed partner's, so `palettes: null` is a normal document --
+    and its SHEET is still pushable, so refusing the press would be wrong."""
+    assert live_link.plan_palettes(None) == []
+    assert live_link.plan_palettes([]) == []
+
+
+def test_a_short_clut_row_writes_only_the_entries_it_declares():
+    """The entries a row does not declare are not ours to zero -- #496 settled
+    that zero is the worst fill."""
+    writes = live_link.plan_palettes([[0x8001, 0x8002, 0x8003]])
+    assert len(writes) == 1
+    assert writes[0] == (live_link.CLUT_BLOCK, b"\x01\x80\x02\x80\x03\x80")
+
+
+def test_both_the_document_shape_and_the_disc_shape_are_accepted():
+    """`map_states[].palettes` is `{"colors": [...], "stp": N}` and
+    `mapfile.read_palettes` is raw BGR555 words. The push is driven from a
+    document; the live probes and the corpus tools hold the other. Refusing
+    either would just move the conversion somewhere less tested."""
+    from _vendor.exmateria_map.document import clut_from_json
+    doc_form = live_link.plan_palettes(_palettes())
+    raw_form = live_link.plan_palettes(
+        [clut_from_json(e) for e in _palettes()])
+    assert doc_form == raw_form
+
+
+def test_a_clut_entry_that_is_neither_shape_is_refused_by_name():
+    """Not a crash inside `int()`. The button did exactly that on its first
+    real document, and `int() argument must be a string` names nothing an
+    artist or a maintainer can act on."""
+    with pytest.raises(live_link.LiveLinkError) as exc:
+        live_link.plan_palettes([{"colours": ["#000000"] * 16}])
+    assert "CLUT row 0" in str(exc.value)
+
+
+def test_the_clut_block_is_verified_against_vram_before_it_is_written():
+    """Decision 5 at this sink. `CLUT_BLOCK` is one address, and a second copy
+    of the same 512 bytes sits at 0x80099D76 -- measured, and writing THERE
+    changes nothing on screen. So the address is not trusted for being written
+    down: the block it names must match what the GPU is actually showing."""
+    live = bytes(range(256)) * 2
+    live_link.check_clut_block(live, live)                      # agrees: fine
+    with pytest.raises(live_link.LiveLinkError) as exc:
+        live_link.check_clut_block(bytes(512), live)
+    assert "0x800E4EA4" in str(exc.value) or "CLUT" in str(exc.value)
+
+
+def test_the_engine_animated_rows_are_excluded_from_the_comparison():
+    """Rows the engine repaints will differ between a RAM read and a VRAM read
+    taken microseconds apart, and that is not a mismatch worth refusing on --
+    measured, rows 13-15 of MAP022 a0 move within 2 s while 0-12 do not. The
+    check compares the rows that hold still, which is what makes it a check
+    rather than a coin flip."""
+    ram = bytearray(bytes(range(256)) * 2)
+    vram = bytearray(ram)
+    for row in (13, 14, 15):
+        vram[row * 32] ^= 0xFF
+    live_link.check_clut_block(bytes(ram), bytes(vram))          # tolerated
+    vram[4 * 32] ^= 0xFF                                         # a STATIC row
+    with pytest.raises(live_link.LiveLinkError):
+        live_link.check_clut_block(bytes(ram), bytes(vram))
+
+
+def _packet_ram(descriptor, document, clut_base=0x7800, tpage_base=12):
+    """RAM holding the packets an engine WOULD hold for this document."""
+    ram = {live_link.PACKET_BASE_POINTER: struct.pack(
+        "<I", live_link.PACKET_BASES[0])}
+    by_bucket = {b: [] for b in live_link.BUCKETS}
+    for poly in document["polygons"]:
+        by_bucket[poly["kind"]].append(poly)
+    for bucket in live_link.PACKET_LAYOUT:
+        polys = by_bucket[bucket]
+        i = live_link.BUCKETS.index(bucket)
+        sink = live_link.SINKS[bucket]
+        stride = sink.packet_stride
+        buf = bytearray(stride * max(descriptor.counts[i], len(polys)))
+        lay = live_link.PACKET_LAYOUT[bucket]
+        for p, poly in enumerate(polys):
+            struct.pack_into("<H", buf, p * stride + lay.clut,
+                             clut_base | poly["palette_id"])
+            struct.pack_into("<H", buf, p * stride + lay.tpage,
+                             tpage_base + poly["texture_page"])
+        ram[live_link.PACKET_BASES[0] + sink.packet
+            + descriptor.starts[i] * stride] = bytes(buf)
+    return ram
+
+
+def test_the_packet_witnesses_pair_every_live_halfword_with_its_document_field():
+    """What `live_vram.derive_addresses` consumes. One tuple per textured
+    polygon, and BOTH textured buckets -- a witness set drawn from triangles
+    alone would agree about a sheet that quads disagreed with, and 361 of
+    MAP022 a0's 385 textured polygons are quads."""
+    doc = {"polygons":
+           [{"kind": "textured_triangle", "palette_id": i % 16,
+             "texture_page": i % 4} for i in range(24)]
+           + [{"kind": "textured_quad", "palette_id": i % 16,
+               "texture_page": i % 4} for i in range(361)]}
+    desc = live_link.Descriptor(index=0, starts=(0, 0, 0, 0),
+                                counts=(24, 361, 18, 51))
+    wit = live_link.packet_witnesses(
+        _FakeClient(_packet_ram(desc, doc)), desc, doc)
+    assert len(wit) == 385
+    assert {c - pid for c, _t, pid, _pg in wit} == {0x7800}
+    assert {(t & 0xF) - pg for _c, t, _pid, pg in wit} == {12}
+
+
+def test_a_document_with_nothing_textured_yields_no_witness():
+    """It is `live_vram.derive_addresses` that refuses this, by name -- so what
+    this must NOT do is invent one."""
+    doc = {"polygons": [{"kind": "untextured_quad"}] * 4}
+    desc = live_link.Descriptor(index=0, starts=(0, 0, 0, 0),
+                                counts=(0, 0, 0, 4))
+    assert live_link.packet_witnesses(
+        _FakeClient(_packet_ram(desc, doc)), desc, doc) == []
+
+
+# ---------------------------------------------------------------------------
+# The RAM-over-HTTP transport (#606 part 1).
+# ---------------------------------------------------------------------------
+
+def test_adjacent_runs_coalesce_into_one_request():
+    """`POST /api/v1/cpu/ram/raw` takes ONE contiguous run per request, and a
+    geometry plan is thousands of six-byte runs. One POST each would be slower
+    than the Lua path it replaces, so the win is entirely in coalescing: the
+    runs are clustered, the gaps are filled from the before-image, and each
+    cluster goes as a single request."""
+    writes = [(live_link.RAM_BASE + 0, b"ab"),
+              (live_link.RAM_BASE + 2, b"cd"),
+              (live_link.RAM_BASE + 4, b"ef")]
+    image = bytes(64)
+    assert live_link.cluster_writes(writes, image, gap=0) == [
+        (live_link.RAM_BASE + 0, b"abcdef")]
+
+
+def test_a_gap_smaller_than_the_threshold_is_filled_from_the_before_image():
+    """The bytes between two runs are not ours. They are written back exactly
+    as read so the request is a no-op over them — which is what makes filling a
+    gap safe, and also what bounds how big a gap may be."""
+    writes = [(live_link.RAM_BASE + 0, b"ab"), (live_link.RAM_BASE + 6, b"cd")]
+    image = bytes(range(64))
+    out = live_link.cluster_writes(writes, image, gap=8)
+    assert len(out) == 1
+    address, data = out[0]
+    assert address == live_link.RAM_BASE
+    assert data == b"ab" + bytes(range(2, 6)) + b"cd"
+
+
+def test_a_gap_larger_than_the_threshold_stays_two_requests():
+    """The threshold is a collateral bound, not a tuning knob. Everything in a
+    filled gap is read-modify-written, so a run that spanned megabytes would
+    write back a stale copy of whatever the ENGINE changed in between — the one
+    way this transport can be wrong where the Lua path cannot."""
+    writes = [(live_link.RAM_BASE + 0, b"ab"), (live_link.RAM_BASE + 900, b"cd")]
+    out = live_link.cluster_writes(writes, bytes(1024), gap=64)
+    assert [a for a, _ in out] == [live_link.RAM_BASE, live_link.RAM_BASE + 900]
+
+
+def test_clustering_refuses_a_write_outside_main_ram():
+    """The same bound `pack_writes` enforces, kept when the transport changed.
+    The endpoint 400s it too, but a 400 names neither the write nor the field."""
+    with pytest.raises(live_link.LiveLinkError):
+        live_link.cluster_writes([(live_link.RAM_BASE - 4, b"ab")], bytes(64))
+    with pytest.raises(live_link.LiveLinkError):
+        live_link.cluster_writes(
+            [(live_link.RAM_BASE + live_link.RAM_BYTES - 1, b"ab")], bytes(64))
+
+
+def test_out_of_order_and_overlapping_runs_are_ordered_before_clustering():
+    """A plan is built per bucket and per field, so it arrives unsorted. The
+    old Lua walk did not care; a cluster does — an unsorted plan would produce
+    a negative-length gap and silently truncate."""
+    writes = [(live_link.RAM_BASE + 4, b"ef"), (live_link.RAM_BASE + 0, b"ab"),
+              (live_link.RAM_BASE + 2, b"cd")]
+    assert live_link.cluster_writes(writes, bytes(64), gap=0) == [
+        (live_link.RAM_BASE + 0, b"abcdef")]
+
+
+class _FakeHttp:
+    """The endpoint as a byte array. GET hands back the whole 2 MB, POST takes
+    one contiguous run — which is the constraint the clustering exists for."""
+
+    def __init__(self):
+        self.ram = bytearray(live_link.RAM_BYTES)
+        self.gets = self.posts = 0
+
+    def get(self):
+        self.gets += 1
+        return bytes(self.ram)
+
+    def post(self, offset, data):
+        self.posts += 1
+        assert 0 <= offset and offset + len(data) <= live_link.RAM_BYTES
+        self.ram[offset:offset + len(data)] = data
+
+
+def _ram_client(http):
+    c = live_link.RamClient()
+    c._get = http.get
+    c._post = http.post
+    return c
+
+
+def test_the_http_client_writes_and_reports_the_bytes_that_CHANGED():
+    """`apply`'s contract is unchanged across the transport swap: it returns
+    bytes that changed, and the whole self-check leans on that number being
+    zero when the engine already holds the plan. The Lua walk counted in the
+    interpreter; here the GET has already provided the before-image, so the
+    count is free."""
+    http = _FakeHttp()
+    client = _ram_client(http)
+    writes = [(live_link.RAM_BASE + 0, b"ab"), (live_link.RAM_BASE + 2, b"cd")]
+    assert client.write(writes) == 4
+    assert http.ram[:4] == b"abcd"
+    assert client.write(writes) == 0          # already there
+
+
+def test_a_whole_plan_costs_one_get_and_one_post():
+    """The headline. A bucket's plan is thousands of six-byte runs; the Lua
+    path hex-encoded every one of them and looped in the interpreter."""
+    http = _FakeHttp()
+    client = _ram_client(http)
+    writes = [(live_link.RAM_BASE + i * 8, b"abcdef") for i in range(500)]
+    client.write(writes)
+    assert (http.gets, http.posts) == (1, 1)
+
+
+def test_reads_come_from_the_same_window_the_writes_go_to():
+    http = _FakeHttp()
+    http.ram[0x400:0x408] = b"12345678"
+    client = _ram_client(http)
+    assert client.read(live_link.RAM_BASE + 0x400, 8) == b"12345678"
+
+
+def test_a_read_outside_main_ram_is_refused_by_the_http_client_too():
+    """The Lua client refuses this by name and the endpoint answers 400. The
+    swap must not quietly downgrade a named refusal to a status code."""
+    client = _ram_client(_FakeHttp())
+    with pytest.raises(live_link.LiveLinkError):
+        client.read(live_link.RAM_BASE - 1, 4)
+    with pytest.raises(live_link.LiveLinkError):
+        client.read(live_link.RAM_BASE + live_link.RAM_BYTES - 2, 8)
+
+
+def test_apply_delegates_so_either_transport_drives_the_same_plan():
+    """The point of the port: every caller of `apply` — geometry, metadata,
+    packets, counts, palettes — is untouched, and the transport is a
+    constructor argument. `apply_gte` is the one thing that cannot move: the
+    GTE control registers are not `m_wram`, so that leg stays on Lua."""
+    http = _FakeHttp()
+    client = _ram_client(http)
+    writes = [(live_link.RAM_BASE + 16, b"xyz")]
+    assert live_link.apply(client, writes) == 3
+    assert http.ram[16:19] == b"xyz"

@@ -58,9 +58,9 @@ import textwrap
 from pathlib import Path
 
 import bpy
-from bpy.props import (CollectionProperty, EnumProperty, FloatProperty,
-                       FloatVectorProperty, IntProperty, IntVectorProperty,
-                       StringProperty)
+from bpy.props import (BoolProperty, CollectionProperty, EnumProperty,
+                       FloatProperty, FloatVectorProperty, IntProperty,
+                       IntVectorProperty, StringProperty)
 from bpy.types import (AddonPreferences, Menu, Operator, Panel,
                        PropertyGroup)
 
@@ -386,6 +386,52 @@ def _state_clut_rows(st, plte_rows):
     return [list(base) for _ in range(16)]
 
 
+def _build_source_art(doc, doc_path):
+    """§4b -- the **Painting**s a converted document carries (ADR-0186 dec. 5).
+
+    Returns `{sheet: image name}` for every sheet whose painting was found.
+    The document names the files and the STATES each one serves; the sheet is
+    reached through `map_states[i].texture_sheet`, which is how decision 5
+    keeps the painting out of a field `build` reads.
+
+    A missing or unreadable sidecar degrades to a warning and that sheet keeps
+    its index -> CLUT preview -- the same posture `_build_textures` takes for a
+    missing sheet sidecar.  An import that lost a file must still open; it is
+    the export that refuses.
+
+    The image is written by `convert_op._write_art`, deliberately and not by a
+    copy of it: the buffer is top-scanline-first and Blender's pixel row 0 is
+    the BOTTOM, and a second row flip is a second chance to have it backwards.
+    That module imports this one, so the name is fetched at call time.
+    """
+    art = doc.get("source_art") or {}
+    if not art:
+        return {}
+    from .convert_op import _write_art, source_art_name
+    states = doc.get("map_states") or []
+    out = {}
+    for fname, entry in sorted(art.items()):
+        path = _find_sidecar(fname, doc_path)
+        if path is None:
+            print(f"EXMATERIA-MAP: warning: source art '{fname}' not found; "
+                  f"its map state(s) preview through the CLUT instead")
+            continue
+        try:
+            w, h, rgb = png_indexed.read_rgb_png(path.read_bytes())
+            if (w, h) != (256, 1024):
+                raise ValueError(f"{w}x{h}, expected 256x1024")
+        except Exception as exc:
+            print(f"EXMATERIA-MAP: warning: source art '{fname}': {exc}")
+            continue
+        for i in entry.get("states") or []:
+            if not (0 <= i < len(states)):
+                continue
+            sheet = states[i].get("texture_sheet")
+            if sheet and sheet not in out:
+                out[sheet] = _write_art(source_art_name(sheet), rgb).name
+    return out
+
+
 def _build_textures(doc, bname, doc_path):
     """The §4 images + wiring info.
 
@@ -653,10 +699,15 @@ def _unit(v):
 def _override_update(self, context):
     """Re-bake the object this Override belongs to.
 
+    Silent while `ensure_rig_exposure` is seeding: that writes 7 properties on
+    each of up to 21 states and moves no picture at all.
+
     A PropertyGroup does not know its owner, so the object is found by identity
     over the objects that carry one.  `bake_light` is 1.39 ms on the corpus's
     largest mesh, which is why a slider can drive it directly.
     """
+    if _SEEDING:
+        return
     for ob in bpy.data.objects:
         if any(o == self for o in getattr(ob, "exmateria_map_rig_overrides", ())):
             apply_state_light(ob)
@@ -709,6 +760,10 @@ class MAP_PG_rig_override(PropertyGroup):
     # is not shading and so not a parity target.  Kept so the Override is the
     # whole 45 bytes and a future save-back is a straight serialisation.
     gradient: IntVectorProperty(name="Gradient", size=6, default=(0,) * 6)
+    #: The editing-unit values this Override was SEEDED with, as they read back
+    #: out of the properties.  See `rig_is_dirty` for why it is stored rather
+    #: than recomputed from the document's rig on demand.
+    seed_units: StringProperty(default="")
 
     GAINS = ("gain_1", "gain_2", "gain_3")
     DIRS = ("dir_1", "dir_2", "dir_3")
@@ -736,6 +791,42 @@ def override_rig(ov):
     }
 
 
+def editing_units(ov):
+    """Everything an artist can move on an Override, as it READS BACK.
+
+    Read back, not as assigned: a Blender float property stores float32 and
+    `c / 255.0` is a float64, so a fresh seed already differs from the numbers
+    it was seeded from.  Going through the property makes both sides of a
+    comparison the same width by construction.
+    """
+    return json.dumps([list(ov.ambient)]
+                      + [list(getattr(ov, g)) for g in MAP_PG_rig_override.GAINS]
+                      + [list(getattr(ov, d)) for d in MAP_PG_rig_override.DIRS]
+                      + [list(ov.gradient)])
+
+
+def rig_is_dirty(ov):
+    """Has the artist actually moved anything on this Override?
+
+    The rig is exposed on every state from the moment of import, so its
+    EXISTENCE no longer means the artist authored anything -- this does.  A
+    clean Override declares nothing on export, warns about nothing, lights
+    nothing differently, and leaves the document byte-identical.
+
+    Compared in the EDITING UNITS, never in the packed bytes.  `override_rig`
+    re-emits a direction at exactly 4096 while the disc's magnitudes run
+    4094.4-4096.7, so `override_rig(seed_override(rig)) != rig` for most real
+    rigs -- a byte comparison would call every untouched rig in the corpus
+    dirty and put us straight back on "exposed, therefore declared", which is
+    the bug this replaces.
+
+    The seed is stored on the Override rather than recomputed, because the
+    document's rig is not always what it was seeded FROM: a state with no rig
+    of its own is seeded from a keyed partner, or from the albedo fallback.
+    """
+    return editing_units(ov) != ov.seed_units
+
+
 def seed_override(ov, rig, index):
     """Fill an Override from a rig, converting into the editing units."""
     ov.state_index = index
@@ -747,6 +838,60 @@ def seed_override(ov, rig, index):
         setattr(ov, d, _unit(_fft_to_blender(
             tuple(float(c) for c in rig["directions"][k]))))
     ov.gradient = tuple(rig.get("gradient") or (0,) * 6)
+    ov.seed_units = editing_units(ov)
+
+
+#: What a state with no rig ANYWHERE is exposed with: the albedo-only picture
+#: the preview already shows (ambient 1.0, diffuse 0), so exposing it does not
+#: MOVE the render -- it only makes it editable.  46 states corpus-wide.
+ALBEDO_RIG = {"colors": [[0, 0, 0]] * 3,
+              "directions": [[0, 0, int(DIR_SCALE)]] * 3,
+              "ambient": [255, 255, 255], "gradient": [0] * 6}
+
+#: Set while `ensure_rig_exposure` and the reset operator are writing seeds, so
+#: `_override_update` does not re-bake once per property per state (21 states x
+#: 7 properties is 147 bakes for an import that changed no picture).
+_SEEDING = False
+
+
+def exposure_rig(ob, states, i):
+    """The rig state `i` is EXPOSED with: its own, else a keyed partner's,
+    else albedo.  Never None, because every state gets a rig to look at."""
+    rig, src = state_rig(states, i)
+    return (rig or ALBEDO_RIG), (src or "no rig in this document (albedo)")
+
+
+def ensure_rig_exposure(ob):
+    """Expose the rig on every map state, once.
+
+    Nothing AUTHORABLE is hidden: the artist should not have to perform a
+    gesture to SEE the numbers the picture is made of.  Exposure is not
+    declaration -- see `rig_is_dirty` -- so this is free, and it is idempotent
+    so a `.blend` saved before this shipped gains its Overrides on load rather
+    than only on a fresh import.
+    """
+    global _SEEDING
+    states = object_states(ob)
+    if not states or not hasattr(ob, "exmateria_map_rig_overrides"):
+        return 0
+    have = {ov.state_index for ov in ob.exmateria_map_rig_overrides}
+    missing = [i for i in range(len(states)) if i not in have]
+    if not missing:
+        return 0
+    was, _SEEDING = _SEEDING, True
+    try:
+        for i in missing:
+            rig, _src = exposure_rig(ob, states, i)
+            seed_override(ob.exmateria_map_rig_overrides.add(), rig, i)
+    finally:
+        _SEEDING = was
+    return len(missing)
+
+
+def dirty_overrides(ob):
+    """The Overrides the artist has actually moved something on."""
+    return [ov for ov in getattr(ob, "exmateria_map_rig_overrides", ())
+            if rig_is_dirty(ov)]
 
 
 def find_override(ob, i):
@@ -760,14 +905,21 @@ def find_override(ob, i):
 def resolved_rig(ob, states, i):
     """The rig the preview lights state `i` with, and where it came from.
 
-    Decision 25's resolution order: **override -> own -> keyed partner**.
+    Resolution order: **edited override -> own -> keyed partner** (decision
+    25, whose override step now turns on `rig_is_dirty` rather than on an
+    Override existing -- every state has one).
     Returns `(rig, source_label, is_override)` so the panel can say which one
     won — an edited picture that reads as the ROM's is the failure mode this
     whole surface exists to prevent.
     """
     ov = find_override(ob, i)
-    if ov is not None:
+    if ov is not None and rig_is_dirty(ov):
         return override_rig(ov), f"EDITED (state {i})", True
+    # Deliberately the document's rig, NOT the clean Override's.  They hold the
+    # same values in editing units, but `override_rig` re-emits a direction at
+    # exactly 4096 -- so routing an untouched state through the Override would
+    # move every bake in the corpus by up to 0.0099 degrees for nothing.  An
+    # unedited preview stays pixel-identical to what it was before exposure.
     rig, src = state_rig(states, i)
     return rig, src, False
 
@@ -789,6 +941,7 @@ def apply_state_light(ob):
     states = object_states(ob)
     if not states or "exmateria_map/preview_state" not in ob:
         return None
+    ensure_rig_exposure(ob)
     i = int(ob["exmateria_map/preview_state"])
     rig, src, edited = resolved_rig(ob, states, i)
     mat = preview_material(ob)
@@ -813,14 +966,35 @@ DEBUG_MODES = (
 )
 
 # Which node feeds the sRGB decode in each mode.
+#
+# Mode 5 is deliberately NOT in this table. "Albedo only" means whatever is
+# currently feeding the multiply's albedo input, and since the Raw/Compiled
+# preview can make that the paint image, naming `exmateria_map.clut` here made
+# the two switches disagree: RAW + albedo-only showed the committed colour, so
+# the one mode whose entire job is "show me the albedo" was the one mode that
+# could not show the albedo you were looking at. Resolved live by
+# `_albedo_node` instead.
 _DEBUG_SOURCE = {
     0: "exmateria_map.multiply",
     1: "exmateria_map.normal_encode",
     2: "exmateria_map.light_sum",
     3: "exmateria_map.ambient",
     4: "exmateria_map.diffuse",
-    5: "exmateria_map.clut",
 }
+
+
+def _albedo_node(nt):
+    """Whatever is wired into the multiply's albedo input right now.
+
+    Falls back to the CLUT node, which is what an un-swapped graph holds.
+    """
+    mix = nt.nodes.get("exmateria_map.multiply")
+    if mix is not None:
+        for link in nt.links:
+            if (link.to_node.name == mix.name
+                    and link.to_socket.name == "Color1"):
+                return link.from_node
+    return nt.nodes.get("exmateria_map.clut")
 # Godot exaggerates 2/3/4 by `map_light_boost` and then clamps; 0/1/5 ignore it.
 _DEBUG_BOOSTED = (2, 3, 4)
 
@@ -855,7 +1029,8 @@ def set_light_debug(mat, mode=0, boost=1.0):
     dec = nt.nodes.get("exmateria_map.srgb_decode")
     boost_node = nt.nodes.get("exmateria_map.boost")
     mode = int(mode)
-    src = nt.nodes.get(_DEBUG_SOURCE.get(mode, _DEBUG_SOURCE[0]))
+    src = (_albedo_node(nt) if mode == 5
+           else nt.nodes.get(_DEBUG_SOURCE.get(mode, _DEBUG_SOURCE[0])))
     if dec is None or boost_node is None or src is None:
         return None
     for link in list(nt.links):
@@ -871,6 +1046,84 @@ def set_light_debug(mat, mode=0, boost=1.0):
         nt.links.new(_out(boost_node), dec.inputs["Color"])
     else:
         nt.links.new(_out(src), dec.inputs["Color"])
+    return src
+
+
+#: The two things that can feed the multiply's ALBEDO input.
+#:
+#: `clut` is the committed state -- the index image looked up through the CLUT
+#: image, which is what the disc will hold. `raw` is the artist's paint image
+#: sampled directly, which is what they just painted and may be any colour at
+#: all.
+#:
+#: This is the preview half of the Raw / Quantised mode. Blender refreshes a
+#: viewport when a material samples the image being painted, so pointing the
+#: albedo at the paint image is what makes painting live -- there is no timer
+#: and no poll, and `interchange-export-v1.md` §4.2's "no hot timer" survives
+#: the mode rather than being overturned by it.
+#:
+#: Both images are float and **Non-Color**, which is why this is a swap of one
+#: socket and not a colour-management problem: the whole chain multiplies in
+#: BYTE space and converts once at the decode (#427), and the paint image is
+#: written as `entry / 255.0` by `paint.recolour`. Sampling it linearly would
+#: be the same mistake as sampling the CLUT linearly.
+#: The node name is `convert_op._show_source_art`'s, not a second one. That
+#: function already rewires this exact socket when a map is converted, and two
+#: names for one role would mean the toggle and the conversion could each undo
+#: the other -- silently, because both leave a graph that renders.
+PREVIEW_SOURCES = {
+    "QUANTISED": "exmateria_map.clut",
+    "RAW": "exmateria_map.source_art",
+}
+
+
+def set_preview_source(mat, mode="QUANTISED", image=None):
+    """Point the albedo at the CLUT lookup or at the paint image.
+
+    Returns the node now feeding the multiply, or None when the graph is not
+    ours. Falls back to the CLUT when RAW is asked for and there is no paint
+    image yet -- pressing *Paint sheet* is what creates one, and a mode that
+    silently rendered black until then would read as a broken preview rather
+    than as a missing step.
+
+    A rewire and not a second material, for the reason `set_light_debug` gives:
+    every stage downstream of the albedo is identical between the two modes, so
+    two materials would be two things to keep true.
+    """
+    if mat is None or mat.node_tree is None:
+        return None
+    nt = mat.node_tree
+    mix = nt.nodes.get("exmateria_map.multiply")
+    clut = nt.nodes.get("exmateria_map.clut")
+    if mix is None or clut is None:
+        return None
+
+    src = clut
+    if str(mode).upper() == "RAW" and image is not None:
+        raw = nt.nodes.get(PREVIEW_SOURCES["RAW"])
+        if raw is None:
+            raw = nt.nodes.new("ShaderNodeTexImage")
+            raw.name = PREVIEW_SOURCES["RAW"]
+            raw.location = (360, 340)
+            # Closest for the same reason the CLUT lookup uses it: a texel is
+            # an authored value, and interpolating between two of them invents
+            # a colour that is in no palette and on no disc.
+            raw.interpolation = "Closest"
+            raw.extension = "CLIP"
+            # Same UVs as the index lookup, taken from the graph rather than
+            # rebuilt, so the two can never drift apart.
+            uv = nt.nodes.get("exmateria_map.index")
+            if uv is not None and uv.inputs["Vector"].links:
+                nt.links.new(uv.inputs["Vector"].links[0].from_socket,
+                             raw.inputs["Vector"])
+        raw.image = image
+        src = raw
+
+    for link in list(nt.links):
+        if (link.to_node.name == mix.name
+                and link.to_socket.name == "Color1"):
+            nt.links.remove(link)
+    nt.links.new(_out(src), mix.inputs["Color1"])
     return src
 
 
@@ -1300,6 +1553,7 @@ def build(doc, context=None, doc_path=None):
     # ---- textures + materials + per-face slot (§4) ----
     sheet_images, clut_names, state_sheets, default_state, default_index = \
         _build_textures(doc, name, doc_path)
+    paintings = _build_source_art(doc, doc_path)
     # Corner light (decision 7): `albedo x (ambient + sum(gain.max(0, N.L)))`,
     # the sum BAKED PER CORNER off the default state's `light_rig` (schema
     # §7.1).  A rig-less arrangement bakes flat 1.0 — albedo only.
@@ -1350,11 +1604,37 @@ def build(doc, context=None, doc_path=None):
     from .authoring import sync_drift
     _n_drift, _n_fixed = sync_drift(ob)
 
+    # Nothing AUTHORABLE is hidden: every state's rig is on screen from here,
+    # with no gesture in between.  Exposure is not declaration -- a clean
+    # Override exports nothing and lights nothing differently -- so this costs
+    # the document nothing.  See `rig_is_dirty`.
+    ensure_rig_exposure(ob)
+
+    # A converted map re-opens converted.  `Convert` is the one-time act; the
+    # presence of `source_art` is the declaration ever after (decision 7), so
+    # the preview is pointed at the painting here by exactly the code the
+    # button uses -- otherwise a saved-and-reopened map would show the Sheet
+    # while `Paint sheet` handed back the Painting, and the two would disagree
+    # about what the artist is looking at.
+    # `paint.sheet_of_state`'s rule, and not `state_sheets[default_state]`.
+    # `map_states` interleaves two row kinds -- a TEXTURE row names the sheet
+    # and carries `palettes: null`, a MESH row carries the palettes and names
+    # no sheet -- so the default state very often names none, and indexing it
+    # straight gives `None`, which reads as "this map has no painting".
+    _sheet_now = ((state_sheets[default_state]
+                   if 0 <= default_state < len(state_sheets) else None)
+                  or next((s for s in state_sheets if s), None))
+    _painting = paintings.get(_sheet_now)
+    if _painting:
+        from .convert_op import _show_source_art
+        _show_source_art(ob, bpy.data.images[_painting])
+
     print(f"EXMATERIA-MAP: imported {name}: "
           f"{len(polys)} polygons, {len(recs)} terrain records, "
           f"{len(doc['map_states'])} states, "
           f"light rig {rig_source or 'ABSENT (albedo only)'}, "
-          f"{_n_drift} drifted tile(s)")
+          f"{_n_drift} drifted tile(s)"
+          + (f", {len(paintings)} painting(s)" if paintings else ""))
     return ob
 
 
@@ -1393,18 +1673,49 @@ class MAP_AddonPreferences(AddonPreferences):
         name="PCSX host",
         description="Host running PCSX-Redux's Lua web server",
         default=LIVE_DEFAULT_HOST)
+    # ADR-0185 decision 4 as amended (Amendment 2).  The decision's objection
+    # was to an import that rearranges the artist's screen with no say in it;
+    # a switch the artist owns is the say.  Default ON because the layout is
+    # for working on a map and an import is the moment one arrives.
+    workspace_on_import: BoolProperty(
+        name="Open the Map workspace on import",
+        description="After importing a map or a GNS, switch to the three-pane "
+                    "Map workspace, building it the first time",
+        default=True)
     live_port: IntProperty(
         name="PCSX port",
         description="Port of PCSX-Redux's Lua web server "
                     "(-webserver -webserver-port N)",
         default=LIVE_DEFAULT_PORT, min=1, max=65535)
+    # #606 part 1.  Two transports reach main RAM and they are NOT a speed
+    # choice: measured on a real geometry plan (2,682 runs, 12,460 bytes) the
+    # HTTP path is 0.182 s against Lua's 0.148 s, because the whole 2 MB comes
+    # back on every GET.  What HTTP buys is reach -- both endpoints are
+    # upstream pcsx-redux, so only the light rig's GTE half still needs our
+    # fork -- and a write longer than 65,535 bytes, which the Lua record format
+    # refuses outright.  Lua stays the default because the rig needs a Lua
+    # client anyway and it is the faster of the two for a push.
+    live_ram_over_http: BoolProperty(
+        name="Main RAM over HTTP",
+        description="Push geometry through /api/v1/cpu/ram/raw instead of the "
+                    "Lua bridge. Slightly slower, but works on a stock "
+                    "PCSX-Redux; the light rig's GTE half still needs the fork",
+        default=False)
 
     def draw(self, context):
+        # ADR-0185 decision 4.  Here and nowhere else: this is the one surface
+        # of the addon reachable with no map open, and the workspace is most
+        # useful BEFORE the first import.  A second home would be a second
+        # thing to keep true.
+        self.layout.operator("exmateria_map.add_workspace",
+                             icon="WORKSPACE")
+        self.layout.prop(self, "workspace_on_import")
         self.layout.prop(self, "last_dir")
         self.layout.prop(self, "last_export_dir")
         row = self.layout.row(align=True)
         row.prop(self, "live_host")
         row.prop(self, "live_port")
+        self.layout.prop(self, "live_ram_over_http")
 
 
 def _prefs(context):
@@ -1516,6 +1827,8 @@ class IMPORT_OT_interchange_document(Operator):
         # 315/315.  The invariant is now graded directly, on the SWITCH, by that
         # harness's `import_lands_authority_off`.
         remember_dir(context, self.filepath)
+        from .workspace import ensure_on_import
+        ensure_on_import(context)
         return {"FINISHED"}
 
 
@@ -1560,7 +1873,7 @@ class MAP_OT_set_preview_state(Operator):
             states = json.loads(ob["exmateria_map/map_states"])
         except (KeyError, ValueError, TypeError):
             states = []
-        # decision 25: override -> own -> keyed partner.  `preview_state` is
+        # edited override -> own -> keyed partner.  `preview_state` is
         # set FIRST because `apply_state_light` reads it — one path serves both
         # a state switch and an Override edit, so the two cannot drift apart.
         # the debug mode is VIEW state, not map data: it survives a state
@@ -1609,6 +1922,61 @@ def _light_debug_update(self, context):
     apply_light_debug(self)
 
 
+#: The preview's two answers to "what am I looking at".
+#:
+#: ADR-0186 decision 7 rejects a MODE for authoring -- the presence of
+#: `source_art` is the declaration, and conversion is the one-time act. This is
+#: not that. It is a VIEW, the same kind of thing as `light_debug` above: it
+#: changes nothing about the document and nothing about what ships, only which
+#: image the albedo is read from while you look at it.
+PREVIEW_MODES = (
+    ("RAW", "Painting", "What you painted, in true colour — the paint image "
+                        "sampled directly. Live, because Blender refreshes a "
+                        "viewport when a material samples the image being "
+                        "painted"),
+    ("QUANTISED", "Compiled", "What the game will show — the index image "
+                              "through the CLUT, the committed state"),
+)
+
+
+def apply_preview_source(ob):
+    """Push the object's Raw/Compiled view state onto its preview graph.
+
+    Registered Object property rather than an `exmateria_map/...` custom
+    property, for the reason `apply_light_debug` gives: those carry the
+    document in the ROM's own shape, and a view mode has no ROM representation.
+    """
+    mat = preview_material(ob)
+    if mat is None or "exmateria_map/preview_state" not in ob:
+        return None
+    image = None
+    if str(getattr(ob, "exmateria_map_preview_source", "")) == "RAW":
+        # Imported lazily: `paint` imports this module, and the addon's own
+        # import order is the one thing a module-scope import here would break.
+        from .paint import paint_image_name, sheet_of_state
+        from .convert_op import source_art_name
+        sheet = sheet_of_state(ob, int(ob.get("exmateria_map/preview_state") or 0))
+        if sheet:
+            # `source_art` FIRST. A converted map has one and has no paint
+            # image -- `convert_manifold` deletes the stale paint copy because
+            # it pictures the pre-conversion layout -- so looking for the paint
+            # image alone would find nothing on exactly the maps this mode is
+            # for, fall back to the CLUT, and quietly undo the conversion's own
+            # rewire.
+            image = (bpy.data.images.get(source_art_name(sheet))
+                     or bpy.data.images.get(paint_image_name(sheet)))
+    src = set_preview_source(mat, getattr(ob, "exmateria_map_preview_source",
+                                          "QUANTISED"), image)
+    # The albedo moved, so a graph sitting in albedo-only has to be re-pointed
+    # at it. Cheap, and it is the whole reason mode 5 left `_DEBUG_SOURCE`.
+    apply_light_debug(ob)
+    return src
+
+
+def _preview_source_update(self, context):
+    apply_preview_source(self)
+
+
 class MAP_OT_pin_view_transform(Operator):
     """Pin the Standard view transform + sRGB display so the preview's
     palette colours are unmodified (the ADR's rig trap; #427)."""
@@ -1620,53 +1988,24 @@ class MAP_OT_pin_view_transform(Operator):
         return {"FINISHED"}
 
 
-class MAP_OT_mint_rig_override(Operator):
-    """Give the previewed state its own editable rig, copied from whatever the
-    preview is currently lighting it with.
-
-    Decision 25 REFUSES live editing on a state that is borrowing.  636 of the
-    691 rig-less states corpus-wide are `texture` rows, so a slider that
-    silently turned "this state has no rig" into "this state has a rig I
-    invented" would mostly fire on a misclick — and decision 7's standing rule
-    is that the preview SAYS what it does not know rather than substituting a
-    default.  Minting is that conversion made deliberate.
-    """
-    bl_idname = "exmateria_map.mint_rig_override"
-    bl_label = "Give this state its own rig"
-    bl_options = {"REGISTER", "UNDO"}
-
-    @classmethod
-    def poll(cls, context):
-        ob = context.object
-        return ob is not None and "exmateria_map/preview_state" in ob
-
-    def execute(self, context):
-        ob = context.object
-        states = object_states(ob)
-        i = int(ob["exmateria_map/preview_state"])
-        if find_override(ob, i) is not None:
-            self.report({"INFO"}, f"state {i} already has an Override")
-            return {"CANCELLED"}
-        rig, src = state_rig(states, i)
-        if rig is None:
-            # Nothing in the document carries a rig (46 states corpus-wide).
-            # Seed the albedo-only picture the preview already shows — ambient
-            # 1.0, diffuse 0 — so minting does not MOVE the render, it only
-            # makes it editable.
-            rig = {"colors": [[0, 0, 0]] * 3,
-                   "directions": [[0, 0, int(DIR_SCALE)]] * 3,
-                   "ambient": [255, 255, 255], "gradient": [0] * 6}
-            src = "no rig in this document (albedo)"
-        seed_override(ob.exmateria_map_rig_overrides.add(), rig, i)
-        apply_state_light(ob)
-        self.report({"INFO"}, f"state {i}: rig copied from {src}")
-        return {"FINISHED"}
-
-
 class MAP_OT_clear_rig_override(Operator):
-    """Drop this state's Override and go back to the document's rig."""
+    """Put this state's rig back to the numbers the ROM carries.
+
+    RE-SEEDS rather than removes, now that the rig is exposed on every state:
+    removing it would take the sliders off screen, which is the one thing
+    exposure exists to stop.
+
+    Not the same gesture as Ctrl+Z, which is why both exist.  Undo walks back
+    the last action and dies with the session; this restores the ROM's values
+    whenever it is asked, including the day after a save.  Under dirty-tracking
+    that difference is load-bearing: clean vs. dirty decides whether `build`
+    writes 45 bytes, and an artist who nudges a slider and saves cannot get
+    back to EXACTLY clean by eye -- these are float32 values, and missing by
+    one LSB still declares the rig.  This is the one gesture that means "make
+    this state clean again".
+    """
     bl_idname = "exmateria_map.clear_rig_override"
-    bl_label = "Revert this state to the ROM's rig"
+    bl_label = "Reset to the ROM's rig"
     bl_options = {"REGISTER", "UNDO"}
 
     all_states: bpy.props.BoolProperty(default=False)
@@ -1674,18 +2013,24 @@ class MAP_OT_clear_rig_override(Operator):
     @classmethod
     def poll(cls, context):
         ob = context.object
-        return ob is not None and len(getattr(
-            ob, "exmateria_map_rig_overrides", ())) > 0
+        return ob is not None and bool(dirty_overrides(ob))
 
     def execute(self, context):
+        global _SEEDING
         ob = context.object
         i = int(ob.get("exmateria_map/preview_state", -1))
-        drop = [k for k, ov in enumerate(ob.exmateria_map_rig_overrides)
-                if self.all_states or ov.state_index == i]
-        for k in reversed(drop):
-            ob.exmateria_map_rig_overrides.remove(k)
+        states = object_states(ob)
+        targets = [ov for ov in ob.exmateria_map_rig_overrides
+                   if self.all_states or ov.state_index == i]
+        was, _SEEDING = _SEEDING, True
+        try:
+            for ov in targets:
+                rig, _src = exposure_rig(ob, states, ov.state_index)
+                seed_override(ov, rig, ov.state_index)
+        finally:
+            _SEEDING = was
         apply_state_light(ob)
-        self.report({"INFO"}, f"reverted {len(drop)} state(s)")
+        self.report({"INFO"}, f"reset {len(targets)} state(s) to the ROM's rig")
         return {"FINISHED"}
 
 
@@ -1743,8 +2088,7 @@ def edited_objects(context):
     screenshotting the viewport and the N-panel is not in frame.
     """
     return [ob for ob in getattr(context, "visible_objects", None) or ()
-            if len(getattr(ob, "exmateria_map_rig_overrides", ())) > 0
-            or normals_edited(ob)]
+            if dirty_overrides(ob) or normals_edited(ob)]
 
 
 def badge_text(obs):
@@ -1756,7 +2100,7 @@ def badge_text(obs):
     is gradeable: the drawing half needs a window manager and a populated
     `visible_objects`, neither of which a headless check has.
     """
-    n = sum(len(getattr(ob, "exmateria_map_rig_overrides", ())) for ob in obs)
+    n = sum(len(dirty_overrides(ob)) for ob in obs)
     axes = []
     if n:
         axes.append(f"light rig ({n} state(s))")
@@ -1796,16 +2140,18 @@ def unregister_badge():
 
 
 class MAP_PT_preview(Panel):
-    """N-panel: the previewed state and its CLUT provenance (§4)."""
-    bl_space_type = "PROPERTIES"
-    bl_region_type = "WINDOW"
-    bl_context = "object"
+    """`Map` sidebar, 3D viewport: the previewed state and its CLUT
+    provenance (§4)."""
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
     bl_category = "Map"
-    bl_label = "ExMateria Map Preview"
-    bl_order = 0
+    bl_label = "Preview"
+    bl_order = 1
 
     def draw(self, context):
-        ob = context.object
+        # The scene's map, not the selection's -- see `marker_in_scene`, 38
+        # lines below, which this panel was measured not to be using.
+        ob = marker_in_scene(context)
         if ob is None or "exmateria_map/preview_state" not in ob:
             return
         try:
@@ -1828,7 +2174,10 @@ class MAP_PT_preview(Panel):
         ov = find_override(ob, i)
         src = ob.get("exmateria_map/light_source") or ""
         rig = state_own_rig(st)
-        if ov is not None:
+        # DIRTY, not present.  Every state carries an Override now, so keying
+        # this on existence told the artist their untouched map was not the
+        # ROM's -- and made the four honest branches below unreachable.
+        if ov is not None and rig_is_dirty(ov):
             layout.label(text="light: EDITED — this is NOT the ROM's rig; "
                               "export WRITES it (decision 27)",
                          icon="GREASEPENCIL")
@@ -1845,6 +2194,7 @@ class MAP_PT_preview(Panel):
             layout.label(text=f"light: rig BORROWED from {src} "
                               f"(same night/weather)", icon="INFO")
         _draw_rig(layout, ob, i, ov, rig, src)
+        layout.prop(ob, "exmateria_map_preview_source", expand=True)
         layout.prop(ob, "exmateria_map_light_debug")
         row = layout.row()
         # Godot's boost exaggerates modes 2/3/4 only, and so does the graph
@@ -1909,18 +2259,78 @@ def state_menu_label(states, i):
     return f"State {i}: {st.get('resource')} ({st.get('kind')})"
 
 
+class MAP_PT_map_transform(Panel):
+    """`Map` sidebar, 3D viewport, FIRST: the map marker's own transform.
+
+    ADR-0185 Amendment 4. *"I want to be able to see translate and other key
+    parameters at the same time."* This is not a request for something new: in
+    Properties ▸ Object, `Location` / `Rotation` / `Scale` and our five panels
+    were **already co-visible**, and vacating Properties would have taken that
+    away. A sidebar cannot show two tabs at once, so Blender's `Item` tab is not
+    an answer -- and `Item` follows the SELECTION, which is the annoyance this
+    amendment exists to remove.
+
+    **It carries a stated consequence, which is why it is a decision and not a
+    convenience.** The transform is invisible to export -- `export_document`
+    never reads it, and every `.location` in the two document modules is
+    shader-node placement -- but it **is** an input to the lighting bake:
+    `lighting_bake` bakes `ob.matrix_world @ v.co` and reads `lamp.matrix_world`
+    for direction. Rotating or scaling the map relative to its lamps changes the
+    baked normals, and those reach the disc. A control that looks cosmetic and
+    silently writes bytes is exactly what this package says out loud.
+
+    **Lamp transforms are not drawn here.** That is the parked *"rig directions
+    as viewport gizmos"* work -- blocked on `lamp_authority` meaning
+    normals-only and on the measured `(-x, y, -z)` non-identity in
+    `spherical_to_cartesian . vector_to_sphere` -- arriving unannounced.
+    """
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Map"
+    bl_label = "Transform"
+    bl_order = 0
+
+    @classmethod
+    def poll(cls, context):
+        return marker_in_scene(context) is not None
+
+    def draw(self, context):
+        ob = marker_in_scene(context)
+        if ob is None:
+            return
+        layout = self.layout
+        layout.label(text=ob.name, icon="OBJECT_DATA")
+        col = layout.column()
+        col.prop(ob, "location")
+        col.prop(ob, "rotation_euler")
+        col.prop(ob, "scale")
+        # WRAPPED at 44, the width `paint.NO_EDITOR_HINT` already uses: a
+        # Blender label does not wrap and the sidebar is 280 px whatever the
+        # pane, so one long line renders as `the export ignore...se reach the
+        # disc`. Measured in the headful probe's own frame -- a consequence the
+        # artist cannot read is not stated.
+        for k, chunk in enumerate(textwrap.wrap(
+                "the export ignores this; the lighting BAKE does not \u2014 "
+                "moving the map relative to its lamps changes the baked "
+                "NORMALS, and those reach the disc", 44)):
+            layout.label(text=chunk, icon="INFO" if k == 0 else "BLANK1")
+
+
 class MAP_PT_export(Panel):
-    """N-panel: write the interchange document to disk.
+    """`Map` sidebar, 3D viewport: the last export's report.
 
     Its own panel rather than a tail on the preview's, which is what made the
-    preview panel three unrelated jobs in one column.
+    preview panel three unrelated jobs in one column. It carries no BUTTON:
+    `File ▸ Export ▸ ExMateria Map Interchange` is the same operator, and
+    reported from use, *"we already have the interchange format in the export
+    drop down under file -- we don't need it twice."* What the File menu
+    cannot show is the report, which is what this panel is for.
     """
-    bl_space_type = "PROPERTIES"
-    bl_region_type = "WINDOW"
-    bl_context = "object"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
     bl_category = "Map"
-    bl_label = "ExMateria Map Export"
-    bl_order = 4
+    bl_label = "Export"
+    bl_order = 5
 
     @classmethod
     def poll(cls, context):
@@ -1931,76 +2341,166 @@ class MAP_PT_export(Panel):
         ob = marker_in_scene(context)
         if ob is None:
             return
+        # NO button.  Reported from use: "we already have the interchange
+        # format in the export drop down under file -- we don't need it twice."
+        # `File > Export > ExMateria Map Interchange` is the same operator, and
+        # a signpost is not a second door.
+        layout.label(text="File \u25b8 Export \u25b8 ExMateria Map Interchange",
+                     icon="EXPORT")
         # Export-v1 §5: the operator reports refusals, warnings and the
         # divergence list to the N-panel as well as to the operator report,
         # because an operator report is gone by the time the artist looks.
-        layout.operator("export_map.document", icon="EXPORT",
-                        text="Export interchange document")
+        # THIS is what the panel is for; the File menu cannot show it.
         _stored_report(layout, ob, "exmateria_map/last_export", "Last export:")
 
 
+#: The Text datablock the reports are written to. A Blender label cannot be
+#: selected and neither can an operator's error toast, so the ONLY place in
+#: this application where a report can be selected with the mouse is a Text
+#: editor. `map.copy_report` keeps this one current and puts the same text on
+#: the clipboard, which is the one-click answer.
+REPORT_TEXT_NAME = "exmateria-map report"
+
+
+class MAP_OT_copy_report(Operator):
+    """Copy this report to the clipboard, and keep a copy in the Text editor.
+
+    Reported from use: "when errors come up I can't copy the contents". Blender
+    renders an operator's report as a toast and a panel line as a label, and
+    neither is selectable -- so a refusal the artist most wants to paste
+    somewhere is the one thing they cannot get out of the application.
+    """
+
+    bl_idname = "map.copy_report"
+    bl_label = "Copy report"
+    bl_description = ("Copy this report to the clipboard and write it to the "
+                      "`exmateria-map report` text block, which a Text editor "
+                      "can select from")
+    bl_options = {"REGISTER", "INTERNAL"}
+
+    key: StringProperty(options={"HIDDEN"})
+    title: StringProperty(options={"HIDDEN"})
+
+    def execute(self, context):
+        ob = context.object
+        if ob is None or self.key not in ob:
+            self.report({"WARNING"}, "no report on this object")
+            return {"CANCELLED"}
+        try:
+            lines = json.loads(ob.get(self.key) or "[]")
+        except (ValueError, TypeError):
+            lines = []
+        text = "\n".join([f"{self.title} ({ob.name})"] + list(lines))
+        context.window_manager.clipboard = text
+        # The same Text datablock, which is now the running **Log**
+        # (`report_log`, ADR-0185 decision 5) -- so this APPENDS. It used to
+        # `clear()` first, which is what kept it from ever being a log: every
+        # press destroyed the history it was supposed to preserve.
+        # `unless_duplicate` stops Copy from making the artist's own history
+        # claim the thing happened twice.
+        from .report_log import record, show
+        if lines:
+            record(self.title.rstrip(":"), ob.name, lines, unless_duplicate=True)
+        else:
+            # An Outcome with no refusals and no warnings carries nothing the
+            # Log does not already hold -- the operator logged its own summary
+            # when it ran, and that summary is RICHER than this (`rep.lines()`
+            # is refusals + warnings only, so a clean export's Outcome is
+            # empty). Appending "(nothing)" beneath it would be noise the
+            # artist has to read past. Reveal the Log instead.
+            show()
+        self.report({"INFO"}, f"{len(lines)} line(s) on the clipboard, and in "
+                              f"the `{REPORT_TEXT_NAME}` text block")
+        return {"FINISHED"}
+
+
 def _stored_report(layout, ob, key, title):
-    """The last export's or push's refuse/warn lines (export-v1 §5.1/§5.2).
+    """The last export's, push's or bake's lines: ONE status row, plus the
+    refusals in full (export-v1 §5.1/§5.2).
 
     Stored on the marker rather than left to the operator report, which is gone
-    by the time the artist looks up from the viewport."""
+    by the time the artist looks up from the viewport.
+
+    **The report is READ in the Log pane now** (ADR-0185 decision 5): a running
+    Text datablock, selectable, in sequence, with a header per entry, because
+    *"I pushed, then exported, and the export refused"* is a sequence the
+    three-key model cannot express. So the in-panel block stops being a second,
+    worse copy of it. The `[:12]` cut, the `[:3]` refusal cut, the 88-column
+    wrap and `exmateria_map_report_expanded` all lose the reason they existed,
+    which was a Properties column with no room -- Amendment 3 deferred this
+    waiting for exactly the space Amendment 4 recovers.
+
+    **Refusals stay in-panel in full**, and that rule is untouched: every
+    refusal LINE, none dropped and none cut short. A refusal is the whole
+    reason the report exists, so it is never behind a disclosure triangle. The
+    wrap goes with the rest because the sidebar is 280 px whatever the pane --
+    88 columns was sized for the 453 px Properties column and clips here too,
+    and the Log is what holds the untruncated text.
+    """
     try:
         lines = json.loads(ob.get(key) or "[]")
     except (ValueError, TypeError):
         return
     if not lines:
         return
+    refusals = [ln for ln in lines if ln.startswith("REFUSE")]
     box = layout.box()
-    box.label(text=title, icon="INFO")
-    # WRAP, do not truncate.  A Blender label does not wrap, and cutting at 90
-    # ate the end of every line -- which on a push report is where the reason
-    # lives ("...check Lamp authority is ON").  A cut sentence reads as a bug in
-    # the thing being reported on.
-    for line in lines[:12]:
-        icon = "ERROR" if line.startswith("REFUSE") else "INFO"
-        for k, chunk in enumerate(textwrap.wrap(line, 88) or [""]):
-            box.label(text=chunk if k == 0 else "    " + chunk,
-                      icon=icon if k == 0 else "BLANK1")
-    if len(lines) > 12:
-        box.label(text=f"... and {len(lines) - 12} more")
+    head = box.row(align=True)
+    head.label(text=f"{title} {len(lines)} line(s)"
+                    + (f", {len(refusals)} refusal(s)" if refusals else ""),
+               icon="ERROR" if refusals else "INFO")
+    copy = head.operator(MAP_OT_copy_report.bl_idname, text="", icon="COPYDOWN")
+    copy.key, copy.title = key, title
+    for line in refusals:
+        box.label(text=line, icon="ERROR")
 
 
 def _rig_box(layout, ov, editable):
-    """The 21 controls, plus the 6 bytes that are shown and not edited."""
+    """The 21 controls as a TABLE — `Light 1 | Light 2 | Light 3` side by side.
+
+    ADR-0185 decision 6. ~24 rows to ~9, measured at the sidebar's 280 px as
+    **~610 px of column against ~175 px** (`workspace/README.md` gate 3, and
+    `gate3_rig_table_vs_list.png`, both shapes in one sidebar at one width).
+    The data is three instances of ONE shape and the list made them
+    incomparable: you cannot see that light 2 is twice light 1 without
+    scrolling between them. A `UIList` was **rejected** — it is Blender's stock
+    answer for N-of-a-kind, and it shows one and hides two, which is the
+    opposite of the goal.
+
+    **The gradient is one line.** Its six values stay in the Override, so the
+    rig remains the whole 45 bytes; they stop occupying a third of the box to
+    be un-editable, which reads as broken rather than as deliberate. This does
+    not start the sky-gradient work, which is parked.
+    """
     box = layout.box()
-    col = box.column(align=True)
-    col.enabled = editable
-    col.prop(ov, "ambient")
+    box.enabled = editable
+    box.prop(ov, "ambient")
+    row = box.row(align=True)
     for k in range(3):
-        col.separator()
+        col = row.column(align=True)
         col.label(text=f"Light {k + 1}")
         # A gain is NOT a colour: Blender hard-clamps a COLOR widget to 0-1 and
         # the corpus reaches 13.55x, so this is a plain float triple in Godot's
         # own uniform units.  The direction's LENGTH is ignored everywhere.
-        col.prop(ov, MAP_PG_rig_override.GAINS[k], text="gain")
-        col.prop(ov, MAP_PG_rig_override.DIRS[k], text="dir")
-    col.separator()
-    grad = box.column(align=True)
-    grad.enabled = False
-    grad.label(text="background gradient — the game draws this as a SCREEN "
-                    "backdrop, not shading; carried, not previewed")
-    grad.prop(ov, "gradient", text="top / bottom (u8)")
+        col.prop(ov, MAP_PG_rig_override.GAINS[k], text="")
+        col.separator()
+        col.prop(ov, MAP_PG_rig_override.DIRS[k], text="")
+    box.label(text="gradient \u2014 carried, not previewed (6 bytes)")
 
 
 def _draw_rig(layout, ob, i, ov, own_rig, src):
     layout.separator()
     if ov is not None:
         _rig_box(layout, ov, True)
-        row = layout.row(align=True)
-        row.operator(MAP_OT_clear_rig_override.bl_idname,
-                     text="Revert this state", icon="LOOP_BACK")
-        n = len(ob.exmateria_map_rig_overrides)
-        row.operator(MAP_OT_clear_rig_override.bl_idname,
-                     text=f"Revert all ({n})", icon="TRASH").all_states = True
+        # ONE button.  "Revert all" was a much bigger hammer than anyone
+        # reaching for it expects now that every state is exposed -- it would
+        # read as "reset all 21 states".  The flag stays on the operator.
+        layout.operator(MAP_OT_clear_rig_override.bl_idname,
+                        text="Reset to the ROM's rig", icon="LOOP_BACK")
         return
-    # No Override.  Decision 25 refuses live editing on a state that does not
-    # own its rig; the values are still SHOWN, so the artist can see what the
-    # preview is using and where it came from.
+    # No Override at all.  `ensure_rig_exposure` gives every state one, so this
+    # is the pre-exposure `.blend` that has not been through `apply_state_light`
+    # yet -- kept so the panel shows the values rather than nothing.
     box = layout.box()
     states = object_states(ob)
     authored = bool(0 <= i < len(states) and states[i].get(AUTHORED_RIG))
@@ -2020,7 +2520,9 @@ def _draw_rig(layout, ob, i, ov, own_rig, src):
             g = tuple(round(c / GAIN_SCALE, 3) for c in own_rig["colors"][k])
             col.label(text=f"gain {k + 1}   {g}")
         col.label(text=f"gradient {tuple(own_rig.get('gradient') or ())}")
-    box.operator(MAP_OT_mint_rig_override.bl_idname, icon="GREASEPENCIL")
+    # No button here: `ensure_rig_exposure` gives every state a rig, so there
+    # is no gesture left to offer.  It stays registered
+    # because scripts and three harnesses still call it.
 
 
 def menu_func(self, context):
@@ -2037,6 +2539,16 @@ def register():
                     "(Godot's map_light_debug)",
         items=[(k, label, desc) for k, label, desc in DEBUG_MODES],
         default="0", update=_light_debug_update)
+    # Default RAW so painting is live the moment there is something to paint.
+    # Harmless before then: `set_preview_source` falls back to the CLUT when no
+    # paint image exists, so an imported map looks exactly as it does today
+    # until *Paint sheet* is pressed.
+    bpy.types.Object.exmateria_map_preview_source = EnumProperty(
+        name="Preview",
+        description="Show the true-colour painting, or the compiled map the "
+                    "game will actually display",
+        items=[(k, label, desc) for k, label, desc in PREVIEW_MODES],
+        default="RAW", update=_preview_source_update)
     bpy.types.Object.exmateria_map_light_boost = FloatProperty(
         name="Light boost",
         description="Exaggerate the isolated stage, then clamp "
@@ -2049,14 +2561,15 @@ def register():
     bpy.utils.register_class(MAP_PG_rig_override)
     bpy.types.Object.exmateria_map_rig_overrides = CollectionProperty(
         type=MAP_PG_rig_override,
-        description="Decision 25 Overrides: edited light rigs, per map state. "
-                    "Preview-only — never written to the document or the disc")
+        description="The light rig, per map state. Exposed on every state; "
+                    "export writes only the ones the artist moved something on")
+    bpy.utils.register_class(MAP_OT_copy_report)
     bpy.utils.register_class(IMPORT_OT_interchange_document)
     bpy.utils.register_class(MAP_OT_set_preview_state)
     bpy.utils.register_class(MAP_OT_pin_view_transform)
-    bpy.utils.register_class(MAP_OT_mint_rig_override)
     bpy.utils.register_class(MAP_OT_clear_rig_override)
     bpy.utils.register_class(MAP_MT_preview_state)
+    bpy.utils.register_class(MAP_PT_map_transform)
     bpy.utils.register_class(MAP_PT_preview)
     bpy.utils.register_class(MAP_PT_export)
     register_badge()
@@ -2079,12 +2592,13 @@ def unregister():
     unregister_badge()
     bpy.utils.unregister_class(MAP_PT_export)
     bpy.utils.unregister_class(MAP_PT_preview)
+    bpy.utils.unregister_class(MAP_PT_map_transform)
     bpy.utils.unregister_class(MAP_MT_preview_state)
     bpy.utils.unregister_class(MAP_OT_clear_rig_override)
-    bpy.utils.unregister_class(MAP_OT_mint_rig_override)
     bpy.utils.unregister_class(MAP_OT_pin_view_transform)
     bpy.utils.unregister_class(MAP_OT_set_preview_state)
     bpy.utils.unregister_class(IMPORT_OT_interchange_document)
+    bpy.utils.unregister_class(MAP_OT_copy_report)
     del bpy.types.Object.exmateria_map_rig_overrides
     bpy.utils.unregister_class(MAP_PG_rig_override)
     bpy.utils.unregister_class(MAP_AddonPreferences)
@@ -2097,10 +2611,11 @@ def viewport_draw_overlays(self, context):
 
 
 classes = (MAP_AddonPreferences, MAP_PG_rig_override,
+           MAP_OT_copy_report,
            IMPORT_OT_interchange_document, MAP_OT_set_preview_state,
-           MAP_OT_pin_view_transform, MAP_OT_mint_rig_override,
-           MAP_OT_clear_rig_override, MAP_MT_preview_state,
-           MAP_PT_preview, MAP_PT_export)
+           MAP_OT_pin_view_transform, MAP_OT_clear_rig_override,
+           MAP_MT_preview_state,
+           MAP_PT_map_transform, MAP_PT_preview, MAP_PT_export)
 
 if __name__ == "__main__":
     register()

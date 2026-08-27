@@ -66,6 +66,17 @@ from __future__ import annotations
 import struct
 from typing import NamedTuple
 
+# The document's palette entries are hex colours plus an STP mask, and turning
+# those into BGR555 words is `build`'s arithmetic. It is imported rather than
+# repeated: a CLUT that reached RAM through different packing than the one that
+# reaches the disc would make this loupe lie in the one way it exists to stop.
+# Both spellings are needed -- the addon imports this module as a package
+# member, the tests and the CLI tools import it as a top-level module.
+try:                                     # pragma: no cover - import shape only
+    from ._vendor.exmateria_map.document import clut_from_json
+except ImportError:                      # pragma: no cover
+    from _vendor.exmateria_map.document import clut_from_json
+
 # --- the document's four polygon buckets, in disc order (schema §3) ---------
 BUCKETS = ("textured_triangle", "textured_quad",
            "untextured_triangle", "untextured_quad")
@@ -140,9 +151,10 @@ def parse_descriptor(block: bytes, index: int) -> Descriptor:
 #:
 #: The last two are written as a byte cursor rather than a count -- 0x2000/0x20
 #: is exactly 256 records -- which is why a count-shaped search for them finds
-#: only the first two. A copy, deliberately: the addon never imports
+#: only the first two. A copy, deliberately: the addon does not import
 #: `exmateria_map` (ADR-0004 §7), and `document.ENGINE_CAPACITY` is the
-#: package's own statement of the same fact for `build`.
+#: package's own statement of the same fact for `build`. ADR-0004 decision 31
+#: vendors the package, which makes this copy collapsible once that is built.
 ENGINE_CAPACITY = {"textured_triangle": 360, "textured_quad": 710,
                    "untextured_triangle": 64, "untextured_quad": 256}
 
@@ -819,6 +831,100 @@ return table.concat(t)''').strip()
         return bytes.fromhex(hexed)
 
 
+class RamClient:
+    """Main RAM over HTTP -- `GET`/`POST /api/v1/cpu/ram/raw` (#606 part 1).
+
+    The same job as `LuaClient` and none of the encoding. The Lua path hex-codes
+    every byte into a string and walks it in the interpreter; this hands raw
+    bytes to a bounds-checked `memcpy` and gets the whole 2 MB back in one GET.
+
+    **Both endpoints are upstream pcsx-redux**, not our fork's -- which is the
+    point of the port: only the light rig's GTE half (`apply_gte`, control
+    registers `cnt13-15` / `cnt16-20`) genuinely needs the fork, because those
+    are not `m_wram` and no HTTP endpoint reaches them. So a session runs this
+    for RAM and keeps a `LuaClient` for the rig.
+
+    Measured [LIVE] 2026-08-27 on a Gariland battle: A/B/A through this client
+    round-trips exactly, and the Lua window sees the same bytes.
+
+    **The trap this class is shaped around.** `POST` takes ONE contiguous run,
+    and a geometry plan is thousands of six-byte runs -- a request each would be
+    *slower* than the Lua walk. `cluster_writes` collapses a whole plan into a
+    handful of requests, which is where the win actually is.
+    """
+
+    def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
+        self.host, self.port = host, port
+        self.base = f"http://{host}:{port}/api/v1/cpu/ram/raw"
+
+    # -- transport, isolated so the tests can drive a byte array
+    def _get(self) -> bytes:
+        try:
+            with urllib.request.urlopen(self.base, timeout=60.0) as r:
+                got = r.read()
+        except urllib.error.HTTPError as e:
+            raise TransportError(f"ram GET {e.code}") from e
+        except (urllib.error.URLError, OSError) as e:
+            raise TransportError(
+                f"no emulator answering on {self.host}:{self.port} ({e})") from e
+        if len(got) != RAM_BYTES:
+            raise TransportError(
+                f"the RAM read returned {len(got):,} bytes, not {RAM_BYTES:,}")
+        return got
+
+    def _post(self, offset: int, data: bytes) -> None:
+        req = urllib.request.Request(
+            f"{self.base}?offset={offset}&size={len(data)}", data=data,
+            method="POST", headers={"Content-Type": "application/octet-stream"})
+        try:
+            urllib.request.urlopen(req, timeout=60.0).read()
+        except urllib.error.HTTPError as e:
+            raise TransportError(
+                f"ram POST {e.code} for {len(data)} byte(s) at "
+                f"0x{RAM_BASE + offset:08X}") from e
+        except (urllib.error.URLError, OSError) as e:
+            raise TransportError(
+                f"no emulator answering on {self.host}:{self.port} ({e})") from e
+
+    def ping(self) -> bool:
+        try:
+            return len(self._get()) == RAM_BYTES
+        except LiveLinkError:
+            return False
+
+    def read(self, address: int, length: int) -> bytes:
+        """`length` bytes of main RAM from `address`.
+
+        Refused by name outside main RAM rather than left to the endpoint's
+        400: the Lua client names the address and the field, and a transport
+        swap must not quietly downgrade that to a status code.
+        """
+        o = address - RAM_BASE
+        if o < 0 or o + length > RAM_BYTES:
+            raise LiveLinkError(f"0x{address:08X}+{length} is outside main RAM")
+        return self._get()[o:o + length]
+
+    def write(self, writes: list[tuple[int, bytes]]) -> int:
+        """Do the writes; return how many bytes actually **changed**.
+
+        The count is the same contract `apply` has always had -- `selfcheck`
+        leans on a zero meaning "the engine already holds this" -- and here it
+        is free: the GET has already provided the before-image the clustering
+        needed anyway.
+        """
+        if not writes:
+            return 0
+        image = self._get()
+        changed = 0
+        for address, data in writes:
+            o = address - RAM_BASE
+            changed += sum(1 for a, b in zip(image[o:o + len(data)], data)
+                           if a != b)
+        for address, data in cluster_writes(writes, image):
+            self._post(address - RAM_BASE, data)
+        return changed
+
+
 #: A packed record is `[8 hex offset][4 hex length][data]`. The length field's
 #: width is load-bearing: a length too wide for it silently spills into the
 #: data, Lua then reads data bytes as the NEXT record's address, and the write
@@ -848,8 +954,68 @@ def pack_writes(writes: list[tuple[int, bytes]]) -> str:
     return "".join(out)
 
 
-def apply(client: LuaClient, writes: list[tuple[int, bytes]]) -> int:
+#: How far apart two runs may be and still travel in one request.
+#:
+#: `POST /api/v1/cpu/ram/raw` takes ONE contiguous run, and a geometry plan is
+#: thousands of six-byte runs -- a request each would be slower than the Lua
+#: path it replaces, so coalescing is the entire point of this transport. The
+#: bytes in a filled gap are read from the before-image and written straight
+#: back, so the request is a no-op over them.
+#:
+#: It is a **collateral bound**, not a tuning knob. Every byte inside a filled
+#: gap is read-modify-written, so if the engine changes one between the GET and
+#: the POST, the POST puts the stale copy back. That is the one way this
+#: transport can be wrong where the hex-encoded Lua walk -- which touched only
+#: the bytes it was given -- could not be. 64 keeps the collateral to a few
+#: bytes per cluster while still collapsing a whole bucket's plan into a
+#: handful of requests.
+COALESCE_GAP = 64
+
+
+def cluster_writes(writes: list[tuple[int, bytes]], image: bytes,
+                   gap: int = COALESCE_GAP) -> list[tuple[int, bytes]]:
+    """Merge a plan into the fewest contiguous runs worth one request each.
+
+    `image` is a whole-RAM before-image (the endpoint's GET), used to fill the
+    gaps between runs with the bytes already there.
+
+    The plan is **sorted first**. It arrives grouped per bucket and per field
+    and is therefore unordered; the Lua walk did not care, but a cluster does --
+    an unsorted plan produces a negative-length gap and silently truncates.
+    """
+    if not writes:
+        return []
+    for address, data in writes:
+        o = address - RAM_BASE
+        if o < 0 or o + len(data) > RAM_BYTES:
+            raise LiveLinkError(
+                f"0x{address:08X}+{len(data)} is outside main RAM")
+
+    ordered = sorted(writes, key=lambda w: w[0])
+    out: list[tuple[int, bytearray]] = []
+    for address, data in ordered:
+        if out:
+            base, buf = out[-1]
+            end = base + len(buf)
+            if address - end <= gap and address >= base:
+                if address > end:
+                    o = end - RAM_BASE
+                    buf += image[o:o + (address - end)]
+                head = address - base
+                buf[head:head + len(data)] = data
+                continue
+        out.append((address, bytearray(data)))
+    return [(a, bytes(b)) for a, b in out]
+
+
+def apply(client, writes: list[tuple[int, bytes]]) -> int:
     """Do the writes; return how many bytes actually **changed**.
+
+    Transport-agnostic since #606 part 1: it delegates to `client.write` when
+    the client has one (`RamClient`), and otherwise runs the packed-Lua walk
+    below. Every caller -- geometry, metadata, packets, counts, palettes -- is
+    untouched by the swap. `apply_gte` is the one leg that cannot move: the GTE
+    control registers are not `m_wram` and no HTTP endpoint reaches them.
 
     Zero is the answer when the caller pushes bytes that are already there,
     and that is the whole point: `selfcheck()` pushes the engine's own bytes
@@ -860,6 +1026,9 @@ def apply(client: LuaClient, writes: list[tuple[int, bytes]]) -> int:
     """
     if not writes:
         return 0
+    writer = getattr(client, "write", None)
+    if writer is not None:
+        return writer(writes)
     packed = pack_writes(writes)
     return int(client.exec(f'''
 local mem = PCSX.getMemPtr()
@@ -930,6 +1099,73 @@ def selfcheck(client, writes: list[tuple[int, bytes]]) -> None:
             "to** -- a live push edits these very bytes and does not survive a "
             "map reload, so reload the savestate to get back to the disc's. "
             "Nothing was written.")
+
+
+#: Fields whose match at a COMPUTED address proves this module's arithmetic.
+#: `positions` and `metadata` share the position array's base; a plan that
+#: reproduces the document's own bytes there, to the byte, cannot have been
+#: built from a wrong stride, a wrong vertex offset or a wrong map.
+PROVING_FIELDS = ("positions", "metadata")
+
+
+def diagnose_selfcheck(results: dict) -> tuple[bool, list[str]]:
+    """Read the WHOLE self-check before saying what it means.
+
+    `results` is `{(bucket, field): (matched, differ, total)}`, where `matched`
+    names the candidate RAM was found to hold, or is `None`.
+
+    This used to raise on the first plan whose candidates both mismatched, and
+    it iterated in sorted order -- `metadata`, `normals`, `positions`. So an
+    emulator holding a previous session's baked normals failed at `normals` and
+    reported *"the loaded map is not this document's map"* while holding, three
+    keys later and unexamined, the proof that it is. Measured on a live
+    battle: positions **0** of 8,664 differ, metadata **0** of 1,444, normals
+    **7,589** of 8,664. Three fields, three different stories, and the
+    pessimistic one won on alphabetical order.
+
+    So: every plan is evaluated, and the PATTERN decides.
+
+    * everything matched -> pass, naming what was found.
+    * only `normals` differ, with every `positions` and `metadata` plan exact
+      -> **pass with a warning**. The arithmetic is proven by the fields that
+      matched, and lighting differing on top of it means somebody pushed a
+      bake here. That is the one cause of a mismatch that is harmless, and
+      refusing it walls the artist out completely: `_LAST_PUSH` is recorded
+      only on a SUCCESSFUL push, so a refusal can never establish the memory
+      that would let the next press through. The only way out was reloading a
+      savestate that was never the problem.
+    * anything else -> refuse, reporting every plan rather than the first.
+    """
+    unmatched = {k: v for k, v in results.items() if v[0] is None}
+    if not unmatched:
+        found = sorted({v[0] for v in results.values()})
+        return True, [f"the planned addresses hold {' and '.join(found)}"]
+
+    proven = all(v[0] is not None for k, v in results.items()
+                 if k[1] in PROVING_FIELDS)
+    if proven and all(k[1] == "normals" for k in unmatched):
+        differ = sum(v[1] for v in unmatched.values())
+        total = sum(v[2] for v in unmatched.values())
+        return True, [
+            f"this emulator was ALREADY PUSHED TO -- by another session, not "
+            f"this one. {differ:,} of {total:,} `normals` byte(s) differ, while "
+            f"every position and binding byte at the same computed addresses "
+            f"is exact, so the map is this document's and the rig's addresses "
+            f"are right. Something pushed lighting here (a bake, a previous "
+            f"Blender). Pushing will overwrite it, which is what you asked "
+            f"for; reload the savestate first if you wanted the disc's."]
+
+    rows = "; ".join(
+        f"{b} {f} {v[1]:,}/{v[2]:,}" + ("" if v[0] is None else " (ok)")
+        for (b, f), v in sorted(results.items()))
+    return False, [
+        "write-path self-check FAILED. Bytes at the planned addresses that "
+        "hold neither the imported document's own geometry nor anything this "
+        f"session pushed, per plan: {rows}. Positions differing is the case "
+        "this check exists for: either the loaded map is not this document's "
+        "map, or something else pushed to this emulator (reload the "
+        "savestate), or this rig's address arithmetic is wrong. Nothing was "
+        "written."]
 
 
 def read_descriptor_block(client: LuaClient) -> bytes:
@@ -1068,9 +1304,11 @@ def _rig_bytes(rig: dict) -> tuple[bytes, bytes, list[int]]:
     """The rig as the FILE holds it: planar gains, interleaved directions.
 
     This is `mapfile.pack_light_rig`'s first 39 bytes, re-derived because the
-    addon ships without the `exmateria_map` package (ADR-0005 decision 6 keeps
-    this module stdlib-only). `tests/test_live_link.py` asserts the two agree
-    byte for byte, so the second copy cannot drift silently.
+    addon ships without the `exmateria_map` package (ADR-0005 decision **2**
+    keeps this module `bpy`-free; there is no decision 6). `tests/
+    test_live_link.py` asserts the two agree byte for byte, so the second copy
+    cannot drift silently. ADR-0004 decision 31 vendors the package and so
+    retires the reason for this copy -- collapsible once that is built.
     """
     colors = _rig_triples(rig, "colors", -0x8000, 0x7FFF)
     directions = _rig_triples(rig, "directions", -0x8000, 0x7FFF)
@@ -1146,6 +1384,219 @@ def apply_gte(client: LuaClient, writes: list[tuple[int, int]]) -> int:
     return len(writes)
 
 
+def packet_witnesses(client, descriptor: Descriptor,
+                     document: dict) -> list[tuple[int, int, int, int]]:
+    """What `live_vram.derive_addresses` needs, read from the live packets.
+
+    One `(live_clut, live_tpage, doc_palette_id, doc_texture_page)` per
+    textured polygon. The engine's halfwords carry the VRAM addresses it is
+    rendering FROM; the document says which palette and page each polygon
+    means. Subtracting the second from the first is what locates the sheet and
+    the CLUT block without reading a single pixel -- and it is 385 independent
+    witnesses on MAP022 a0, which is what makes the answer knowledge.
+
+    Both textured buckets, always. 361 of those 385 are quads, so a witness set
+    drawn from triangles alone would happily agree about a layout that the bulk
+    of the map disagreed with.
+    """
+    live, = struct.unpack("<I", client.read(PACKET_BASE_POINTER, 4))
+    check_packet_base(live)
+
+    by_bucket: dict[str, list[dict]] = {b: [] for b in BUCKETS}
+    for poly in document.get("polygons", ()):
+        by_bucket[poly["kind"]].append(poly)
+
+    out = []
+    for bucket in PACKET_LAYOUT:
+        polys = by_bucket[bucket]
+        if not polys:
+            continue
+        sink, lay = SINKS[bucket], PACKET_LAYOUT[bucket]
+        i = BUCKETS.index(bucket)
+        stride, start = sink.packet_stride, descriptor.starts[i]
+        current = client.read(live + sink.packet + start * stride,
+                              stride * max(descriptor.counts[i], len(polys)))
+        for p, poly in enumerate(polys):
+            if "palette_id" not in poly or "texture_page" not in poly:
+                continue
+            clut, = struct.unpack_from("<H", current, p * stride + lay.clut)
+            tpage, = struct.unpack_from("<H", current, p * stride + lay.tpage)
+            out.append((clut, tpage, poly["palette_id"], poly["texture_page"]))
+    return out
+
+
+# --- the palettes (decision 2's other half of the sheet atom) ---------------
+
+#: The 16x16 CLUT block's home in **main RAM**, and the reason this leg is here
+#: rather than in `live_vram.py`.
+#:
+#: The obvious sink is wrong. A map state's palettes ARE VRAM's CLUT rows at
+#: y=480 -- `live_clut_halfword - doc_palette_id` is 0x7800 on 385 of 385
+#: polygons, and 0x7800 decodes to exactly that row. But VRAM is not where they
+#: LIVE. Measured [LIVE] on a Gariland battle, 2026-08-26, by writing a row and
+#: reading it back at four delays:
+#:
+#:     VRAM  (x=80, y=480)   written, verified 0/32 differ, and back to its
+#:                           ORIGINAL bytes 50 ms later -- and at 0.2 s, and 1 s
+#:     RAM   0x800E4EA4+160  written, still 0/32 differ a full second later,
+#:                           and VRAM's row 5 moved to match within 0.3 s
+#:
+#: The same experiment on the texture SHEET holds in VRAM indefinitely, which
+#: is what makes this a property of the palettes rather than of the endpoint:
+#: the engine re-uploads this block every frame and does not re-upload the
+#: sheet. So a push aimed at VRAM's CLUT rows is a push that works for one
+#: frame -- long enough to verify, short enough that the artist never sees it.
+#:
+#: This block matched the live VRAM CLUT block **0 of 512 bytes different**,
+#: and differs from `MAP022.9`'s own 0x44 chunk by 35 bytes over rows 0, 7, 8,
+#: 10, 13 and 14 -- which is why no disc resource matches all 16 live rows.
+#: Those six are the palette ANIMATION's work; the chunk that drives it
+#: (`mapfile.PALETTE_ANIM_PTR`, 0x70) still has no reader.
+CLUT_BLOCK = 0x800E4EA4
+CLUT_ROWS = 16
+CLUT_ENTRIES = 16
+CLUT_ROW_BYTES = CLUT_ENTRIES * 2
+CLUT_BLOCK_BYTES = CLUT_ROWS * CLUT_ROW_BYTES
+
+#: The map's **0x44 palette chunk, as the loader left it in RAM** -- the other
+#: block a content scan for these 512 bytes finds. Pushing here does not reach
+#: the screen (measured: writing row 5 moved 0 of 32 VRAM bytes), so `CLUT_BLOCK`
+#: above is the sink and this is not.
+#:
+#: It was first recorded here as an "inert twin", and that was wrong about WHAT
+#: it is while right about what it does. It is not a stale duplicate: the
+#: palette-animation routine at `0x8009269C` / `0x800926AC` (one function,
+#: `ra = 0x80092794`) writes each animated frame into **both** blocks, entry by
+#: entry -- this one at `+0x10`, `CLUT_BLOCK` at `+0x00` of the same loop body.
+#: Confirmed by watchpoint, 20 and 60 hits, single writer each.
+#:
+#: Why a push here is still ineffective: nothing re-uploads a STATIC row from
+#: either block after map load. `CLUT_BLOCK` reaches VRAM continuously, so a
+#: write there shows up within ~0.3 s; this block is only ever read as the
+#: animation's own source. Anything that later wants to change an ANIMATED row
+#: for more than one frame has to deal with both, which is #624's problem.
+CLUT_BLOCK_BASE_COPY = 0x80099D76
+
+#: The old name, kept briefly because it appears in a shipped docstring and in
+#: #606's comment thread. It described the address correctly and the thing
+#: incorrectly.
+CLUT_BLOCK_INERT_TWIN = CLUT_BLOCK_BASE_COPY
+
+#: Rows the engine repaints on its own, measured by writing all 16 and reading
+#: back. Used ONLY to keep the pre-write check from refusing on them (they
+#: legitimately differ between a RAM read and a VRAM read taken moments apart).
+#: Decision 3: the push does not PREDICT which rows will not hold -- it writes,
+#: reads back, and names whatever did not. This list is what the check
+#: tolerates, never what the report is built from.
+CLUT_ANIMATED_MEASURED = (13, 14, 15)
+
+
+def plan_palettes(palettes) -> list[tuple[int, bytes]]:
+    """Writes for `map_states[].palettes`, one per declared CLUT row.
+
+    Decision 10: **push only what the document declares.** `None` plans
+    nothing -- 38.5% of corpus states carry no palettes of their own and render
+    with a keyed partner's, so a null is a normal document, and refusing the
+    whole press for one would strand a state whose SHEET is perfectly pushable.
+    A short row writes only the entries it has, for the same reason: what it
+    does not declare is not ours to zero (#496 -- zero is the worst fill).
+
+    A row at a time rather than one 512-byte write because a row is the unit
+    everything else here happens to: a refusal names one, the readback reports
+    one, and the engine's animation overwrites one.
+    """
+    if not palettes:
+        return []
+    out = []
+    for i, row in enumerate(palettes):
+        if not row:
+            continue
+        row = _clut_words(row, i)
+        if i >= CLUT_ROWS:
+            raise LiveLinkError(
+                f"this document declares CLUT row {i}, and a map has "
+                f"{CLUT_ROWS}. Writing past the block would land in whatever "
+                "follows it in RAM")
+        if len(row) > CLUT_ENTRIES:
+            raise LiveLinkError(
+                f"CLUT row {i} declares {len(row)} entries and a row holds "
+                f"{CLUT_ENTRIES}")
+        out.append((CLUT_BLOCK + i * CLUT_ROW_BYTES,
+                    b"".join(int(w).to_bytes(2, "little") for w in row)))
+    return out
+
+
+def _clut_words(row, index: int) -> list[int]:
+    """One CLUT row as BGR555 words, from either shape it can arrive in.
+
+    `map_states[].palettes` is the DOCUMENT's `{"colors": ["#RRGGBB" x 16],
+    "stp": u16}` (schema §6.4); `mapfile.read_palettes` hands back the disc's
+    raw words. The push is driven from a document, and the corpus tools and the
+    live probes hold the other, so both are taken here rather than pushing the
+    conversion out to whichever caller is least tested.
+
+    The hex form is converted by the **vendored writer `build` itself uses**,
+    not by a second implementation of the packing. A CLUT that reached RAM
+    through different arithmetic than the one that reaches the disc would make
+    the loupe lie in exactly the way it exists to prevent.
+    """
+    if isinstance(row, dict):
+        try:
+            return clut_from_json(row)
+        except (KeyError, ValueError, TypeError) as e:
+            raise LiveLinkError(
+                f"CLUT row {index} is a document palette entry but not a valid "
+                f"one ({e}). The schema is "
+                '{"colors": ["#RRGGBB" x 16], "stp": 0..65535}') from e
+    try:
+        return [int(w) for w in row]
+    except (TypeError, ValueError) as e:
+        raise LiveLinkError(
+            f"CLUT row {index} is neither a document palette entry "
+            '({"colors": [...], "stp": N}) nor a list of BGR555 words: '
+            f"{row!r:.80}") from e
+
+
+def check_clut_block(ram: bytes, vram_clut: bytes) -> None:
+    """Refuse unless `CLUT_BLOCK` is really feeding the CLUT rows on screen.
+
+    Decision 5's locate-by-verify, at the one address on this leg that a
+    content scan cannot settle: the same 512 bytes appear TWICE in main RAM,
+    and the other one (`CLUT_BLOCK_BASE_COPY`, the map's 0x44 chunk as the
+    loader left it) does not reach the screen -- a push into it reports a
+    healthy changed-byte count and moves nothing at all. So the address is not
+    trusted for being written down; the block it names is checked against what
+    the GPU is actually showing.
+
+    The engine-animated rows are excluded, and that is not a loophole. They
+    differ between a RAM read and a VRAM read taken microseconds apart because
+    the engine repaints them in between -- comparing them would make this check
+    fail at random on a perfectly healthy rig, which is the one way to make a
+    guard worth ignoring.
+    """
+    if len(ram) < CLUT_BLOCK_BYTES or len(vram_clut) < CLUT_BLOCK_BYTES:
+        raise LiveLinkError(
+            f"the CLUT check needs {CLUT_BLOCK_BYTES} bytes from each side and "
+            f"got {len(ram)} / {len(vram_clut)}")
+    differ = []
+    for row in range(CLUT_ROWS):
+        if row in CLUT_ANIMATED_MEASURED:
+            continue
+        o = row * CLUT_ROW_BYTES
+        n = sum(1 for a, b in zip(ram[o:o + CLUT_ROW_BYTES],
+                                  vram_clut[o:o + CLUT_ROW_BYTES]) if a != b)
+        if n:
+            differ.append(f"row {row} ({n}/{CLUT_ROW_BYTES} B)")
+    if differ:
+        raise LiveLinkError(
+            f"0x{CLUT_BLOCK:08X} does not hold the palettes the GPU is showing: "
+            + ", ".join(differ) +
+            ". This is not the map this module was built against, or the block "
+            f"has moved -- the map's 0x44 chunk as loaded sits at "
+            f"0x{CLUT_BLOCK_BASE_COPY:08X} and a push into THAT one does not "
+            "reach the screen. Refusing rather than writing there")
+
+
 #: Document fields with no live sink, and why. Decision 4 wants these NAMED on
 #: every push rather than silently dropped.
 UNPUSHED = {
@@ -1166,10 +1617,15 @@ UNPUSHED = {
                                      "fill. A reordered untextured polygon "
                                      "leaves them behind, on 69 of MAP022 "
                                      "a0's 454 polygons",
-    "map_states[].texture_sheet": "built, but by `tools/live_push.py`'s "
-                                  "savestate round trip, not by this module",
-    "map_states[].palettes": "the CLUT rows are VRAM, on the same savestate "
-                             "leg as the sheet -- and ONE ATOM with it "
-                             "(decision 9): a sheet pushed through the wrong "
-                             "state's CLUTs is garbage, not a stale picture",
 }
+
+#: Fields that USED to be in `UNPUSHED` and are not any more, kept as a note
+#: because the addon's own `CLAUDE.md` records a false premise here that
+#: "outlived the code by four months".
+#:
+#: `map_states[].texture_sheet` and `map_states[].palettes` are both pushed by
+#: the button now (`live_vram.plan_sheet` and `plan_palettes` above), so they
+#: are out of `UNPUSHED` altogether -- the same exit the light rig made when it
+#: got a sink. The entry for the sheet said it was built "by
+#: `tools/live_push.py`'s savestate round trip"; that tool is gone, and so is
+#: the premise it rested on.

@@ -40,7 +40,7 @@ REPORT = TMP / "report.json"
 
 #: A run that stops early has caught nothing. `live_normals_audit.py` learned
 #: this the hard way — it printed PASS directly under "the audit itself broke".
-EXPECTED_CHECKS = 86
+EXPECTED_CHECKS = 120
 
 SCRIPT_TEMPLATE = r'''
 import json
@@ -77,7 +77,8 @@ except Exception as e:
 bpy.ops.preferences.addon_enable(module='exmateria_map')
 sys.path.insert(0, PKG)
 
-from exmateria_map import export_document, live_link as L, live_link_ui as UI
+from exmateria_map import (export_document, live_link as L,
+                           live_link_ui as UI, live_vram as VR)
 
 DOC = json.loads(open(JSON).read())
 
@@ -307,7 +308,7 @@ def seed_rig(ram, rig):
 
 
 def fresh_ram(doc=DOC, counts=None, honour_start=True, rig=None,
-              followers=()):
+              followers=(), clut=False):
     ram = FakeRam()
     ram.poke(L.DESCRIPTOR_BASE,
              descriptor_block(counts or doc_counts(doc), followers=followers))
@@ -315,11 +316,100 @@ def fresh_ram(doc=DOC, counts=None, honour_start=True, rig=None,
     seed_metadata(ram, doc, honour_start=honour_start)
     seed_packets(ram, doc, honour_start=honour_start)
     seed_rig(ram, rig)
+    # Off by default for the same reason the rig is: a comparison side that
+    # seeds what the push is about to write is an inert seed, and reads exactly
+    # like a blind check. Switched on only where the check is about something
+    # ELSE and the palette write would otherwise show up as its difference.
+    if clut:
+        block = clut_block_bytes(doc)
+        if block is not None:
+            ram.poke(L.CLUT_BLOCK, block)
     return ram
 
 
+def fresh_vram(ram, doc=DOC):
+    vram = FakeVramClient()
+    seed_clut(ram, vram, doc)
+    return vram
+
+
+class FakeVramClient:
+    """Enough of `live_vram.VramClient` to be a machine, not a stub.
+
+    VRAM really is a byte buffer, so this is not a mock of the endpoint -- it
+    is the endpoint's semantics: a POST paints `width` words a row at `(x, y)`
+    and a GET hands back the megabyte. `check_rect` runs on every write, so a
+    rectangle the real fork would 400 fails here too.
+    """
+
+    def __init__(self):
+        self.vram = bytearray(VR.VRAM_BYTES)
+        self.posted = []
+        self.reads = 0
+
+    def ping(self):
+        return True
+
+    def read(self):
+        self.reads += 1
+        return bytes(self.vram)
+
+    def write_rect(self, rc):
+        VR.check_rect(rc)
+        self.posted.append(rc.label)
+        for r in range(rc.height):
+            o = (rc.y + r) * VR.PITCH + rc.x * 2
+            self.vram[o:o + rc.width * 2] = rc.data[r * rc.width * 2:
+                                                    (r + 1) * rc.width * 2]
+
+
+def clut_block_bytes(doc):
+    """A state's palettes packed as the 512-byte block the loader leaves."""
+    pals = next((st["palettes"] for st in doc["map_states"] if st.get("palettes")),
+                None)
+    if not pals:
+        return None
+    block = b"".join(w.to_bytes(2, "little")
+                     for row in pals
+                     for w in L._clut_words(row, 0))[:L.CLUT_BLOCK_BYTES]
+    return block.ljust(L.CLUT_BLOCK_BYTES, b"\x00")
+
+
+def seed_clut(ram, vram, doc):
+    """Put a state's palettes where the map loader would have left them, in
+    BOTH memories, so `check_clut_block` has something coherent to check.
+
+    The two must agree because that is the real invariant: the RAM block is
+    what the engine uploads to the VRAM rows every frame. Seeding only one
+    would make the check pass or fail for a reason the rig does not have.
+    """
+    block = clut_block_bytes(doc)
+    if block is None:
+        return
+    ram.poke(L.CLUT_BLOCK, block)
+    for row in range(L.CLUT_ROWS):
+        o = VR.CLUT_Y * VR.PITCH + row * L.CLUT_ENTRIES * 2
+        vram.vram[o:o + L.CLUT_ENTRIES * 2] = block[row * 32:(row + 1) * 32]
+
+
 RAM = None
+
+#: VRAM is derived from whichever RAM is current rather than assigned beside
+#: it. Seventeen checks build a fresh `RAM` and none of them is about VRAM;
+#: making each one remember a second line would mean the one that forgot got a
+#: stale CLUT block and a `check_clut_block` refusal that had nothing to do
+#: with what it was testing.
+_VRAM = {}
+
+
+def vram_for(ram):
+    if _VRAM.get("ram") is not ram:
+        _VRAM["ram"], _VRAM["vram"] = ram, fresh_vram(ram)
+    return _VRAM["vram"]
+
+
 L.LuaClient = lambda host=None, port=None: RAM
+UI.VR.VramClient = lambda host=None, port=None: vram_for(RAM)
 
 
 # --- the scene -------------------------------------------------------------
@@ -463,6 +553,31 @@ try:
           any("packet plan(s) over 2 buffers" in ln for ln in last_push()),
           str(last_push()))
 
+    # ---- pushing from EDIT MODE ------------------------------------------
+    # Reported from use as a bare `IndexError` out of `stamp_new_faces` after
+    # deleting a face -- which is the exact gesture the shrink leg exists for.
+    # In Edit Mode the geometry lives in the BMesh and the Mesh datablock's
+    # ATTRIBUTE arrays read as size 0 while `me.polygons` still reports a
+    # count, so the two disagree and the first lookup blows up. The deletion is
+    # not what breaks it; READING IN EDIT MODE is, so this arm needs no
+    # deletion to seed it.
+    RAM = fresh_ram()
+    UI._LAST_PUSH.clear()
+    bpy.context.view_layer.objects.active = ob
+    ob.select_set(True)
+    bpy.ops.object.mode_set(mode="EDIT")
+    check("Edit Mode really does empty the attribute arrays",
+          len(ob.data.attributes["imported"].data) == 0
+          and len(ob.data.polygons) > 0,
+          f"{len(ob.data.attributes['imported'].data)} vs "
+          f"{len(ob.data.polygons)}")
+    res, err = push()
+    check("a push from EDIT MODE finishes instead of raising",
+          res == {"FINISHED"}, f"{res} {err}")
+    check("the artist is left in Edit Mode, where they were",
+          ob.mode == "EDIT", ob.mode)
+    bpy.ops.object.mode_set(mode="OBJECT")
+
     # ---- bytes 6-7 are written on EVERY push ------------------------------
     # The document owns the terrain BINDING word and VISIBLE_ANGLES, and the
     # push used to leave both alone on the reasoning that an existing polygon
@@ -598,6 +713,40 @@ try:
           f"{res} {err}; RAM holds {RAM.read(_at, 2).hex()}")
     _va.data[0].value = _va_was
 
+    # ---- an emulator someone ALREADY pushed lighting to -------------------
+    # Reported from use, and it walled the artist out completely: open a map in
+    # a fresh Blender, press the button, get "the loaded map is not this
+    # document's map". `_LAST_PUSH` is recorded only on a SUCCESSFUL push, so
+    # the refusal could never establish the memory that would let the next
+    # press through -- the only way out was reloading a savestate that was
+    # never the problem.
+    #
+    # Seeded as the real thing: normals scribbled, positions and metadata left
+    # exact, which is what a previous session's BAKE looks like from here.
+    # Measured on the live emulator that produced the report: positions 0 of
+    # 8,664 differ, metadata 0 of 1,444, normals 7,589 of 8,664.
+    RAM = fresh_ram()
+    UI._LAST_PUSH.clear()
+    _n = 0
+    for b in ("textured_triangle", "textured_quad"):
+        polys = [p for p in DOC["polygons"] if p["kind"] == b]
+        stride = len(polys[0]["positions"]) * 8 if polys else 0
+        for i in range(len(polys)):
+            at = (L.SINKS[b].normals
+                  + (STARTS[L.BUCKETS.index(b)] + i) * stride)
+            RAM.poke(at, b"\x11\x22\x33\x44\x55\x66")
+            _n += 1
+    check("the previous-push seed moved normals and nothing else", _n > 0, _n)
+    res, err = push()
+    check("an already-pushed-to emulator is NOT refused", res == {"FINISHED"},
+          f"{res} {err}")
+    check("it says the emulator was already pushed to, and by whom",
+          any("ALREADY PUSHED TO" in ln and "another session" in ln
+              for ln in last_push()), str(last_push()))
+    check("it does NOT blame the map or the arithmetic",
+          not any("not this document's map" in ln or "arithmetic is wrong" in ln
+                  for ln in last_push()), str(last_push()))
+
     # ---- the seeded defect: a rig that ignored the start index -----------
     # Gariland's four start indices are 0, so this is the arm the emulator
     # cannot provide. Seeded at base + i*stride, the self-check MUST go red.
@@ -636,7 +785,11 @@ try:
     # The rig is seeded on the comparison side because the push writes it and
     # the loader would have: without it this equality reports 48 bytes of
     # difference that are the feature working.
-    _seeded = fresh_ram(live_doc, rig=DOC["map_states"][0]["light_rig"])
+    # The palettes join the rig here, and for the same reason: the push writes
+    # them and the loader would have, so without them this equality reports the
+    # 472 bytes of the palette leg WORKING as a difference.
+    _seeded = fresh_ram(live_doc, rig=DOC["map_states"][0]["light_rig"],
+                        clut=True)
     check("RAM holds the edited document, at the start-index addresses",
           bytes(RAM.mem) == bytes(_seeded.mem),
           sum(1 for a, b in zip(RAM.mem, _seeded.mem) if a != b))
@@ -799,6 +952,77 @@ try:
           any("night=1" in ln for ln in last_push()), str(last_push()))
     ob["exmateria_map/preview_state"] = 0
 
+    # ---- the picture: the sheet to VRAM, the palettes to RAM --------------
+    # The leg the artist actually pressed the button for. It spans two
+    # memories: the sheet's pixels are VRAM and stay there, the palettes are
+    # VRAM's CLUT rows and are re-uploaded from main RAM every frame, so a
+    # palette write to VRAM is gone in 50 ms and the RAM block is the sink.
+    RAM = fresh_ram()
+    VRAM_NOW = vram_for(RAM)
+    _clut_before = RAM.read(L.CLUT_BLOCK, L.CLUT_BLOCK_BYTES)
+    res, err = push()
+    check("a push with a sheet and palettes finishes", res == {"FINISHED"},
+          f"{res} {err}")
+    check("the sheet reached VRAM as four page rectangles",
+          VRAM_NOW.posted[:4] == [f"texture page {p}" for p in range(4)],
+          str(VRAM_NOW.posted))
+    check("the report names the picture push",
+          any("picture:" in ln and "texture sheet" in ln for ln in last_push()),
+          str(last_push()))
+    check("the sheet is no longer named as UNPUSHED",
+          not any("map_states[].texture_sheet" in ln for ln in last_push()),
+          str(last_push()))
+    check("the palettes are no longer named as UNPUSHED",
+          not any("map_states[].palettes" in ln for ln in last_push()),
+          str(last_push()))
+
+    # The sheet in VRAM is the DOCUMENT's blob, byte for byte -- the whole
+    # point of surfacing `pack_4bpp`'s output from `assemble` rather than
+    # PNG-encoding it and decoding it again on the way in.
+    _doc, _files, _rep = export_document.assemble(ob)
+    _at = L.aim(_doc["map_states"], 0)
+    _blob = _rep.sheets[_at.sheet_row["texture_sheet"]]
+    _wit = L.packet_witnesses(RAM, L.read_descriptors(
+        L.read_descriptor_block(RAM))[0], _doc)
+    _atv = VR.derive_addresses(_wit)
+    check("VRAM holds the document's own 4bpp blob, byte for byte",
+          VR.verify(VRAM_NOW, VR.plan_sheet(_blob, _atv)) == [],
+          str([(r.label, n) for r, n in
+               VR.verify(VRAM_NOW, VR.plan_sheet(_blob, _atv))]))
+    check("the sheet blob is the disc's 131,072-byte layout",
+          len(_blob) == VR.SHEET_BYTES, str(len(_blob)))
+
+    # The palettes went to RAM, not to VRAM's CLUT rows.
+    check("the palettes reached the RAM block",
+          RAM.read(L.CLUT_BLOCK, L.CLUT_BLOCK_BYTES) == clut_block_bytes(DOC),
+          "the CLUT block in RAM is not the document's")
+    check("no CLUT rectangle was ever POSTed to VRAM",
+          not any("CLUT" in lbl for lbl in VRAM_NOW.posted),
+          str(VRAM_NOW.posted))
+
+    # Decision 6: skip the write when the bytes already match, and say so.
+    _posted_before = len(VRAM_NOW.posted)
+    push()
+    check("a second press re-POSTs no sheet page",
+          len(VRAM_NOW.posted) == _posted_before,
+          f"{VRAM_NOW.posted[_posted_before:]}")
+
+    # Decision 10: a group that declares no palettes pushes its SHEET anyway
+    # and says why. 38.5% of corpus states are in that position, and refusing
+    # the press for one would strand a perfectly pushable sheet.
+    RAM = fresh_ram()
+    _v = vram_for(RAM)
+    _night_sheet = [i for i, st in enumerate(DOC["map_states"])
+                    if st["night"] == 1]
+    ob["exmateria_map/preview_state"] = _night_sheet[0]
+    res, err = push()
+    ob["exmateria_map/preview_state"] = 0
+    check("a group with no TEXTURE row is named, not crashed on",
+          res in ({"FINISHED"}, {"CANCELLED"}),
+          f"{res} {err}")
+    check("the no-sheet group is explained by name",
+          any("night=1" in ln for ln in last_push()), str(last_push()))
+
     # ---- the base survives a DELETION, at IMPORT length -------------------
     # The old base walked `me.polygons` in CURRENT order, so deleting face 5
     # of 24 shifted every survivor down a slot, the base plan claimed slot 5
@@ -848,6 +1072,147 @@ try:
     res, err = push()
     check("a second press after a shrink is not blocked by the first",
           res == {"FINISHED"}, f"{res} {err}")
+
+    # ---- the report is COPYABLE, and collapsed by default -----------------
+    # Reported from use, twice: "it shoves a ton of crap in the right space",
+    # and "when errors come up I can't copy the contents". A Blender label
+    # cannot be selected and neither can an operator's error toast, so the
+    # refusal the artist most wants to paste was the one thing they could not
+    # get out of the application.
+    #
+    # A panel cannot be drawn in --background (there is no region), so the
+    # draw path is exercised against a recording stand-in. That catches what
+    # actually breaks here -- a missing property, a wrong operator id, an
+    # attribute error in draw -- while leaving pixels to a real Blender.
+    class FakeLayout:
+        def __init__(self, sink):
+            self.sink = sink
+
+        def box(self):
+            return self
+        def row(self, **kw):
+            return self
+        def column(self, **kw):
+            return self
+        def label(self, text="", icon=""):
+            self.sink.append(("label", text, icon))
+        def prop(self, *a, **kw):
+            self.sink.append(("prop", kw.get("icon", ""), ""))
+        def operator(self, idname, **kw):
+            self.sink.append(("operator", idname, ""))
+            return type("Props", (), {"key": "", "title": ""})()
+
+    from exmateria_map import import_document as IMP
+
+    # ADR-0185 decision 5: the panel is a STATUS ROW plus the refusals, and the
+    # Log pane is where a report is read.  There is no "open" size any more and
+    # no `exmateria_map_report_expanded` -- the disclosure triangle is what made
+    # a refusal hideable, which is the one thing this block must never allow.
+    _stored_lines = json.loads(ob[UI.LAST_PUSH_KEY])
+    _stored_refusals = [ln for ln in _stored_lines if ln.startswith("REFUSE")]
+    rows_closed = []
+    IMP._stored_report(FakeLayout(rows_closed), ob, UI.LAST_PUSH_KEY, "Last push:")
+    _row_labels = [r for r in rows_closed if r[0] == "label"]
+    check("the report is a status row and its refusals, never the whole report",
+          len(_stored_lines) > len(_stored_refusals) + 1
+          and len(_row_labels) == 1 + len(_stored_refusals),
+          f"{len(_row_labels)} label row(s) for {len(_stored_lines)} report "
+          f"line(s), {len(_stored_refusals)} of them refusals -- the "
+          f"precondition is that there IS something it is not drawing")
+    check("the report still offers the copy button",
+          any(r[0] == "operator" and r[1] == "map.copy_report"
+              for r in rows_closed), str(rows_closed[:4]))
+    check("the report draws no disclosure triangle",
+          not any(r[0] == "prop" for r in rows_closed)
+          and not hasattr(bpy.types.Object, "exmateria_map_report_expanded"),
+          str(rows_closed[:4]))
+
+    # A refusal is the whole reason the report exists and is never hidden.
+    _saved = ob[UI.LAST_PUSH_KEY]
+    ob[UI.LAST_PUSH_KEY] = json.dumps(
+        ["REFUSE: the sky fell on it", "pushed 0 changed byte(s)"])
+    rows_refuse = []
+    IMP._stored_report(FakeLayout(rows_refuse), ob, UI.LAST_PUSH_KEY, "Last push:")
+    check("a REFUSE line is drawn in full",
+          any("sky fell" in str(r[1]) for r in rows_refuse), str(rows_refuse))
+    check("the header counts the refusals",
+          any("refusal" in str(r[1]) for r in rows_refuse), str(rows_refuse))
+
+    # The clipboard is the point of the feature and is NOT observable here:
+    # measured, not assumed -- a bare `wm.clipboard = x` does not round-trip in
+    # --background. So this arm is a CONTROL on that limitation rather than a
+    # check of the feature, and it is written to go RED if a future Blender
+    # starts round-tripping, which is the signal to strengthen it. The write
+    # itself is covered by the text block below: one `execute`, two sinks, and
+    # the observable sink stands in for the one a headless run cannot see.
+    bpy.context.view_layer.objects.active = ob
+    bpy.context.window_manager.clipboard = "canary-123"
+    check("the clipboard is unobservable headless, so the TEXT BLOCK grades it",
+          bpy.context.window_manager.clipboard != "canary-123",
+          "the clipboard round-trips now -- assert the report content here")
+    res_copy = bpy.ops.map.copy_report(key=UI.LAST_PUSH_KEY, title="Last push:")
+    check("the copy operator runs to completion", res_copy == {"FINISHED"},
+          str(res_copy))
+    check("the copy operator writes a SELECTABLE text block",
+          IMP.REPORT_TEXT_NAME in bpy.data.texts
+          and "sky fell" in bpy.data.texts[IMP.REPORT_TEXT_NAME].as_string(),
+          str(list(bpy.data.texts.keys())))
+    # Pressed twice, it must not breed datablocks.
+    bpy.ops.map.copy_report(key=UI.LAST_PUSH_KEY, title="Last push:")
+    check("pressing copy twice reuses the one text block",
+          sum(1 for t in bpy.data.texts if t.name.startswith(IMP.REPORT_TEXT_NAME))
+          == 1, str(list(bpy.data.texts.keys())))
+    ob[UI.LAST_PUSH_KEY] = _saved
+
+    # The bake panel shares the renderer rather than carrying a third copy.
+    from exmateria_map import lighting_bake as LB
+    ob["exmateria_map/last_bake"] = json.dumps(["a bake line"])
+    rows_bake = []
+    LB._bake_report(FakeLayout(rows_bake), ob)
+    check("the bake report shares the collapsing renderer",
+          any(r[0] == "operator" and r[1] == "map.copy_report"
+              for r in rows_bake), str(rows_bake))
+    del ob["exmateria_map/last_bake"]
+
+    check("the `what a push carries` box is a CLOSED sub-panel now",
+          "DEFAULT_CLOSED" in UI.MAP_PT_live_push_carries.bl_options
+          and UI.MAP_PT_live_push_carries.bl_parent_id == "MAP_PT_live_push",
+          str(UI.MAP_PT_live_push_carries.bl_options))
+
+    # ADR-0186 Amendment 3's Consequences: *"the panel whose job is to say
+    # what a push carries is wrong about the leg this loop depends on."*  It
+    # said the sheet and the CLUT rows had no live sink and to use
+    # `tools/live_push.py` -- for as long as step 5c had been pushing both,
+    # and after that tool was deleted.  A panel that RESTATES `UNPUSHED` can
+    # disagree with it; these three arms hold it reading the table instead.
+    rows_carry = []
+    UI.MAP_PT_live_push_carries.draw(
+        type("P", (), {"layout": FakeLayout(rows_carry)})(), None)
+    said = " ".join(str(part) for row in rows_carry for part in row)
+    check("the carries panel names the sheet and the CLUT as CARRIED",
+          "TEXTURE SHEET" in said and "CLUT ROWS" in said, said[:300])
+    check("...and no longer sends the artist to a tool that is deleted",
+          "live_push.py" not in said and "no live sink" not in said,
+          said[:300])
+    check("...and every field it calls unpushed is one `UNPUSHED` names",
+          set(UI.NOT_CARRIED) <= set(L.UNPUSHED),
+          f"{sorted(UI.NOT_CARRIED)} vs {sorted(L.UNPUSHED)}")
+    # The other direction, and the one a restating panel got wrong: a field
+    # that gains no sink must APPEAR, prose or no prose.  Seeded rather than
+    # asserted off today's two entries, which the panel happens to have lines
+    # for -- that arm would pass on a `draw` that ignored the table entirely.
+    L.UNPUSHED["a field with no sink and no prose"] = "seeded"
+    try:
+        rows_seeded = []
+        UI.MAP_PT_live_push_carries.draw(
+            type("P", (), {"layout": FakeLayout(rows_seeded)})(), None)
+        seeded_said = " ".join(str(part) for row in rows_seeded
+                               for part in row)
+    finally:
+        del L.UNPUSHED["a field with no sink and no prose"]
+    check("a new UNPUSHED field is named by the panel with no edit to it",
+          "a field with no sink and no prose" in seeded_said,
+          seeded_said[:300])
 
     # ---- the all-empty refusal -------------------------------------------
     # Zeroing all four counts would make `check_descriptors` read the block as

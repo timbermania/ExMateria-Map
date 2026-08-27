@@ -19,7 +19,11 @@ Export reads the SCENE, never a source document.  Its five sources (§1):
 - **the grid object** — `size_x` / `size_z`, the writable target extent;
 - **tile objects** — one flagged object per level-0 record;
 - **the index images** — one per distinct sheet, the 4-bit index buffer the
-  sidecar is repacked and re-hashed from (§4.5).
+  sidecar is repacked and re-hashed from (§4.5);
+- **the CLUT images** — one 16x16 per map state, pixel (col, row) = CLUT
+  `row`'s entry `col`, which `map_states[].palettes` is re-emitted from (§6.4).
+  A state the document gives no palettes keeps none: its image is fabricated
+  from the sidecar's display-only PLTE and is not that state's data.
 
 Objects are found by their `exmateria_map/*` flags inside the marker's own
 collection; names are never parsed (§1's rule).
@@ -42,6 +46,7 @@ idempotent by a second zero-filled flag — run at the head of every export, so
 the document is right whether or not a live handler ever runs.
 """
 import array
+import contextlib
 import hashlib
 import json
 import os
@@ -56,7 +61,8 @@ from . import png_indexed
 from .import_document import (AUTHORED_RIG, AUTHORED_RIG_VERSION, FACE_INTS,
                               FORMAT, TILE_PAYLOAD_FIELDS, VERSION,
                               _blender_to_fft, _prefs, find_override,
-                              import_order, override_rig, remember_dir)
+                              import_order, override_rig, remember_dir,
+                              rig_is_dirty)
 
 SHEET_W, SHEET_H = 256, 1024
 NEW_FACE_VISIBLE_ANGLES = 32768        # 0x8000, export-v1 §8
@@ -204,6 +210,15 @@ def stamp_new_faces(me):
     imported = ensure_attr(me, "imported", "BOOLEAN", "FACE").data
     stamped = ensure_attr(me, "visible_angles_stamped", "BOOLEAN", "FACE").data
     va = ensure_attr(me, "visible_angles", "INT", "FACE").data
+    # `readable_mesh` is what keeps this from firing. It is here anyway because
+    # the alternative was an `IndexError` from deep in a loop, which names
+    # neither the invariant nor the gesture that broke it.
+    if not (len(imported) == len(stamped) == len(va) == n):
+        raise RuntimeError(
+            f"{me.name} has {n} face(s) but its attributes hold "
+            f"{len(imported)} / {len(stamped)} / {len(va)} -- the mesh and its "
+            "attributes are out of sync. This is what Edit Mode looks like "
+            "from here; leave it and press again")
     hit = 0
     for i in range(n):
         if imported[i].value or stamped[i].value:
@@ -226,6 +241,10 @@ class Report:
         self.new_faces = 0
         self.stamped = 0
         self.paint = None
+        #: {sidecar name: the 131,072-byte 4bpp blob}, for the live push.
+        #: Export writes PNGs; the push wants the disc's own layout, and this
+        #: is where it already exists (§4.5). Empty when no sheet had a buffer.
+        self.sheets = {}
 
     def refuse(self, text):
         self.refusals.append(text)
@@ -569,6 +588,100 @@ def image_indices(img):
     return bytes(out)
 
 
+def set_image_indices(img, indices):
+    """Write a 4-bit index plane back into one index image.
+
+    The inverse of `image_indices`, and it lives beside it so the two row
+    flips cannot drift apart: `indices` is TOP-scanline-first (the sidecar
+    PNG's order, which is exactly what `image_indices` hands out) and
+    Blender's pixel row 0 is the BOTTOM.  R holds the exact 0..15 index and
+    alpha is 1, the shape `import_document._index_image` writes at import.
+
+    ADR-0186 Amendment 3 decision 14 is what needs it: a conversion or a
+    re-pack moves every island, and the compiled **Sheet** is carried through
+    that same blit rather than left picturing a layout the mesh no longer
+    uses.
+    """
+    w, h = img.size
+    buf = array.array("f", bytes(4 * w * h * 4))
+    for y in range(h):
+        src, dst = y * w, (h - 1 - y) * w
+        for x in range(w):
+            at = (dst + x) * 4
+            buf[at] = float(indices[src + x] & 0xF)
+            buf[at + 3] = 1.0
+    img.pixels.foreach_set(buf)
+    img.update()
+    try:
+        img.pack()          # or it reloads BLANK, which is index 0 everywhere
+    except RuntimeError:
+        pass
+
+
+def image_rgb(img):
+    """The true-colour picture behind one image, three bytes per texel.
+
+    The inverse of `convert_op._write_art`: that buffer is TOP-scanline-first
+    like the sidecar PNG and Blender's pixel row 0 is the BOTTOM.  The image
+    is `Non-Color` and holds `byte / 255`, so a read back is the byte again --
+    the same exactness `paint.py`'s gate relies on, and the reason a painting
+    survives a save without drifting a channel.
+    """
+    w, h = img.size
+    buf = array.array("f", bytes(4 * w * h * 4))
+    img.pixels.foreach_get(buf)
+    out = bytearray(3 * w * h)
+    for y in range(h):
+        src, dst = (h - 1 - y) * w, y * w
+        for x in range(w):
+            at, j = 3 * (dst + x), (src + x) * 4
+            out[at] = int(round(buf[j] * 255.0)) & 0xFF
+            out[at + 1] = int(round(buf[j + 1] * 255.0)) & 0xFF
+            out[at + 2] = int(round(buf[j + 2] * 255.0)) & 0xFF
+    return bytes(out)
+
+
+def export_source_art(ob, states, base):
+    """The **Painting**, written beside the document (ADR-0186 dec. 4, 5, 6).
+
+    Decision 4: the compile has no inverse, so the painting cannot be
+    recovered from a compiled map -- and the irreplaceable half of an authored
+    map does not live in the `.blend`.  Decision 5: it sits in its OWN
+    top-level section under its own name, never in `map_states[].texture_sheet`
+    -- `build` reads only what that field names, so it stays blind to source
+    art by construction rather than by a rule someone has to keep.
+    Decision 6: one entry per map state, deduplicated by the painting's own
+    content hash, exactly as the disc's own sheets already collapse.
+
+    The hash is over the RGB bytes and not over the PNG, so two identical
+    paintings share one file whatever the encoder was feeling -- the same rule
+    `export_sheets` uses, where the name comes from the packed 4bpp.
+
+    Returns `(files, section)`.  Both are EMPTY on an unconverted map: the
+    section is emitted only when there is something in it, so a document that
+    never met the compile round-trips byte for byte as it always has.
+    """
+    from .convert_op import source_art_name
+    stem = f"{base['map']}.a{base['arrangement']}"
+    files, out, by_hash = {}, {}, {}
+    for i, st in enumerate(states):
+        sheet = st.get("texture_sheet")
+        if not sheet:
+            continue
+        img = bpy.data.images.get(source_art_name(sheet))
+        if img is None or tuple(img.size) != (SHEET_W, SHEET_H):
+            continue
+        rgb = image_rgb(img)
+        digest = hashlib.sha256(rgb).hexdigest()[:8]
+        name = by_hash.get(digest)
+        if name is None:
+            name = by_hash[digest] = f"{stem}.source-{digest}.png"
+            files[name] = png_indexed.write_rgb_png(rgb, SHEET_W, SHEET_H)
+            out[name] = {"states": []}
+        out[name]["states"].append(i)
+    return files, out
+
+
 def off_palette_list(ob):
     """§3.6 / §4.4 — the sticky off-palette list.
 
@@ -630,10 +743,20 @@ def majority_plte(indices, claims, clut_rows):
 def export_sheets(ob, states, base):
     """§4.5 — repack, re-hash, rename.
 
-    Returns ({new sidecar name: PNG bytes}, {old name: new name}).  A sheet
-    whose sidecar never decoded has no buffer: its states keep the imported
-    name and export writes no file for it, rather than inventing one.  Export
-    writes its own files only and never deletes a stale sidecar."""
+    Returns ({new sidecar name: PNG bytes}, {old name: new name},
+    {new sidecar name: the 4bpp blob}).  A sheet whose sidecar never decoded
+    has no buffer: its states keep the imported name and export writes no file
+    for it, rather than inventing one.  Export writes its own files only and
+    never deletes a stale sidecar.
+
+    The third return is the disc's own 131,072-byte layout, and it is handed
+    back rather than recomputed because the live push needs exactly it. It was
+    already being built here and thrown away after hashing -- and that hash is
+    the sidecar's NAME, so the bytes the push sends and the bytes `build` puts
+    on a disc are the same bytes by construction rather than by agreement. The
+    alternative, PNG-encoding here and decoding again in the pusher, is two
+    more chances to differ and no more truth.
+    """
     sheet_images = section(ob, "sheet_images", {}) or {}
     state_sheets = section(ob, "state_sheets", []) or []
     stem = f"{base['map']}.a{base['arrangement']}"
@@ -661,7 +784,7 @@ def export_sheets(ob, states, base):
                 uvs.append((u, g - page * SHEET_W))
             claims.setdefault(sheet, []).append((pal[i].value, page, uvs))
 
-    files, rename = {}, {}
+    files, rename, blobs = {}, {}, {}
     for old, img_name in sheet_images.items():
         img = bpy.data.images.get(img_name) if img_name else None
         if img is None or tuple(img.size) != (SHEET_W, SHEET_H):
@@ -670,17 +793,59 @@ def export_sheets(ob, states, base):
         packed = png_indexed.pack_4bpp(indices)
         new = f"{stem}.sheet-{hashlib.sha256(packed).hexdigest()[:8]}.png"
         rename[old] = new
+        blobs[new] = packed
         files[new] = png_indexed.write_indexed_png(
             indices, majority_plte(indices, claims.get(old, []), clut_rows),
             SHEET_W, SHEET_H)
-    return files, rename
+    return files, rename, blobs
 
 
 # ---------------------------------------------------------------------------
 # §9 — the operator's document assembly.
 # ---------------------------------------------------------------------------
 
+@contextlib.contextmanager
+def readable_mesh(ob):
+    """Read the mesh OUT of Edit Mode, and put the artist back where they were.
+
+    In Edit Mode the live geometry lives in the BMesh, and the Mesh datablock's
+    **attribute arrays read as size 0** while `me.polygons` still reports a
+    count -- so the two disagree and the first attribute lookup is a bare
+    `IndexError`. That is what an artist got for deleting a face and pressing
+    the button, which is the exact gesture the whole shrink leg exists for.
+
+    `Object.update_from_editmode()` is NOT the fix. Measured: after deleting
+    one face of 454 it syncs `me.polygons` to 453 and leaves the `imported`
+    attribute at **0**, so it converts a stale read into a mismatched one.
+    Only leaving Edit Mode restores the attributes (measured: 453 and 453).
+
+    The round trip is safe to do for the artist rather than refuse at them:
+    measured, face selection survives EDIT -> OBJECT -> EDIT unchanged. If the
+    object is not the active one there is nothing to toggle *to*, so that is
+    the one case this refuses rather than guesses at.
+    """
+    if getattr(ob, "mode", "OBJECT") != "EDIT":
+        yield
+        return
+    if bpy.context.view_layer.objects.active is not ob:
+        raise RuntimeError(
+            f"{ob.name} is in Edit Mode but is not the active object, so its "
+            "mesh cannot be read: Blender keeps edit-mode geometry in a BMesh "
+            "and the attributes read empty. Leave Edit Mode and press again")
+    bpy.ops.object.mode_set(mode="OBJECT")
+    try:
+        yield
+    finally:
+        bpy.ops.object.mode_set(mode="EDIT")
+
+
 def assemble(ob):
+    """`_assemble`, with the mesh made readable first. See `readable_mesh`."""
+    with readable_mesh(ob):
+        return _assemble(ob)
+
+
+def _assemble(ob):
     """The §2 table, end to end.  Returns (doc, sidecars, report).
 
     Refusals are collected, never raised: §9.4 evaluates them ALL first and
@@ -710,12 +875,18 @@ def assemble(ob):
     for entry in off_palette_list(ob):
         rep.refuse(f"off-palette colour {entry.get('color')}: "
                    f"{entry.get('count')} pixel(s), bbox {entry.get('bbox')}")
-    files, rename = export_sheets(ob, states, base)
+    files, rename, rep.sheets = export_sheets(ob, states, base)
+    # BEFORE the rename: `source_art` keys its entries by STATE INDEX, and the
+    # paintings are named from the sheet the marker knows, not from the hashed
+    # name this export is about to give it.
+    art_files, source_art = export_source_art(ob, states, base)
+    files.update(art_files)
     states = [dict(st) for st in states]
     for st in states:
         if st.get("texture_sheet") in rename:
             st["texture_sheet"] = rename[st["texture_sheet"]]
 
+    export_palettes(ob, states, rep)
     export_rigs(ob, states, rep)
 
     # §2 / decision 27: `version` is the oldest `build` that can handle this
@@ -727,7 +898,72 @@ def assemble(ob):
     doc = {"format": FORMAT, "version": version, "base": base,
            "polygons": polys, "terrain": terrain, "map_states": states,
            "carry": section(ob, "carry")}
+    # Only when there IS one.  Decision 7's shape a third time: the presence
+    # of the section is the declaration, and a map that never met the compile
+    # must round-trip exactly as it did before this leg existed -- which is
+    # what `export(import(doc)) == doc` asserts over all 148 arrangements.
+    if source_art:
+        doc["source_art"] = source_art
     return doc, files, rep
+
+
+def export_palettes(ob, states, rep):
+    """§6.4 — re-emit `map_states[].palettes` from the 16x16 CLUT image.
+
+    The CLUT image is already the addon's palette surface: import builds one
+    per state (`_clut_image`, pixel (col, row) = CLUT `row`'s entry `col`), the
+    preview graph samples it, and `paint.clut_entries` gates painted pixels
+    against it deliberately -- "the image is what the preview shows, so the gate
+    accepts exactly the colours the artist can see".  It was the one surface the
+    document was NOT written from, so a recoloured entry previewed, gated, and
+    then exported the colour it had replaced.
+
+    Three rules, each a decision rather than a convenience:
+
+    - **A `palettes: null` state stays null.**  Import fabricates that state's
+      CLUT image out of the sidecar's display-only PLTE (§4's untrusted-colour
+      preview), so its pixels are not the state's data and never were.  Writing
+      them back would invent a `0x44` chunk for a resource that has none --
+      decision 3's ownership, not a colour edit.
+    - **`stp` is carried, never re-derived.**  The mask is per-CLUT live data
+      (1,178 bits set across 651 palette-carrying resources) and the image has
+      nowhere to put it: an entry's colour and its STP bit are independent, so
+      the bit rides through from the imported row untouched.
+    - **Only the entries the document declared.**  A row is re-emitted at its
+      own length, so a short CLUT is not silently padded to 16 out of image
+      pixels import zero-filled.
+
+    The bar is the identity trip: §6.4's expansion (`c8 = c5 * 255 // 31`) and
+    this read-back both land on the same 8-bit lattice, so an untouched CLUT
+    must come back byte-identical to what `dump` wrote.  That is asserted, not
+    assumed -- `export_palette_untouched_is_byte_exact`.
+    """
+    names = section(ob, "state_cluts", []) or []
+    written = 0
+    for i, state in enumerate(states):
+        rows_in = state.get("palettes")
+        if not rows_in:
+            continue                      # `palettes: null` stays null
+        img = bpy.data.images.get(names[i]) if i < len(names) else None
+        if img is None or tuple(img.size) != (16, 16):
+            continue                      # no image: hand back what arrived
+        px = array.array("f", bytes(4 * 16 * 16 * 4))
+        img.pixels.foreach_get(px)
+        rows_out = []
+        for r, ent in enumerate(rows_in):
+            if not ent or r >= 16:
+                rows_out.append(ent)
+                continue
+            colors = []
+            for c in range(len(ent.get("colors", []))):
+                j = (r * 16 + min(15, c)) * 4
+                colors.append("#%02X%02X%02X" % tuple(
+                    max(0, min(255, int(round(px[j + k] * 255.0))))
+                    for k in range(3)))
+            rows_out.append(dict(ent, colors=colors))
+        state["palettes"] = rows_out
+        written += 1
+    return written
 
 
 def export_rigs(ob, states, rep):
@@ -737,13 +973,17 @@ def export_rigs(ob, states, rep):
     Override is no longer preview-only; on export it BECOMES the state's
     authored rig, and `build` writes its 45 bytes at pointer `0x64`.
 
+    Only an Override the artist MOVED something on.  The rig is exposed on
+    every state from import, so existence declares nothing -- see
+    `import_document.rig_is_dirty`.
+
     Three rules, and each one is a decision rather than a convenience:
 
-    - **A state that can hold no rig is warned about, never refused.**  Decision
-      25 deliberately allows minting an Override on a state that is BORROWING --
-      that is what makes a borrowed picture editable -- and 640 of the corpus's
-      rig-less rows are texture rows.  Refusing here would turn an ordinary
-      preview action into a failed export.  The Override stays what it was: the
+    - **A state that can hold no rig is warned about, never refused.**  The rig
+      is exposed on borrowing states too -- that is what makes a borrowed
+      picture editable -- and 640 of the corpus's rig-less rows are texture
+      rows.  Refusing here would turn an ordinary preview action into a failed
+      export.  The Override stays what it was: the
       screen.  `light_rig is None` is exactly the right test now that the reader
       takes the resource's KIND (#576): a texture row reads None by kind and a
       chunkless mesh row reads None for having no chunk, which are the only two
@@ -754,16 +994,23 @@ def export_rigs(ob, states, rep):
       carries 6, so they are re-read from this state's own rig here -- which is
       also what makes `build`'s verbatim-gradient refusal something an honest
       export can never trip.
-    - **The presence of the field is the declaration.**  A state with no
-      Override has no key written to it, so an untouched document is byte-for-
-      byte what `dump` produced and the identity trip is untouched.
+    - **The presence of the field is the declaration.**  A state whose rig the
+      artist never moved has no key written to it, so an untouched document is
+      byte-for-byte what `dump` produced and the identity trip is untouched.
     """
     if not getattr(ob, "exmateria_map_rig_overrides", ()):
         return 0
     written = 0
     for i, state in enumerate(states):
         ov = find_override(ob, i)
-        if ov is None:
+        # EXISTENCE is no longer the declaration: the rig is exposed on every
+        # state from import, so what the artist MOVED is the only honest
+        # signal.  Before this, an Override that existed and was never moved
+        # still shifted 2 bytes of MAP011.8 through `build` -- the direction
+        # re-emitted at
+        # exactly 4096 against a disc magnitude of 4094.4-4096.7.  Exposed on
+        # every state, that defect would fire on all 1,371 of them.
+        if ov is None or not rig_is_dirty(ov):
             continue
         base_rig = state.get("light_rig")
         if not base_rig:
@@ -888,6 +1135,12 @@ class EXPORT_OT_interchange_document(Operator):
         with suspended():               # §6.1, as on the import side
             doc, files, rep = assemble(ob)
         ob["exmateria_map/last_export"] = json.dumps(rep.lines())
+        # The Log carries what the artist would have READ, in order.
+        # `rep.lines()` is refusals + warnings only, so on a clean export it is
+        # empty -- the stats are in `describe_divergence`, which until now went
+        # only to a toast that is gone by the time anyone looks up.
+        from .report_log import record
+        summary = [describe_divergence(rep)] + list(rep.lines())
         for w in rep.warnings:
             self.report({"WARNING"}, w)
         self.report({"INFO"}, describe_divergence(rep))
@@ -897,13 +1150,18 @@ class EXPORT_OT_interchange_document(Operator):
                         f"{len(rep.refusals)} refusal(s), nothing written: "
                         + "; ".join(rep.refusals[:12])
                         + (" ..." if len(rep.refusals) > 12 else ""))
+            record("Export REFUSED", ob.name,
+                   summary + [f"{len(rep.refusals)} refusal(s), nothing written"])
             return {"CANCELLED"}
         directory = output_directory(self.filepath, self.directory)
         try:
             path = write_bundle(doc, files, directory)
         except Exception as e:
             self.report({"ERROR"}, f"could not write into {directory}: {e}")
+            record("Export FAILED", ob.name,
+                   summary + [f"could not write into {directory}: {e}"])
             return {"CANCELLED"}
+        record("Export", ob.name, summary + [f"wrote into {path}"])
         remember_dir(context, str(path), field="last_export_dir")
         # Name the DIRECTORY, always.  "wrote MAP022.a0.json + 5 sidecar(s)" is
         # indistinguishable from having written nothing if the artist is

@@ -78,14 +78,14 @@ for o in list(bpy.data.objects):
 setup(sc)
 ob = mod.build(json.loads(open("@DOC@").read()), bpy.context, "@DOC@")
 frame(sc, ob)
-# Decision 25: an Override is an artist's WORK, so it has to survive the file
-# the same way the generated images do — and neither property is
-# introspectable, which is why both are asserted by reopening and rendering.
-# The clean round asserts the opposite half: with no Override the picture is
-# the ROM's, so the parity instrument still measures what it claims to.
+# An edited rig is an artist's WORK, so it has to survive the file the same
+# way the generated images do — and neither property is introspectable, which
+# is why both are asserted by reopening and rendering. The clean round asserts
+# the opposite half: every state is EXPOSED either way, so a round that edits
+# nothing must still render the ROM's picture, which is what keeps the parity
+# instrument measuring what it claims to.
 if @OVERRIDE@:
     bpy.context.view_layer.objects.active = ob
-    bpy.ops.exmateria_map.mint_rig_override()
     _ov = mod.find_override(ob, int(ob["exmateria_map/preview_state"]))
     _ov.ambient = (0.5, 0.125, 0.75)
     _ov.gain_1 = (3.5, 0.25, 1.0)
@@ -93,7 +93,8 @@ if @OVERRIDE@:
           mod.override_rig(_ov)["colors"][0])
 else:
     print("EXMATERIA-MAP overrides:",
-          len(ob.exmateria_map_rig_overrides), "(clean round)")
+          len(mod.dirty_overrides(ob)), "edited of",
+          len(ob.exmateria_map_rig_overrides), "exposed (clean round)")
 sc.render.filepath = "@OUTA@"
 bpy.ops.render.render(write_still=True)
 packed = [i.name for i in bpy.data.images if i.name.startswith("exmateria_map/")

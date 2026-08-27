@@ -70,6 +70,7 @@ from bpy.props import BoolProperty
 from bpy.types import Operator, Panel
 
 from . import live_link as L
+from . import live_vram as VR
 from .export_document import (assemble, describe_divergence, find_marker,
                               markers)
 from .import_document import (_prefs, _stored_report, marker_in_scene,
@@ -127,38 +128,32 @@ def base_polygons(ob):
 
 
 def selfcheck(client, base_plans, prev_plans):
-    """Demand that RAM holds the disc's bytes, or this session's last push.
+    """Read the whole check, then let `live_link.diagnose_selfcheck` judge it.
 
-    Returns a one-line description of which of the two it found. Raises
-    `LiveLinkError` -- naming every cause, because a mismatch here has three
-    and the first version of this check in the core named only one -- when
-    neither candidate matches.
+    Returns `(ok, lines)`. It used to raise on the FIRST plan that matched
+    neither candidate, in sorted-key order -- so `normals` was judged before
+    `positions` had been looked at, and an emulator holding a previous
+    session's bake was reported as possibly the wrong map. Every plan is
+    evaluated now and the pattern across them is what decides; the reasoning
+    lives in the core, where `pytest` can grade it.
 
-    `prev_plans` is tried first when it exists: after a push it is what RAM
-    holds, so checking it first costs one read per bucket instead of two.
+    `prev_plans` is still tried first when it exists: after a push it is what
+    RAM holds, so checking it first costs one read per bucket instead of two.
     """
-    found = set()
+    results = {}
     for key, writes in sorted(base_plans.items()):
         prev = (prev_plans or {}).get(key)
-        differ, total = 0, 0
+        matched, differ, total = None, 0, 0
         for what, candidate in (("this session's last push", prev),
                                 ("the base map's own bytes", writes)):
             if candidate is None:
                 continue
             differ, total = L.verify(client, candidate)
             if differ == 0:
-                found.add(what)
+                matched = what
                 break
-        else:
-            raise L.LiveLinkError(
-                f"write-path self-check FAILED on {key[0]} {key[1]}: "
-                f"{differ:,} of {total:,} byte(s) at the planned addresses "
-                "hold neither the imported document's own geometry nor "
-                "anything this session pushed. Either the loaded map is not "
-                "this document's map, or something else pushed to this "
-                "emulator (reload the savestate), or this rig's address "
-                "arithmetic is wrong. Nothing was written.")
-    return " and ".join(sorted(found)) if found else "nothing to check"
+        results[key] = (matched, differ, total)
+    return L.diagnose_selfcheck(results)
 
 
 def _by_address(plans, extra=()):
@@ -244,6 +239,108 @@ def unpushed_lines(pushed_fields):
             for field, why in sorted(L.UNPUSHED.items())]
 
 
+def picture_plan(at, at_vram, sheets, clut_ram, clut_vram):
+    """The sheet's rectangles and the palettes' RAM writes, or a refusal.
+
+    Decision 2's atom, planned as one. `bpy`-free and pure so the composition
+    itself is testable -- the operator around it is neither.
+
+    Returns `(rects, writes, notes)`. A `note` is a thing the artist must be
+    told that is not a failure: decision 10's "this state declares no palettes,
+    so none were pushed" is the common one, and 38.5% of corpus states are in
+    exactly that position. A genuine problem raises instead, and takes the
+    whole atom with it.
+    """
+    notes = []
+    if at.sheet_row is None:
+        raise L.LiveLinkError(
+            f"the group night={at.night} weather={at.weather} carries no "
+            "TEXTURE row, so there is no sheet to push (71 of the corpus's "
+            "774 groups are like this)")
+    name = at.sheet_row.get("texture_sheet")
+    blob = (sheets or {}).get(name)
+    if blob is None:
+        raise L.LiveLinkError(
+            f"the sheet {name!r} has no pixel buffer in this scene, so there "
+            "is nothing to send. Its image was never loaded, or it is not "
+            "256x1024 -- the document still names it and `build` will still "
+            "ship the sidecar on disk")
+
+    rects = VR.plan_sheet(blob, at_vram)
+    for rc in rects:
+        VR.check_rect(rc)
+
+    writes = []
+    if at.palette_row is None or not at.palette_row.get("palettes"):
+        notes.append(
+            f"palettes: none pushed -- the group night={at.night} "
+            f"weather={at.weather} declares none of its own, so the map keeps "
+            "the CLUTs it is already showing (decision 10). 38.5% of corpus "
+            "states are like this and render with a keyed partner's")
+    else:
+        # Decision 5 at the RAM sink: the block is checked against what the GPU
+        # is actually showing before a byte of it is written, because a second,
+        # INERT copy of the same 512 bytes sits elsewhere in RAM and pushing
+        # into that one moves nothing at all.
+        L.check_clut_block(clut_ram, clut_vram)
+        writes = L.plan_palettes(at.palette_row["palettes"])
+    return rects, writes, notes
+
+
+def picture_lines(at, rects, writes, sheet_changed, clut_changed,
+                  unheld_rects, clut_differ, notes):
+    """What the sheet-and-palette push moved, and what did not hold.
+
+    Decision 3 lives here: the rows that did not take are NAMED from a
+    readback, never predicted. Some CLUT rows are engine-animated -- rows 13-15
+    on MAP022 a0 -- and a push cannot make those stick, but an artist who is
+    not told WHICH ones reads one reverting swatch as a rig that does not work.
+    """
+    out = [f"picture: {sheet_changed:,} VRAM byte(s) of texture sheet + "
+           f"{clut_changed:,} RAM byte(s) of palette, aimed at "
+           f"night={at.night} weather={at.weather} kind {at.kind}"]
+    if not sheet_changed and rects:
+        out.append("  the sheet was already live -- these are the bytes the "
+                   "emulator is already holding, not a push that failed")
+    for rc, n in unheld_rects:
+        out.append(f"  {rc.label} did NOT hold: {n:,} byte(s) read back "
+                   "different -- the game has reloaded the map over the push")
+    if clut_differ:
+        out.append(
+            f"  {clut_differ} palette byte(s) did not hold. The engine "
+            "repaints some CLUT rows itself (rows "
+            + ", ".join(str(r) for r in L.CLUT_ANIMATED_MEASURED)
+            + " on MAP022 a0), and it wins every frame -- this is the "
+              "palette ANIMATION, whose source chunk (0x70) still has no "
+              "reader. Everything else took")
+    out.extend("  " + n for n in notes)
+    return out
+
+
+def push_picture(client, vram, at, at_vram, sheets, say):
+    """Apply decision 2's atom and report it. Returns the report lines."""
+    try:
+        clut_vram = VR.clut_block(vram.read(), at_vram)
+        clut_ram = client.read(L.CLUT_BLOCK, L.CLUT_BLOCK_BYTES)
+        rects, writes, notes = picture_plan(
+            at, at_vram, sheets, clut_ram, clut_vram)
+    except (L.LiveLinkError, VR.VramError) as e:
+        say("WARNING", f"sheet and palettes NOT pushed: {e}")
+        return []
+
+    try:
+        sheet_changed = VR.apply(vram, rects)
+        clut_changed = L.apply(client, writes)
+    except (L.LiveLinkError, VR.VramError) as e:
+        say("ERROR", f"the picture push FAILED part way: {e}")
+        return []
+
+    unheld = VR.verify(vram, rects)
+    clut_differ, _compared = L.verify(client, writes)
+    return picture_lines(at, rects, writes, sheet_changed, clut_changed,
+                         unheld, clut_differ, notes)
+
+
 def rig_lines(states, index, rig_source, ram, registers):
     """What the rig push moved, and every state that moved with it.
 
@@ -299,6 +396,11 @@ class MAP_OT_live_push(Operator):
         def finish(status, ob=None):
             if ob is not None:
                 ob[LAST_PUSH_KEY] = json.dumps(lines)
+            # Every finish, refusals included -- a push that refused is the one
+            # the artist most wants to read, and the panel truncates.
+            from .report_log import record
+            record("Push to PCSX-Redux", ob.name if ob is not None else "",
+                   lines)
             return {status}
 
         ob, problem = find_marker(context)
@@ -311,8 +413,15 @@ class MAP_OT_live_push(Operator):
         prefs = _prefs(context)
         host = getattr(prefs, "live_host", "") or L.DEFAULT_HOST
         port = int(getattr(prefs, "live_port", 0) or L.DEFAULT_PORT)
-        client = L.LuaClient(host=host, port=port)
-        if not client.ping():
+        # #606 part 1: main RAM has two transports. `client` is whichever the
+        # artist chose; `lua` is kept regardless, because the light rig's GTE
+        # half writes coprocessor control registers that are not `m_wram` and
+        # no HTTP endpoint reaches them. That leg is the ONLY thing here that
+        # still needs our pcsx-redux fork.
+        lua = L.LuaClient(host=host, port=port)
+        over_http = bool(getattr(prefs, "live_ram_over_http", False))
+        client = L.RamClient(host=host, port=port) if over_http else lua
+        if not lua.ping():
             say("ERROR", f"no emulator answering on {host}:{port} -- launch "
                          "pcsx-redux with -webserver and load a battle")
             return finish("CANCELLED", ob)
@@ -386,13 +495,20 @@ class MAP_OT_live_push(Operator):
                 "base geometry to compare RAM against. The descriptor "
                 "gate is the only guard on this push")
         elif not self.skip_selfcheck:
-            try:
-                held = selfcheck(client, base_plans, _LAST_PUSH.get(ob.name))
-            except L.LiveLinkError as e:
-                say("ERROR", str(e))
+            ok, said = selfcheck(client, base_plans, _LAST_PUSH.get(ob.name))
+            if not ok:
+                for line in said:
+                    say("ERROR", line)
                 return finish("CANCELLED", ob)
-            say("INFO", f"self-check: the planned addresses hold {held}",
-                keep=False)
+            # A pass with something to say is a WARNING, not a silent INFO:
+            # "this emulator was already pushed to" is the one the artist
+            # needs on the marker afterwards, because it explains a picture
+            # that is not the disc's.
+            for line in said:
+                if line.startswith("the planned addresses hold"):
+                    say("INFO", f"self-check: {line}", keep=False)
+                else:
+                    say("WARNING", f"self-check: {line}")
 
         # 4b. the packet plan: uv, palette_id, texture_page. Separate from
         # `plan_document` because two of its inputs are only knowable live --
@@ -451,7 +567,7 @@ class MAP_OT_live_push(Operator):
         if rig:
             try:
                 rig_ram = L.apply(client, L.plan_rig(rig))
-                rig_regs = L.apply_gte(client, L.plan_rig_gte(rig))
+                rig_regs = L.apply_gte(lua, L.plan_rig_gte(rig))
             except L.LiveLinkError as e:
                 say("WARNING", f"light rig NOT pushed: {e}")
             else:
@@ -461,6 +577,34 @@ class MAP_OT_live_push(Operator):
             say("WARNING",
                 "light rig NOT pushed: no state in this arrangement carries "
                 "one, so the map renders albedo (46 states corpus-wide)")
+
+        # 5c. the sheet and the palettes -- decision 2's ATOM, and it spans two
+        # memories. The sheet's pixels are VRAM and stay there (uploaded once
+        # at map load, never re-uploaded); the palettes are VRAM's CLUT rows
+        # and are NOT VRAM's to keep -- the engine re-uploads that block from
+        # main RAM every frame, so a CLUT write to VRAM is gone in 50 ms.
+        # Measured [LIVE] 2026-08-26 against a sheet write that held for a
+        # second in the same session.
+        #
+        # Both are PLANNED before either is applied, which is what makes them
+        # one act: a sheet shown through the wrong state's CLUTs is garbage
+        # rather than a stale picture, so a half that cannot be planned takes
+        # the other half with it.
+        sheet_reported = []
+        if states:
+            at = L.aim(states, index)
+            try:
+                witnesses = L.packet_witnesses(client, primary, doc)
+                at_vram = VR.derive_addresses(witnesses)
+            except (L.LiveLinkError, VR.VramError) as e:
+                say("WARNING", f"sheet and palettes NOT pushed: {e}")
+            else:
+                vram = VR.VramClient(host=host, port=port)
+                sheet_reported = push_picture(
+                    client, vram, at, at_vram, rep.sheets, say)
+        elif not states:
+            say("WARNING", "sheet and palettes NOT pushed: this document "
+                           "carries no map states")
 
         say("INFO", describe_divergence(rep), keep=False)
         say("INFO", f"pushed {total + packet_total:,} changed byte(s) into "
@@ -481,6 +625,8 @@ class MAP_OT_live_push(Operator):
             say("INFO", line)
         for line in rig_reported:
             say("INFO", line)
+        for line in sheet_reported:
+            say("INFO", line)
         lines.extend(unpushed_lines({f for _, f in plans}
                                     | {k[1] for k in packet_plans}))
         lines.append("a picture, not a disc: a map reload uploads the disc's "
@@ -491,19 +637,19 @@ class MAP_OT_live_push(Operator):
 
 
 class MAP_PT_live_push(Panel):
-    """N-panel: push the scene into a running PCSX-Redux battle.
+    """`Map` sidebar, 3D viewport: push the scene into a running PCSX-Redux
+    battle.
 
     Its own section, next to the operator it drives, rather than a tail on the
     preview panel — reported from use as "the menus are a mess".  It also has
     something to say that no other panel does, and that has to be said WHERE THE
     BUTTON IS: what a push carries, and what it does not.
     """
-    bl_space_type = "PROPERTIES"
-    bl_region_type = "WINDOW"
-    bl_context = "object"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
     bl_category = "Map"
     bl_label = "Push to PCSX-Redux"
-    bl_order = 5
+    bl_order = 6
 
     @classmethod
     def poll(cls, context):
@@ -522,50 +668,94 @@ class MAP_PT_live_push(Panel):
             row.prop(prefs, "live_host", text="")
             row.prop(prefs, "live_port", text="")
 
-        # Reported from use: "when I change map preview entry and hit push
-        # nothing happens - shouldn't it update the texture?"  It cannot, and
-        # for two independent reasons, neither of which was anywhere on screen:
-        #
-        #   1. the previewed state is VIEW state.  `export_document` never reads
-        #      `exmateria_map/preview_state`, so the document is byte-identical
-        #      whichever state is on screen -- and `apply` reports only CHANGED
-        #      bytes, so the second push of an unchanged document is a truthful
-        #      zero.
-        #   2. the texture sheet and the CLUT have NO LIVE SINK in this module
-        #      at all (`live_link.UNPUSHED`): the packet's CLUT and TPAGE fields
-        #      are located but not built, and the sheet is pushed only by
-        #      `tools/live_push.py`, through a savestate round trip.
-        #
-        # `UNPUSHED` was already named in the last-push report, which is read
-        # AFTER the click and only once there has been one.  A limit the artist
-        # has to trigger the disappointment to discover is not documented.
-        box = layout.box()
-        box.label(text="A push carries GEOMETRY, NORMALS, UVs, "
-                       "PALETTE IDs and TEXTURE PAGES.", icon="INFO")
-        # Wrapped at 60, not `_stored_report`'s 88: this box is always drawn,
-        # where a report is occasional, and at 88 the second line ran past the
-        # Properties editor's width in the default layout.
-        for line in ("A palette ID is a row INDEX, not the row's COLOURS.",
-                     "Not the texture sheet's PIXELS, and not the CLUT rows "
-                     "themselves — one atom, no live sink here. "
-                     "Use tools/live_push.py.",
-                     "Not the light rig — 0x800F5B14 is the DIRECTION "
-                     "matrix; the gains and ambient are not located.",
-                     "Not yet the preview state — decision 9 has the push "
-                     "AIM at it, but the legs it aims are not built."):
+        _stored_report(layout, ob, LAST_PUSH_KEY, "Last push:")
+
+
+#: One line per `live_link.UNPUSHED` field, keyed by that table's own
+#: field name.  A key that is not in `UNPUSHED` is never drawn and a field
+#: with no line here is drawn bare, so this can go stale in the direction
+#: of saying too little and never in the direction of claiming a sink is
+#: missing when it is not.
+NOT_CARRIED = {
+    "the terrain grid":
+        "Not the terrain GRID \u2014 the tile records. The per-polygon "
+        "BINDING is a different thing and does push.",
+    "polygons[].unknown_untextured":
+        "Not the untextured record's four raw property bytes \u2014 a "
+        "different thing from bytes 6-7, which every push writes.",
+}
+
+
+class MAP_PT_live_push_carries(Panel):
+    """What a push carries, and what it does not — a CLOSED sub-panel.
+
+    Reported from use: "when I change map preview entry and hit push nothing
+    happens - shouldn't it update the texture?"  It cannot, and for two
+    independent reasons, neither of which was anywhere on screen:
+
+      1. the previewed state is VIEW state.  `export_document` never reads
+         `exmateria_map/preview_state`, so the document is byte-identical
+         whichever state is on screen -- and `apply` reports only CHANGED
+         bytes, so the second push of an unchanged document is a truthful zero.
+      2. what the push does NOT carry was nowhere on screen either.
+
+    `UNPUSHED` was already named in the last-push report, which is read AFTER
+    the click and only once there has been one.  A limit the artist has to
+    trigger the disappointment to discover is not documented.
+
+    So it stays on screen -- but as a HEADER, not as eight always-drawn label
+    rows.  It is reference, read once and then in the way, and the second
+    report from use was that this column is full of text nobody is re-reading.
+
+    **It reads `live_link.UNPUSHED`; it does not restate it.**  Reason 2 used
+    to say the texture sheet and the CLUT rows had no live sink and to use
+    `tools/live_push.py` -- which stopped being true when step 5c gained one,
+    and stayed on screen anyway.  ADR-0186 Amendment 3's Consequences named it:
+    *"the panel whose job is to say what a push carries is wrong about the leg
+    this loop depends on."*  A panel that RESTATES a table can disagree with
+    it; one that reads it cannot.  `NOT_CARRIED` is prose keyed by that
+    table's own field names, and a field with no prose is still named, bare,
+    rather than silently dropped.
+    """
+
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Map"
+    bl_parent_id = "MAP_PT_live_push"
+    bl_label = "What a push carries"
+    bl_order = 7
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        box = self.layout.box()
+        box.label(text="GEOMETRY, NORMALS, UVs, PALETTE IDs, TEXTURE PAGES,",
+                  icon="INFO")
+        box.label(text="the TEXTURE SHEET, the CLUT ROWS, the terrain "
+                       "BINDINGS, the polygon COUNTS and the LIGHT RIG.")
+        lines = ["A palette ID is a row INDEX, not the row's COLOURS."]
+        for field in sorted(L.UNPUSHED):
+            lines.append(NOT_CARRIED.get(field, f"Not {field}."))
+        lines.append("Not yet the preview state \u2014 decision 9 has the "
+                     "push AIM at it, but the legs it aims are not built.")
+        # Wrapped at 60, not `_stored_report`'s 88: at 88 the second line ran
+        # past the Properties editor's width in the default layout.
+        for line in lines:
             for k, chunk in enumerate(textwrap.wrap(line, 60) or [""]):
                 box.label(text=("    " if k else "") + chunk)
-        _stored_report(layout, ob, LAST_PUSH_KEY, "Last push:")
+
 
 
 def register():
     bpy.utils.register_class(MAP_OT_live_push)
     bpy.utils.register_class(MAP_PT_live_push)
+    bpy.utils.register_class(MAP_PT_live_push_carries)
 
 
 def unregister():
+    bpy.utils.unregister_class(MAP_PT_live_push_carries)
     bpy.utils.unregister_class(MAP_PT_live_push)
     bpy.utils.unregister_class(MAP_OT_live_push)
 
 
-classes = (MAP_OT_live_push, MAP_PT_live_push)
+classes = (MAP_OT_live_push, MAP_PT_live_push,
+           MAP_PT_live_push_carries)

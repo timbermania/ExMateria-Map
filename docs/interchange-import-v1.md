@@ -169,12 +169,16 @@ decision 3's ownership table is untouched.
 - **Edits quantize to the ROM immediately.** `override_rig` rounds ambient to
   u8 and a gain to i16 before the bake, so ambient `0.125` renders as `32/255`.
   The artist is shown exactly what the 45 bytes can hold.
-- **A borrowing state refuses live editing.** Its values are shown read-only
-  with the source named, and one explicit operator
-  (`exmateria_map.mint_rig_override`) mints an Override seeded from it. 636 of
-  the 691 rig-less states corpus-wide are `texture` rows, so a slider that
-  silently minted a rig would mostly fire on a misclick — and decision 7's rule
-  is that the preview *says* what it does not know.
+- **Every state's rig is exposed and editable, borrowing ones included.**
+  Nothing authorable is hidden, so there is no gesture to perform first: import
+  seeds an Override per state from its own rig, else a keyed partner's, else the
+  albedo fallback, and the panel names which one won. Decision 25 withheld this
+  because 636 of the 691 rig-less states corpus-wide are `texture` rows, so a
+  slider that silently turned "no rig" into "a rig I invented" would mostly fire
+  on a misclick. That reason is answered rather than overruled: a misclick that
+  changes nothing declares nothing, because export keys on what the artist
+  **moved**, not on an Override existing. Decision 7's rule still holds — the
+  panel *says* the rig is borrowed, and from where.
 - **`gradient` is shown read-only**, both swatches, labelled as the game's
   screen backdrop (`MapComposer._apply_gradient_from_manifest` →
   `ScreenEffectOverlay`). It is carried so the Override is the whole 45 bytes,

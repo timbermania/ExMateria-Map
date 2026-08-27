@@ -743,6 +743,13 @@ class _FakeLayout:
     def separator(self, **kw):
         return self
 
+    def grid_flow(self, **kw):
+        return self
+
+    def template_palette(self, data, prop, color=False, **kw):
+        _labels.append(f"<palette {getattr(getattr(data, prop, None), 'name', None)}>")
+        return self
+
     def operator(self, bl_idname, text="", icon=None, **kw):
         class _Op:
             pass
@@ -767,6 +774,27 @@ class _FakeLayout:
         _props.append(prop_name)
         return self
 
+def _panel_shim(cls, layout):
+    """The `self` Blender hands to `draw` -- a Panel INSTANCE, so it carries
+    every class attribute the panel declared.
+
+    A shim holding only `layout` is a WEAKER `self` than the real one, and a
+    panel registered in two editors reads its own class attributes to know
+    which copy it is drawing.  Copied wholesale rather than by name, so the
+    harness does not have to be edited every time a panel gains one.
+    """
+    attrs = {}
+    for k in dir(cls):
+        if k.startswith("__"):
+            continue
+        try:
+            attrs[k] = getattr(cls, k)
+        except Exception:
+            pass
+    attrs["layout"] = layout
+    return type("_S", (), attrs)()
+
+
 _icons = []
 _props = []
 _ops = []
@@ -776,7 +804,8 @@ _fl = _FakeLayout(_icons)
 try:
     class _Self:
         layout = _fl
-    mod.MAP_PT_preview.draw(_Self(), type("_Ctx", (), {"object": ob2})())
+    mod.MAP_PT_preview.draw(_Self(), type("_Ctx", (), {
+        "object": ob2, "scene": bpy.context.scene})())
     check("panel_draw", True)
 except Exception as e:
     check("panel_draw", False, repr(e))
@@ -788,9 +817,41 @@ _valid = set(bpy.types.UILayout.bl_rna.functions["label"]
 # the debug mode + boost are VIEW state on the Object, so the panel must reach
 # them through `prop` on the registered properties, not through the
 # `exmateria_map/...` custom properties that carry the document.
+# The rig props come FIRST and unconditionally -- nothing authorable is
+# hidden, so a plain import with no gesture already draws the 21 controls.
+# The debug mode and boost are VIEW state on the Object, so the panel must
+# still reach those two through `prop` on the registered properties rather
+# than through the `exmateria_map/...` custom properties that carry the
+# document; that is what the tail of this list is asserting.
 check("panel_light_debug_props",
-      _props == ["exmateria_map_light_debug", "exmateria_map_light_boost"],
+      _props[-2:] == ["exmateria_map_light_debug", "exmateria_map_light_boost"],
       str(_props))
+# `gradient` is NOT in this set: decision 6 collapses it to one line, because
+# it was a third of the box being un-editable, which reads as broken rather
+# than as deliberate.  The six values stay in the Override -- the rig is still
+# the whole 45 bytes -- and that half is asserted separately, on the Override.
+check("panel_draws_the_rig_without_a_gesture",
+      set(_props) >= {"ambient", "gain_1", "gain_2", "gain_3",
+                      "dir_1", "dir_2", "dir_3"},
+      f"a plain import does not draw the rig: {_props}")
+# The LIGHT PROVENANCE line, which nothing asserted before -- the panel's icons
+# and prop names were graded, its words never were.  Exposing the rig on every
+# state made that gap load-bearing: the line keyed on an Override EXISTING, so
+# it now fires on every state and tells the artist their untouched map is not
+# the ROM's.  That is the exact lie decision 25's provenance line exists to
+# prevent, and it also makes the four honest branches (albedo / AUTHORED /
+# 45-byte rig / BORROWED) unreachable.
+_light_lines = [t for t in _labels if isinstance(t, str) and t.startswith("light:")]
+check("panel_says_the_light_provenance_once",
+      len(_light_lines) == 1, str(_light_lines))
+check("panel_clean_rig_is_not_called_edited",
+      bool(_light_lines) and "EDITED" not in _light_lines[0],
+      f"a freshly imported, untouched state reports {_light_lines[:1]} -- "
+      f"exposure is not authorship")
+check("panel_clean_rig_names_where_it_came_from",
+      bool(_light_lines) and any(w in _light_lines[0] for w in
+                                 ("rig from", "BORROWED", "albedo", "AUTHORED")),
+      f"the provenance line says nothing about the source: {_light_lines[:1]}")
 check("panel_icons_valid",
       bool(_valid) and all(i in _valid for i in _icons if i is not None),
       str([i for i in _icons if i is not None and i not in _valid]))
@@ -828,7 +889,8 @@ class _MenuLayout(_FakeLayout):
 try:
     _mcls = getattr(bpy.types, "MAP_MT_preview_state")
     _mcls.draw(type("_S", (), {"layout": _MenuLayout([])})(),
-               type("_Ctx", (), {"object": ob2})())
+               type("_Ctx", (), {"object": ob2,
+                                 "scene": bpy.context.scene})())
     check("state_menu_registered", True)
 except Exception as e:
     check("state_menu_registered", False, repr(e))
@@ -879,6 +941,23 @@ check("push_panel_icons_valid",
 # the previewed state is VIEW state that never enters the document, and the
 # texture sheet and CLUT have no live sink in this module at all. The panel has
 # to say so where the button is, not in a report the artist reads afterwards.
+# It lives in a DEFAULT_CLOSED sub-panel now rather than eight always-drawn
+# rows -- reported from use as "it shoves a ton of crap in the right space".
+# The intent is unchanged and so is this check: the text must be WHERE THE
+# BUTTON IS, which a child panel satisfies and a different tab would not. So
+# drive the child too, and assert the parentage that makes it the same place.
+try:
+    _ccls = getattr(bpy.types, "MAP_PT_live_push_carries")
+    _ccls.draw(type("_S", (), {"layout": _PushLayout(_push_icons)})(),
+               type("_Ctx", (), {"object": ob2, "scene": bpy.context.scene})())
+    check("push_carries_subpanel_registered", True)
+except Exception as e:
+    check("push_carries_subpanel_registered", False, repr(e))
+check("push_carries_subpanel_is_a_child_of_the_push_panel",
+      getattr(bpy.types.MAP_PT_live_push_carries, "bl_parent_id", "")
+      == "MAP_PT_live_push"
+      and "DEFAULT_CLOSED" in bpy.types.MAP_PT_live_push_carries.bl_options,
+      str(bpy.types.MAP_PT_live_push_carries.bl_options))
 _push_text = " ".join(_push_labels).lower()
 check("push_panel_says_it_carries_no_texture",
       "texture" in _push_text, str(_push_labels))
@@ -919,18 +998,47 @@ _doc_before = ob2["exmateria_map/map_states"]
 _ov_states = json.loads(_doc_before)
 _i0 = int(ob2["exmateria_map/preview_state"])
 _src_rig, _src_name = mod.state_rig(_ov_states, _i0)
-check("override_absent_initially",
-      len(ob2.exmateria_map_rig_overrides) == 0
-      and mod.find_override(ob2, _i0) is None)
+# Nothing AUTHORABLE is hidden.  The rig is exposed on every state from the
+# moment of import, with no gesture in between -- so EXPOSURE can no longer be
+# the declaration, and a second signal has to carry that.  That signal is
+# DIRTY: an Override whose editing-unit values still equal what it was seeded
+# with declares nothing, warns about nothing, and lights nothing differently.
+#
+# Compared in the FLOATS, never in the packed bytes.  `override_rig` re-emits a
+# direction at exactly 4096 while the disc's magnitudes run 4094.4-4096.7, so a
+# byte comparison calls every untouched rig dirty and lands straight back on a
+# rig that is exposed and therefore declared -- which is the bug this replaces.
+_dirty = getattr(mod, "rig_is_dirty", None)
+check("rig_dirty_predicate_exists", callable(_dirty),
+      "import_document exposes no `rig_is_dirty`; exposure cannot stop meaning "
+      "declaration without it")
+check("rig_exposed_on_every_state",
+      sorted(o.state_index for o in ob2.exmateria_map_rig_overrides)
+      == list(range(len(_ov_states))),
+      f"exposed on {sorted(o.state_index for o in ob2.exmateria_map_rig_overrides)}, "
+      f"expected every state of {len(_ov_states)}")
+check("rig_exposure_is_clean",
+      callable(_dirty)
+      and not any(_dirty(o) for o in ob2.exmateria_map_rig_overrides),
+      "a freshly imported document already reads as edited")
+# Name the trap, so `rig_exposure_is_clean` cannot pass for the wrong reason.
+# If this fixture's rig round-trips byte-exactly then the check above is green
+# whichever way dirty is measured, and this harness stops covering the choice.
+_seed_rig, _seed_src = mod.exposure_rig(ob2, _ov_states, _i0)
+_packed_now = mod.override_rig(mod.find_override(ob2, _i0))
+check("packed_bytes_would_call_this_rig_dirty",
+      _packed_now["directions"] != [list(d) for d in _seed_rig["directions"]],
+      f"this fixture's directions survive the unit vector byte-exactly "
+      f"({_packed_now['directions']}), so the editing-units comparison is not "
+      f"under test here -- blender_corpus.py's 148 maps still cover it")
 
 bpy.context.view_layer.objects.active = ob2
-_res = bpy.ops.exmateria_map.mint_rig_override()
-check("override_mint_ran", _res == {"FINISHED"}, f"res={_res}")
 _ov = mod.find_override(ob2, _i0)
-check("override_minted", _ov is not None and len(ob2.exmateria_map_rig_overrides) == 1)
+check("rig_exposed_without_a_gesture", _ov is not None,
+      "the previewed state has no Override after a plain import")
 
-# Minting must NOT move the picture: it converts "the ROM's rig" into "the same
-# rig, editable".  Ambient and the gains are an integer scaled by a constant and
+# Exposure must NOT move the picture: it makes the ROM's rig editable, it does
+# not replace it.  Ambient and the gains are an integer scaled by a constant and
 # back, so those are byte-exact; a direction is re-emitted at exactly 4096 while
 # the disc runs 4094.4-4096.7, so its bytes may move by a couple of LSB and the
 # bar there is the PICTURE (measured 0.0099 deg worst case, a 0.000/255 delta).
@@ -950,12 +1058,12 @@ for _k in range(3):
     _ang.append(sum(x * y for x, y in zip(_a, _b)))
 check("override_dirs_picture_exact", all(d > 1 - 1e-6 for d in _ang),
       f"dot products {_ang}")
-_check_bake("override_minted_same_picture", ob2, _src_rig)
+_check_bake("override_exposed_same_picture", ob2, _src_rig)
 
 # The document is untouched — the Override is stored apart, by construction.
 check("override_document_untouched",
       ob2["exmateria_map/map_states"] == _doc_before,
-      "minting an Override rewrote the document")
+      "exposing the rig rewrote the document")
 
 # An edit must reach the bake AND the graph constant, through the same one path
 # a state switch uses.
@@ -1006,13 +1114,14 @@ check("badge_reports_edited",
 _props.clear()
 _icons.clear()
 try:
-    mod.MAP_PT_preview.draw(_Self(), type("_Ctx", (), {"object": ob2})())
+    mod.MAP_PT_preview.draw(_Self(), type("_Ctx", (), {
+        "object": ob2, "scene": bpy.context.scene})())
     check("panel_draw_edited", True)
 except Exception as e:
     check("panel_draw_edited", False, repr(e))
 check("panel_rig_props",
       set(_props) >= {"ambient", "gain_1", "gain_2", "gain_3",
-                      "dir_1", "dir_2", "dir_3", "gradient"},
+                      "dir_1", "dir_2", "dir_3"},
       str(_props))
 check("panel_icons_valid_edited",
       all(i in _valid for i in _icons if i is not None),
@@ -1021,9 +1130,17 @@ check("panel_icons_valid_edited",
 # Revert returns the ROM's picture exactly.
 _res = bpy.ops.exmateria_map.clear_rig_override(all_states=True)
 check("override_cleared_ran", _res == {"FINISHED"}, f"res={_res}")
-check("override_cleared",
-      len(ob2.exmateria_map_rig_overrides) == 0
-      and mod.find_override(ob2, _i0) is None)
+# Reset RE-SEEDS; it does not remove.  Removing would take the sliders off
+# screen, which is the one thing exposure exists to stop.
+check("override_reset_stays_exposed",
+      len(ob2.exmateria_map_rig_overrides) == len(_ov_states)
+      and mod.find_override(ob2, _i0) is not None,
+      f"reset left {len(ob2.exmateria_map_rig_overrides)} of "
+      f"{len(_ov_states)} states exposed")
+check("override_reset_is_clean",
+      not mod.dirty_overrides(ob2),
+      "reset left the state reading as edited, so `build` would still write "
+      "its 45 bytes")
 _check_bake("override_reverted", ob2, _src_rig)
 check("badge_silent_when_clean",
       not mod.edited_objects(type("_C", (), {"visible_objects": [ob2]})()))
@@ -1090,6 +1207,18 @@ check("export_grid_from_grid_object",
       _doc["base"]["terrain_grid"] == {"size_x": 10, "size_z": 13},
       str(_doc["base"]["terrain_grid"]))
 check("export_carry_verbatim", _doc["carry"] == doc["carry"])
+# The live bug this leg fixes: an Override that existed and was NEVER moved
+# 2 bytes of MAP011.8 through `build`, because the Override's existence alone
+# promoted it to `authored_light_rig` and the direction was re-emitted at 4096.
+# Now every state is exposed, so that would fire on all 1,371 of them.
+check("export_exposure_declares_nothing",
+      not any(mod.AUTHORED_RIG in st for st in _doc["map_states"]),
+      f"exposure alone declared an authored rig on states "
+      f"{[i for i, st in enumerate(_doc['map_states']) if mod.AUTHORED_RIG in st]}")
+check("export_exposure_does_not_bump_version",
+      _doc["version"] == mod.VERSION,
+      f"version={_doc['version']}, expected {mod.VERSION} -- an untouched "
+      f"document must stay readable by the oldest `build` that can take it")
 
 # The identity check's own seed: move ONE vertex and it must speak, naming the
 # field.  Without this arm, `export_identity` passing proves only that
@@ -1106,6 +1235,106 @@ check("export_divergence_seed_speaks",
       f"divergence did not see the moved corner: {dict(_seed_rep.divergence)}")
 obx.data.vertices[0].co = _v0
 check("export_identity_restored", not docdiff(doc, exp.assemble(obx)[0]))
+
+# ---- §6.4 the CLUT image is the palette EDIT surface -----------------------
+# Import builds a 16x16 image per state (`_clut_image`: pixel (col, row) = CLUT
+# `row`'s entry `col`), the preview samples it, and `paint.clut_entries` gates
+# against it -- so it is already what the artist sees and paints under.  What it
+# was not, until this leg, is what the DOCUMENT is written from: `_assemble`
+# copied `map_states` through and never re-emitted `palettes`, so a recoloured
+# entry previewed correctly and exported the imported colour.
+_pal_names = json.loads(obx["exmateria_map/state_cluts"])
+_pal_img = bpy.data.images[_pal_names[0]]
+_pal_orig = list(_pal_img.pixels)
+_PAL_ROW, _PAL_COL = 3, 5
+
+
+def pal_hex(d, state, row, col):
+    return d["map_states"][state]["palettes"][row]["colors"][col].upper()
+
+
+def pal_set(img, row, col, hexcolor):
+    """Paint one CLUT entry, the way the artist's colour picker does."""
+    buf = list(img.pixels)
+    j = (row * 16 + col) * 4
+    for k in range(3):
+        buf[j + k] = int(hexcolor[1 + 2 * k:3 + 2 * k], 16) / 255.0
+    img.pixels[:] = buf
+
+
+_pal_was = pal_hex(doc, 0, _PAL_ROW, _PAL_COL)
+_PAL_NEW = "#FF00FF" if _pal_was != "#FF00FF" else "#00FF00"
+check("export_palette_seed_is_not_inert", _pal_was != _PAL_NEW,
+      f"CLUT entry ({_PAL_ROW},{_PAL_COL}) already holds {_PAL_NEW}; "
+      f"recolouring it to that could not change anything")
+pal_set(_pal_img, _PAL_ROW, _PAL_COL, _PAL_NEW)
+_pal_doc = exp.assemble(obx)[0]
+check("export_palette_reemitted_from_clut_image",
+      pal_hex(_pal_doc, 0, _PAL_ROW, _PAL_COL) == _PAL_NEW,
+      f"recolouring CLUT entry ({_PAL_ROW},{_PAL_COL}) to {_PAL_NEW} left the "
+      f"document at {pal_hex(_pal_doc, 0, _PAL_ROW, _PAL_COL)}")
+# EXACTLY one line, not "no line that isn't it": an export that re-emits
+# nothing has an empty diff and would satisfy the weaker form vacuously.
+_pal_diff = docdiff(doc, _pal_doc)
+check("export_palette_edit_touches_one_entry",
+      len(_pal_diff) == 1 and _pal_diff[0].startswith(
+          f"doc.map_states[0].palettes[{_PAL_ROW}].colors[{_PAL_COL}]"),
+      f"one recoloured entry should move itself and nothing else, but the "
+      f"document moved at: {_pal_diff[:6]}")
+
+# The control, and the bar this whole leg has to clear: reading the palettes
+# back OUT of a float image must reproduce what `dump` wrote, byte for byte,
+# or every untouched CLUT in the corpus reads as an edit.
+_pal_img.pixels[:] = _pal_orig
+check("export_palette_untouched_is_byte_exact",
+      not docdiff(doc, exp.assemble(obx)[0]),
+      "an untouched CLUT did not survive the image round trip")
+
+# A `palettes: null` state's CLUT image is FABRICATED -- import fills it from
+# the sidecar's display-only PLTE so the state still previews (§4).  Those
+# pixels are not the state's data, so writing them back would invent a `0x44`
+# chunk for a resource that has none.  The fixture's state 1 (MAP001.8) is
+# exactly that row, so this arm is not hypothetical.
+_PAL_NULL = next(i for i, st in enumerate(doc["map_states"])
+                 if st.get("palettes") is None)
+check("export_palette_null_state_exists_in_fixture", _PAL_NULL == 1,
+      f"the fixture no longer has a `palettes: null` state at 1: {_PAL_NULL}")
+_pal_null_img = bpy.data.images[_pal_names[_PAL_NULL]]
+_pal_null_orig = list(_pal_null_img.pixels)
+pal_set(_pal_null_img, 0, 0, "#FF00FF")
+_pal_null_doc = exp.assemble(obx)[0]
+check("export_palette_null_state_stays_null",
+      _pal_null_doc["map_states"][_PAL_NULL]["palettes"] is None,
+      f"recolouring a fabricated CLUT invented palettes for a state that has "
+      f"none: {str(_pal_null_doc['map_states'][_PAL_NULL]['palettes'])[:120]}")
+_pal_null_img.pixels[:] = _pal_null_orig
+
+# `stp` is per-CLUT live data (1,178 bits set across 651 palette-carrying
+# resources) and the CLUT image has nowhere to put it -- an entry's colour and
+# its STP bit are independent.  Seed a mask AND recolour that same row, so the
+# row is definitely rewritten and the bit has to ride through the writer.
+_PAL_STP_ROW, _PAL_STP = 2, 0xBEEF
+_pal_ms = json.loads(obx["exmateria_map/map_states"])
+_pal_ms_orig = obx["exmateria_map/map_states"]
+check("export_palette_stp_seed_is_not_inert",
+      _pal_ms[0]["palettes"][_PAL_STP_ROW]["stp"] != _PAL_STP,
+      "the fixture already carries the seeded STP mask")
+_pal_ms[0]["palettes"][_PAL_STP_ROW]["stp"] = _PAL_STP
+obx["exmateria_map/map_states"] = json.dumps(_pal_ms)
+pal_set(_pal_img, _PAL_STP_ROW, 0, _PAL_NEW)
+_pal_stp_doc = exp.assemble(obx)[0]
+check("export_palette_stp_rides_through_a_recolour",
+      _pal_stp_doc["map_states"][0]["palettes"][_PAL_STP_ROW]["stp"] == _PAL_STP,
+      f"recolouring an entry dropped its CLUT's STP mask: "
+      f"{_pal_stp_doc['map_states'][0]['palettes'][_PAL_STP_ROW].get('stp')!r} "
+      f"!= {_PAL_STP}")
+check("export_palette_stp_row_was_actually_rewritten",
+      pal_hex(_pal_stp_doc, 0, _PAL_STP_ROW, 0) == _PAL_NEW,
+      "the STP arm never exercised the writer: the row's colour did not move")
+obx["exmateria_map/map_states"] = _pal_ms_orig
+_pal_img.pixels[:] = _pal_orig
+check("export_palette_arms_restored", not docdiff(doc, exp.assemble(obx)[0]),
+      "the palette arms did not restore the scene")
 
 # ---- §5.2 the out-of-grid WARNING -----------------------------------------
 # MAP001.a0's live polygon carries {255, 127, 0}.  It is NOT a warning: no
@@ -1887,6 +2116,180 @@ check("paint_repaint_clears_the_refusal",
 check("paint_export_unblocked", not exp.assemble(obp)[2].refusals,
       str(exp.assemble(obp)[2].refusals[:3]))
 
+# --- the summary is auditable: no painted pixel is silently lost -----------
+# ADR-0007's last consequence.  `off_palette` is the STANDING sticky total
+# over every pass, `painted` counts this pass alone, so the one invariant
+# worth having -- every painted pixel either resolved or was refused -- is
+# not expressible from the two of them.  It needs a per-pass refusal count.
+#
+# Seed a pass that already has refusals STANDING from an earlier one, or the
+# per-pass count and the standing total are equal by accident and the check
+# proves nothing.
+_bad = [(17, 19, 23), (29, 31, 37), (41, 43, 47), (53, 59, 61)]
+check("audit_seed_colours_are_really_off",
+      all(c not in set(_dupe) for c in _bad), str(_dupe))
+_px = pnt._floats(_pimg)
+for _n, _p in enumerate((5, 6)):
+    for _k in range(3):
+        _px[_p * 4 + _k] = _bad[_n][_k] / 255.0
+_pimg.pixels.foreach_set(_px)
+_r = pnt.resolve(obp)
+check("audit_prior_pass_refused_two",
+      (_r["painted"], _r["resolved"], _r["off_palette"]) == (2, 0, 2), str(_r))
+
+# This pass paints TWO pixels: one colour the row holds, one it does not.
+# The worked example, from the seed rather than from the code: painted 2,
+# resolved 1, refused 1 -- while three refusals stand on the sticky list.
+_good = next((e for e in _dupe if e != _dupe[_buf0[7]]), None)
+check("audit_resolvable_seed_is_not_inert", _good is not None,
+      "every entry of this CLUT is the colour pixel 7 already holds")
+_px = pnt._floats(_pimg)
+for _k in range(3):
+    _px[7 * 4 + _k] = _good[_k] / 255.0        # pixel 7, the row holds it
+    _px[8 * 4 + _k] = _bad[2][_k] / 255.0      # pixel 8, it does not
+_pimg.pixels.foreach_set(_px)
+_r = pnt.resolve(obp)
+check("audit_this_pass_painted_two", _r["painted"] == 2, str(_r))
+check("audit_this_pass_resolved_one", _r["resolved"] == 1, str(_r))
+check("audit_refusal_count_is_per_pass", _r.get("refused") == 1,
+      f"refused={_r.get('refused')!r}; expected the ONE colour THIS pass "
+      f"refused, not the {_r['off_palette']} standing on the sticky list")
+check("audit_off_palette_is_still_the_standing_total",
+      _r["off_palette"] == 3,
+      f"{_r}; `off_palette` is the cross-pass total and must stay that way -- "
+      f"export reads the same section")
+_ref = _r.get("refused")
+check("audit_no_painted_pixel_is_lost",
+      _ref is not None and _r["resolved"] + _ref == _r["painted"], str(_r))
+check("audit_nothing_was_cleared", _r["cleared"] == 0, str(_r))
+check("audit_nothing_was_recovered", _r.get("recovered") == 0,
+      f"{_r}; a pass that only PAINTED must not report a palette recovery")
+
+# A refusal counts PIXELS, not distinct colours.  Three pixels of ONE colour
+# the row cannot hold are three painted pixels that did not resolve; folding
+# them into one is the same silent loss in a different disguise, and a count
+# of colours passes every check above it.
+_px = pnt._floats(_pimg)
+for _p in (9, 10, 11):
+    for _k in range(3):
+        _px[_p * 4 + _k] = _bad[3][_k] / 255.0
+_pimg.pixels.foreach_set(_px)
+_r = pnt.resolve(obp)
+_ref = _r.get("refused")
+check("audit_refusal_counts_pixels_not_colours", _ref == 3,
+      f"refused={_ref!r} for three pixels of ONE off-palette colour; "
+      f"expected 3")
+check("audit_one_colour_pass_conserves",
+      _ref is not None and _r["resolved"] + _ref == _r["painted"] == 3, str(_r))
+check("audit_one_colour_pass_is_one_sticky_entry",
+      _r["off_palette"] == 6
+      and len([e for e in pnt.sticky(obp)
+               if e.get("color") == "#353B3D"]) == 1,
+      f"{_r}; {pnt.sticky(obp)}")
+
+# A pass that paints NOTHING refuses nothing, however many refusals stand.
+_r = pnt.resolve(obp)
+check("audit_a_clean_pass_refuses_nothing",
+      (_r["painted"], _r["resolved"], _r.get("refused")) == (0, 0, 0)
+      and _r["off_palette"] == 6, str(_r))
+
+# Painting MORE pixels in a colour already on the list merges into that
+# entry rather than making a second one -- and the merged entry moves to the
+# END of the list, which is the order export prints its refusal lines in.
+# Two merges in one pass, from different positions, or a rewrite that only
+# ever merges the head passes.
+_px = pnt._floats(_pimg)
+for _p, _n in ((12, 0), (13, 3)):
+    for _k in range(3):
+        _px[_p * 4 + _k] = _bad[_n][_k] / 255.0
+_pimg.pixels.foreach_set(_px)
+_r = pnt.resolve(obp)
+check("audit_merge_pass_conserves",
+      _r.get("refused") == _r["painted"] == 2 and _r["resolved"] == 0, str(_r))
+check("audit_merge_did_not_make_a_second_entry",
+      len(pnt.sticky(obp)) == 4 and _r["off_palette"] == 8,
+      f"{_r}; {[e['color'] for e in pnt.sticky(obp)]}")
+_merged = next(e for e in pnt.sticky(obp) if e["color"] == "#111317")
+check("audit_merge_unions_the_pixels_and_the_bbox",
+      (_merged["count"], _merged["pixels"], _merged["bbox"])
+      == (2, [5, 12], [5, 0, 12, 0]), str(_merged))
+check("audit_a_merged_entry_moves_to_the_end",
+      [e["color"] for e in pnt.sticky(obp)]
+      == ["#1D1F25", "#292B2F", "#111317", "#353B3D"],
+      str([e["color"] for e in pnt.sticky(obp)]))
+
+# Clearing is not a refusal either: repaint all six back onto the row.
+_px = pnt._floats(_pimg)
+for _p in (5, 6, 8, 9, 10, 11, 12, 13):
+    for _k in range(3):
+        _px[_p * 4 + _k] = _dupe[_buf0[_p]][_k] / 255.0
+_pimg.pixels.foreach_set(_px)
+_r = pnt.resolve(obp)
+_ref = _r.get("refused")
+check("audit_clearing_pass_conserves",
+      _ref is not None and _r["resolved"] + _ref == _r["painted"] == 8,
+      str(_r))
+check("audit_clearing_pass_emptied_the_list",
+      (_r["off_palette"], _r["cleared"], _r.get("refused")) == (0, 8, 0),
+      str(_r))
+check("audit_repainting_is_not_a_recovery",
+      _r.get("recovered") == 0,
+      f"{_r}; the diff loop already moved these indices -- counting them "
+      f"again as recoveries would double-report the same event")
+check("audit_export_unblocked_again", not exp.assemble(obp)[2].refusals,
+      str(exp.assemble(obp)[2].refusals[:3]))
+
+# --- authoring an entry TO a refused colour must RESOLVE the pixel --------
+# The path a quantiser needs (ADR-0007 decision 1): it decides sixteen
+# colours, writes them into the row, and the pixels that were refused for
+# want of them have to land on the new indices.
+#
+# `_gate` drops a stored pixel whose colour the palette now accepts, but the
+# INDEX is written in `resolve`'s diff loop, which is skipped when nothing was
+# painted -- and authoring a CLUT entry paints nothing. So the refusal can
+# clear while the index never moves: the sticky list goes quiet, export stops
+# refusing, and the sheet ships the pixel's import-time colour.
+_off2 = (65, 74, 82)
+check("author_seed_is_really_off", tuple(_off2) not in set(_dupe), str(_dupe))
+_px = pnt._floats(_pimg)
+for _k in range(3):
+    _px[14 * 4 + _k] = _off2[_k] / 255.0
+_pimg.pixels.foreach_set(_px)
+_r = pnt.resolve(obp)
+check("author_pixel_starts_refused",
+      (_r.get("refused"), _r["off_palette"]) == (1, 1), str(_r))
+# The slot must NOT be the index pixel 14 already carries, or the check
+# below is satisfied by an index that never moved -- which is exactly the
+# failure it exists to catch.
+_slot = next(i for i in range(16)
+             if i not in (_lo, _hi, _target, pnt.read_buffer(_idx)[14]))
+check("author_slot_is_not_inert", pnt.read_buffer(_idx)[14] != _slot,
+      f"pixel 14 already carries index {_slot}")
+_cpx = pnt._floats(_clut)
+for _k in range(3):
+    _cpx[(_pal * 16 + _slot) * 4 + _k] = _off2[_k] / 255.0
+_clut.pixels.foreach_set(_cpx)
+check("author_entry_took",
+      pnt.clut_entries(obp, _pal_state, _pal)[_slot] == _off2,
+      str(pnt.clut_entries(obp, _pal_state, _pal)[_slot]))
+_r = pnt.resolve(obp)
+check("author_clears_the_refusal",
+      (_r["off_palette"], _r["cleared"]) == (0, 1), str(_r))
+check("author_resolves_the_pixel_it_cleared",
+      pnt.read_buffer(_idx)[14] == _slot,
+      f"index {pnt.read_buffer(_idx)[14]}, expected {_slot}: the refusal "
+      f"cleared but the index never moved, so the pixel ships its "
+      f"import-time colour and the artist's paint is silently lost")
+check("author_conserves",
+      _r["resolved"] + _r.get("refused", -1) == _r["painted"] == 0, str(_r))
+check("author_reports_the_recovery",
+      _r.get("recovered") == 1,
+      f"{_r}; the index moved on a pass that painted nothing, so it has to "
+      f"be counted somewhere other than `resolved`")
+check("author_export_is_clean", not exp.assemble(obp)[2].refusals,
+      str(exp.assemble(obp)[2].refusals[:3]))
+_dupe = pnt.clut_entries(obp, _pal_state, _pal)
+
 # --- §4.1 a state change re-colours, and resolves against the OUTGOING set --
 _before = list(pnt._floats(_pimg))
 _other = next(k for k in range(len(json.loads(obp["exmateria_map/map_states"])))
@@ -1941,6 +2344,300 @@ try:
 except RuntimeError as e:
     _res = {"CANCELLED": str(e)}
 check("paint_sheet_finished", _res == {"FINISHED"}, str(_res))
+
+# --- the active palette follows the SELECTED FACE, in BOTH modes ------------
+# How an artist learns which of the 16 CLUT rows a wall uses: select it and read
+# the panel.  In Edit Mode -- the only mode that can select a face --
+# `me.attributes["palette_id"].data` is EMPTY, so the old read raised IndexError
+# inside a panel `draw`, which means the panel does not render at all.  Same
+# species as `02b99279a`, in the surface used to CHOOSE the face.
+import bmesh as _bmesh
+
+_pal_attr = obp.data.attributes["palette_id"].data
+_want = [(0, 11), (1, 4)][:len(obp.data.polygons)]
+for _i, _v in _want:
+    _pal_attr[_i].value = _v
+bpy.context.view_layer.objects.active = obp
+obp.select_set(True)
+
+_seen = []
+for _i, _v in _want:
+    bpy.ops.object.mode_set(mode="EDIT")
+    _bm = _bmesh.from_edit_mesh(obp.data)
+    _bm.faces.ensure_lookup_table()
+    for _f in _bm.faces:
+        _f.select = False
+    _bm.faces[_i].select = True
+    _bm.faces.active = _bm.faces[_i]
+    _bmesh.update_edit_mesh(obp.data)
+    check(f"paint_attr_data_is_empty_in_edit_mode_{_i}",
+          len(obp.data.attributes["palette_id"].data) == 0,
+          "if this goes green-by-accident the defect below is unreachable and "
+          "the check no longer states anything")
+    try:
+        _edit = pnt.active_palette(obp)
+    except Exception as _e:
+        _edit = f"{type(_e).__name__}: {_e}"
+    bpy.ops.object.mode_set(mode="OBJECT")
+    _obj = pnt.active_palette(obp)
+    _seen.append((_i, _v, _edit, _obj))
+    check(f"paint_active_palette_in_edit_mode_face_{_i}",
+          isinstance(_edit, tuple) and _edit[1] == _v,
+          f"selected face {_i} carries palette_id {_v}; Edit Mode said {_edit}")
+    check(f"paint_active_palette_agrees_across_modes_face_{_i}",
+          _edit == _obj,
+          f"Edit {_edit} vs Object {_obj} -- the panel must not change its "
+          f"answer when the artist tabs")
+
+# --- the 16 legal colours reach Blender's own colour shelf ------------------
+# The gate is an exact byte match and nothing ever showed the artist WHAT the
+# legal colours are, so every colour was chosen by eye against a gate that
+# accepts only a perfect hit.  #423 is right that a Palette cannot LOCK the
+# artist to the row -- the gate does that -- but the shelf says what yes looks
+# like, and it was never built.
+_shelf = bpy.data.palettes.get(pnt.PALETTE_SHELF)
+_ip_t = bpy.context.scene.tool_settings.image_paint
+_st_s, _pal_s = pnt.active_palette(obp)
+_entries_s = pnt.clut_entries(obp, _st_s, _pal_s)
+check("paint_shelf_exists_after_paint_sheet",
+      _shelf is not None and len(_shelf.colors) == len(_entries_s),
+      f"{_shelf and len(_shelf.colors)} swatches vs {len(_entries_s)} entries")
+check("paint_shelf_is_bound_to_the_brush",
+      _ip_t.palette is _shelf, str(_ip_t.palette))
+# EXACT, not near: a swatch that misses by one unit is refused by the gate, so
+# "close" is the same as broken here.
+check("paint_shelf_colours_are_byte_exact",
+      [tuple(round(c * 255.0) for c in sl.color) for sl in _shelf.colors]
+      == _entries_s,
+      "a PaletteColor that drifts by one unit hands the brush a colour the "
+      "gate refuses, which is indistinguishable from having no shelf")
+# ...and it must follow the face, or it names the wrong row's colours -- worse
+# than nothing, because it looks authoritative.
+_other = next(((i, v) for i, v in _want if v != _pal_s), None)
+if _other is not None:
+    _oi, _ov = _other
+    bpy.ops.object.mode_set(mode="EDIT")
+    _bm = _bmesh.from_edit_mesh(obp.data)
+    _bm.faces.ensure_lookup_table()
+    for _f in _bm.faces:
+        _f.select = False
+    _bm.faces[_oi].select = True
+    _bm.faces.active = _bm.faces[_oi]
+    _bmesh.update_edit_mesh(obp.data)
+    bpy.context.view_layer.update()
+    check("paint_shelf_follows_the_clicked_face",
+          [tuple(round(c * 255.0) for c in sl.color)
+           for sl in bpy.data.palettes[pnt.PALETTE_SHELF].colors]
+          == pnt.clut_entries(obp, _st_s, _ov),
+          f"clicked a face on row {_ov}; the shelf still holds row {_pal_s}")
+    bpy.ops.object.mode_set(mode="OBJECT")
+else:
+    check("paint_shelf_follows_the_clicked_face", False,
+          "no second row in the fixture -- this arm cannot run and must not "
+          "read as a pass")
+
+# --- and the PAINT IMAGE re-colours to the face you clicked ----------------
+# §3.3's face-select trigger is the point of all of the above: click a wall and
+# edit in the palette that wall actually reads.  It watched
+# `me.polygons.active`, which FREEZES in Edit Mode, so it could never fire in
+# the only mode that can select a face.
+_sheet_t = pnt.sheet_of_state(obp, int(obp.get("exmateria_map/preview_state") or 0))
+_pimg_t = pnt.ensure_paint_image(obp, _sheet_t)
+_idx_t = pnt.index_image(obp, _sheet_t)
+_frozen = []
+for _i, _v in _want:
+    bpy.ops.object.mode_set(mode="EDIT")
+    _bm = _bmesh.from_edit_mesh(obp.data)
+    _bm.faces.ensure_lookup_table()
+    for _f in _bm.faces:
+        _f.select = False
+    _bm.faces[_i].select = True
+    _bm.faces.active = _bm.faces[_i]
+    _bmesh.update_edit_mesh(obp.data)
+    _frozen.append(obp.data.polygons.active)
+    check(f"paint_active_face_index_tracks_in_edit_mode_{_i}",
+          pnt.active_face_index(obp) == _i,
+          f"clicked face {_i}, active_face_index said "
+          f"{pnt.active_face_index(obp)}")
+    bpy.context.view_layer.update()          # runs the scene-update handlers
+    _st_t, _pal_t = pnt.active_palette(obp)
+    _want_px = list(pnt.expand(pnt.read_buffer(_idx_t),
+                               pnt.clut_entries(obp, _st_t, _pal_t)))
+    check(f"paint_image_recolours_to_the_clicked_face_{_i}",
+          list(pnt._floats(_pimg_t)) == _want_px,
+          f"face {_i} reads CLUT row {_v}; the paint image is not that row's "
+          f"expansion, so the artist edits in the WRONG palette's colours")
+    bpy.ops.object.mode_set(mode="OBJECT")
+
+# The seed's own precondition: `me.polygons.active` does NOT name the face the
+# artist just clicked.  Stated as disagreement rather than as a specific wrong
+# value, because the wrong value has two observed shapes -- FROZEN at 0 across
+# 454 faces on MAP022 a0, and STALE BY ONE on this 2-face fixture ([1, 0] for
+# clicks on [0, 1]).  A guard written to either shape would go green on the
+# other while the defect stood.  If Blender ever starts syncing it, this check
+# says so rather than the arms above passing for a reason that no longer holds.
+check("paint_polygons_active_disagrees_in_edit_mode",
+      _frozen != [i for i, _ in _want],
+      f"me.polygons.active read {_frozen} for clicks on "
+      f"{[i for i, _ in _want]} -- if it now tracks, `active_face_index`'s "
+      f"Edit branch is no longer load-bearing")
+
+# The two faces must actually DIFFER, or one constant would satisfy both arms.
+check("paint_active_palette_seed_faces_differ",
+      len({v for _, v, _, _ in _seen}) == len(_seen),
+      str([(i, v) for i, v, _, _ in _seen]))
+
+# A panel whose draw raises does not render; drive the real draw in Edit Mode.
+bpy.ops.object.mode_set(mode="EDIT")
+_bm = _bmesh.from_edit_mesh(obp.data)
+_bm.faces.ensure_lookup_table()
+for _f in _bm.faces:
+    _f.select = False
+_bmesh.update_edit_mesh(obp.data)
+try:
+    # A real panel context always carries `scene`; the shim must too, or the
+    # check fails for a reason the artist can never hit.
+    _props_before = len(_props)
+    _drew = pnt.MAP_PT_paint.draw(
+        _panel_shim(pnt.MAP_PT_paint, _FakeLayout([])),
+        type("C", (), {"object": obp, "scene": bpy.context.scene})()) or True
+except Exception as _e:
+    _drew = f"{type(_e).__name__}: {_e}"
+bpy.ops.object.mode_set(mode="OBJECT")
+check("paint_panel_draws_in_edit_mode_with_nothing_selected",
+      _drew is True, str(_drew))
+# `draw` surviving is not the claim -- the 16 swatches reaching the panel is.
+# Counted over THIS draw only: `_props` is shared with every other panel the
+# harness drives, so a global count would be satisfied by somebody else's.
+_swatches = _props[_props_before:].count("color")
+check("paint_panel_draws_all_16_swatches",
+      _swatches == len(_entries_s),
+      f"{_swatches} colour swatches drawn, expected {len(_entries_s)} -- a "
+      f"panel that survives its draw while showing nothing is, to the artist, "
+      f"the same as one that crashed")
+
+# --- the button reaches Image Editors in OTHER workspaces -------------------
+# The defect: the walk read `context.screen` and stopped at the first hit, so
+# an artist on Layout -- which has no Image Editor -- pressed the button, saw
+# nothing happen, and was told the image was "open".  Blender's own
+# `CLIP_spaces_walk` walks `bpy.data.screens`; this asserts we take that arm.
+_here = sum(1 for _a in bpy.context.window.screen.areas
+            if _a.type == "IMAGE_EDITOR")
+_all = pnt.image_editor_spaces()
+check("paint_walk_reaches_other_workspaces",
+      _here == 0 and len(_all) >= 4,
+      f"the pressed-from screen '{bpy.context.window.screen.name}' has {_here} "
+      f"Image Editor(s); the walk reaches {len(_all)}. If _here is nonzero the "
+      f"startup changed and this check no longer states the defect")
+for _sp, _ in _all:
+    _sp.image = None
+_shown, _skipped = pnt.show_in_image_editors(_pimg)
+check("paint_sheet_fills_every_free_editor",
+      (_shown, _skipped) == (len(_all), 0)
+      and all(_sp.image is _pimg for _sp, _ in pnt.image_editor_spaces()),
+      f"shown={_shown} skipped={_skipped} of {len(_all)}")
+
+# A render result is not the artist's file and must not be displaced.  Real
+# RENDER_RESULT images cannot be minted from Python, so the guard is seeded on
+# its own predicate -- and restored, with an arm that proves the restore, so a
+# guard stuck permanently on cannot read as a pass (an INERT seed).
+_saved = pnt.PROTECTED_IMAGE_TYPES
+pnt.PROTECTED_IMAGE_TYPES = {"IMAGE"}
+_s2, _k2 = pnt.show_in_image_editors(_pimg)
+check("paint_sheet_skips_protected_editors",
+      (_s2, _k2) == (0, len(_all)), f"shown={_s2} skipped={_k2}")
+pnt.PROTECTED_IMAGE_TYPES = _saved
+_s3, _ = pnt.show_in_image_editors(_pimg)
+check("paint_sheet_protected_seed_was_not_inert", _s3 == len(_all), str(_s3))
+
+# With nowhere to show it: WARNING, no claim that anything opened, and the hint
+# that says how to open one.
+_types = [(_sc, _a, _a.type) for _sc in bpy.data.screens for _a in _sc.areas
+          if _a.type == "IMAGE_EDITOR"]
+for _sc, _a, _t in _types:
+    _a.type = "VIEW_3D"
+check("paint_no_editors_left", not pnt.image_editor_spaces(),
+      str(len(pnt.image_editor_spaces())))
+
+
+class _ReportShim:                  # execute() only ever uses self.report
+    def __init__(self):
+        self.reports = []
+
+    def report(self, level, msg):
+        self.reports.append((level, msg))
+
+
+_shim = _ReportShim()
+_res = pnt.MAP_OT_paint_sheet.execute(_shim, bpy.context)
+_lvl, _msg = _shim.reports[-1]
+check("paint_sheet_finished_with_no_editor", _res == {"FINISHED"}, str(_res))
+check("paint_sheet_warns_when_no_editor", _lvl == {"WARNING"}, str(_lvl))
+check("paint_sheet_does_not_claim_it_opened",
+      "NO Image Editor is open" in _msg,
+      f"the report must not advertise an editor this button never opens: {_msg}")
+check("paint_sheet_hint_says_how_to_open_one",
+      all(_w in _msg for _w in ("UV Editing", "Texture Paint", "Image Editor")),
+      _msg)
+for _sc, _a, _t in _types:          # put the artist's screens back
+    _a.type = _t
+check("paint_editors_restored", len(pnt.image_editor_spaces()) == len(_all),
+      str(len(pnt.image_editor_spaces())))
+
+# --- recolouring a CLUT entry the sheet USES must not refuse the export -----
+# This is the ordering trap of the palette-authoring leg, and it only fires on
+# the SECOND session with a file.
+#
+# `resolve` decides what was painted by diffing the paint image against
+# `_CACHE` -- what this module last wrote.  The cache is per-process, so a
+# reopened `.blend` has none and `resolve` rebuilds the baseline as
+# `expand(buffer, entries)` under the entries in force NOW.  Recolour an entry
+# and that rebuilt baseline is the NEW colour while the paint image still shows
+# the OLD one, so every pixel holding that index reads as freshly painted, in a
+# colour the CLUT no longer contains: the export refuses a sheet the artist
+# never touched, and refuses it for the one gesture this whole leg exists for.
+#
+# The buffer arm is the sharper half.  If the old colour happens to still match
+# some OTHER entry, the pixels do not refuse -- they silently re-index to it,
+# which is data loss rather than a failed export.
+_out_state, _out_pal = pnt.outgoing_palette(obp, _sheet)
+check("clut_edit_state_carries_palettes",
+      json.loads(obp["exmateria_map/map_states"])[_out_state]["palettes"],
+      f"map state {_out_state} carries no palettes, so recolouring its CLUT "
+      f"image tests nothing about the document")
+_cur = pnt.clut_entries(obp, _out_state, _out_pal)
+_buf_now = pnt.read_buffer(_idx)
+_USED = _buf_now[0]
+_NEWC = (0xFF, 0x00, 0xFF)
+check("clut_edit_seed_is_not_inert",
+      tuple(_NEWC) not in set(_cur) and _buf_now.count(_USED) > 0,
+      f"{_NEWC} is already among this row's sixteen, or no pixel uses entry "
+      f"{_USED}: nothing would change")
+_clut_img = bpy.data.images[
+    json.loads(obp["exmateria_map/state_cluts"])[_out_state]]
+_cpx2 = pnt._floats(_clut_img)
+for _k in range(3):
+    _cpx2[(_out_pal * 16 + _USED) * 4 + _k] = _NEWC[_k] / 255.0
+_clut_img.pixels.foreach_set(_cpx2)
+pnt._CACHE.clear()          # exactly what reopening the .blend leaves behind
+_cd, _cf, _crep = exp.assemble(obp)
+check("clut_edit_does_not_refuse_the_export",
+      not _crep.refusals,
+      f"recolouring CLUT entry {_USED}, which {_buf_now.count(_USED)} pixels "
+      f"use, refused the export: {_crep.refusals[:3]}")
+check("clut_edit_does_not_move_the_index_buffer",
+      pnt.read_buffer(_idx) == _buf_now,
+      "recolouring a CLUT entry re-indexed the sheet: a colour edit moves the "
+      "palette, never which entry a pixel points at")
+check("clut_edit_recolours_the_paint_image",
+      tuple(int(round(pnt._floats(_pimg)[_k] * 255.0)) for _k in range(3))
+      == _NEWC,
+      f"the paint image still shows the colour entry {_USED} used to hold, so "
+      f"the artist's canvas disagrees with the palette they just authored")
+check("clut_edit_reaches_the_document",
+      _cd["map_states"][_out_state]["palettes"][_out_pal]["colors"][_USED]
+      == "#FF00FF",
+      str(_cd["map_states"][_out_state]["palettes"][_out_pal]["colors"][_USED]))
 
 from exmateria_map import lighting_bake as mod_bake
 
@@ -2137,6 +2834,1500 @@ if _lit is not None:
     check("reimport_destroys_what_the_addon_made",
           bpy.data.objects.get("addon_owned_lamp") is None,
           "re-import spared an object carrying an `exmateria_map/*` flag")
+
+# --- the Map workspace (ADR-0185 decision 1, as amended) --------------------
+# WHAT THIS CAN AND CANNOT SEE.  In `-b` the screen never lays out and the
+# timers never tick, so the PANES are not gradeable here at all and this file
+# deliberately does not try: `area.type` is readable in background mode and is
+# the one field that LIES -- assigning it on a screen no window is showing
+# records the type and never swaps `spaces.active`, so an area that draws as a
+# 3D viewport reports `TEXT_EDITOR` forever.  A check over it would be green on
+# exactly the defect that shipped first.  The layout is graded headful, by
+# `workspace/workspace_probe.py` phase `build`.  What IS gradeable here is the
+# offer: the operator exists, runs, makes one workspace, and does not make a
+# second one on a second press.
+from exmateria_map import workspace as mod_ws
+
+# `bpy.ops` resolves lazily, so `hasattr(bpy.ops.exmateria_map, "...")` is True
+# for any name ever spelled -- probe the RNA type instead (addon CLAUDE.md).
+check("workspace_operator_registered",
+      getattr(bpy.types, "EXMATERIA_MAP_OT_add_workspace", None) is not None,
+      "MAP_OT_add_workspace is not registered")
+# The harness has already imported a document by now, and under Amendment 2
+# that import OFFERS the workspace -- so its presence here is the hook's own
+# receipt, not a leftover. (It used to be checked absent; that premise died
+# with the decision, and the check is inverted rather than deleted.)
+_ws_before = {w.name for w in bpy.data.workspaces}
+check("import_left_the_workspace_behind",
+      mod_ws.WORKSPACE_NAME in _ws_before, str(sorted(_ws_before)))
+# Guarded: an unregistered operator raises, and an abort here would take the
+# whole report with it -- a hard "no report written" reads as a broken harness
+# rather than as the one check that is actually red.
+try:
+    _res = bpy.ops.exmateria_map.add_workspace()
+except Exception as e:
+    _res = {"raised": repr(e)}
+check("workspace_button_ran", "FINISHED" in _res, str(_res))
+check("workspace_named_after_the_tab",
+      mod_ws.WORKSPACE_NAME in bpy.data.workspaces,
+      str(sorted(w.name for w in bpy.data.workspaces)))
+# Pressing it when the workspace is already there must switch, never build --
+# rebuilding would re-split a screen the artist has since arranged.
+check("workspace_button_on_an_existing_one_adds_nothing",
+      {w.name for w in bpy.data.workspaces} == _ws_before,
+      f"{sorted(_ws_before)} -> "
+      f"{sorted(w.name for w in bpy.data.workspaces)}")
+# ...and `build` itself, under a name no import can have taken. It is a
+# DUPLICATE, not an add: `workspace.add` is PASS_THROUGH in every mode, which
+# is what the ADR's rejected alternative was measured on.
+_before_build = {w.name for w in bpy.data.workspaces}
+_made = mod_ws.build(mod_ws._main_window(), name="_check_map_workspace")
+check("build_returns_the_workspace_it_made",
+      _made is not None and _made.name == "_check_map_workspace",
+      repr(getattr(_made, "name", _made)))
+check("build_adds_exactly_one_workspace",
+      len(bpy.data.workspaces) == len(_before_build) + 1,
+      f"{len(_before_build)} -> {len(bpy.data.workspaces)}")
+# Pressing it twice is switching, not building: an artist who already has the
+# workspace must not end up with `Map.001` and a re-split screen.
+try:
+    _res2 = bpy.ops.exmateria_map.add_workspace()
+except Exception as e:
+    _res2 = {"raised": repr(e)}
+check("workspace_second_press_ran", "FINISHED" in _res2, str(_res2))
+check("workspace_second_press_makes_no_duplicate",
+      f"{mod_ws.WORKSPACE_NAME}.001" not in bpy.data.workspaces,
+      str(sorted(w.name for w in bpy.data.workspaces)))
+# `focus_tab` runs on every click, including today, when no panel anywhere
+# carries `bl_category = "Map"` in a sidebar.  Refusing must be silent: the
+# property is an enum over the categories that exist, so it RAISES rather than
+# returning a falsy value, and an unguarded assignment would break the button
+# for everyone until decision 3 lands.
+_ws = bpy.data.workspaces[mod_ws.WORKSPACE_NAME]
+try:
+    _focused = mod_ws.focus_tab(_ws.screens[0])
+    check("focus_tab_survives_having_no_Map_tab", True)
+except Exception as e:
+    check("focus_tab_survives_having_no_Map_tab", False, repr(e))
+    _focused = None
+check("focus_tab_claims_nothing_it_did_not_set", _focused == [], str(_focused))
+# The offer has to be somewhere the artist can reach with no map open, which
+# is what rules out every panel in the addon: all six poll on a marker.
+_prefs_ops, _prefs_props = [], []
+
+
+class _PrefsLayout:
+    def operator(self, idname, **kw):
+        _prefs_ops.append(idname)
+        return self
+
+    def prop(self, _data=None, _name=None, *a, **kw):
+        _prefs_props.append(_name)
+        return self
+
+    def row(self, **kw):
+        return self
+
+
+try:
+    # `draw` reads `self.layout`, so the fake carrying the layout IS `self` --
+    # the same shape the push-panel checks above use.
+    _pf = bpy.context.preferences.addons["exmateria_map"].preferences
+    type(_pf).draw(type("_S", (), {"layout": _PrefsLayout()})(), None)
+    check("prefs_draw_ran", True)
+except Exception as e:
+    check("prefs_draw_ran", False, repr(e))
+check("prefs_offers_the_workspace_button",
+      "exmateria_map.add_workspace" in _prefs_ops, str(_prefs_ops))
+# ...and in File > Import, which is the door an artist actually finds.  The
+# preferences copy is behind a disclosure triangle in a window that is not even
+# the one the layout lands in.  Reported from use: "do I have to do this
+# ceremony every time?"  Same operator, so two doors and one behaviour.
+_menu_ops = []
+
+
+class _MenuLayout:
+    def operator(self, idname, **kw):
+        _menu_ops.append(idname)
+        return self
+
+    def separator(self, **kw):
+        return self
+
+
+mod_ws.menu_func(type("_S", (), {"layout": _MenuLayout()})(), bpy.context)
+check("file_import_menu_offers_the_workspace",
+      "exmateria_map.add_workspace" in _menu_ops, str(_menu_ops))
+# `_draw_funcs` hangs off the DISPATCHER, not the class: `append()` replaces
+# `cls.draw` with `draw_ls` and the list lives on that (addon CLAUDE.md,
+# "Menu wiring").  `hasattr(cls, "_draw_funcs")` is False and reads as "the
+# menu entry is missing" when it is there.
+check("workspace_menu_func_is_registered_on_file_import",
+      mod_ws.menu_func in getattr(bpy.types.TOPBAR_MT_file_import.draw,
+                                  "_draw_funcs", []),
+      str([getattr(f, "__name__", "?") for f in
+           getattr(bpy.types.TOPBAR_MT_file_import.draw, "_draw_funcs", [])]))
+# The button is clicked from the addon preferences, which Blender opens as a
+# SEPARATE TEMPORARY WINDOW holding one PREFERENCES area -- `context.window`
+# there has no viewport, and the first release laid the workspace out on it,
+# which is to say not at all.  A harness cannot open a second window, so the
+# window CHOICE is graded on the pure helper instead of on Blender's state.
+class _FakeScreen:
+    def __init__(self, temp, types):
+        self.is_temporary = temp
+        self.areas = [type("_A", (), {"type": t})() for t in types]
+
+
+class _FakeWindow:
+    def __init__(self, parent, screen):
+        self.parent = parent
+        self.screen = screen
+
+
+_real = _FakeWindow(None, _FakeScreen(False, ["VIEW_3D", "OUTLINER"]))
+_prefs_win = _FakeWindow(_real, _FakeScreen(True, ["PREFERENCES"]))
+check("main_window_skips_the_preferences_window",
+      mod_ws._main_window([_prefs_win, _real]) is _real,
+      "picked the temporary Preferences window")
+check("main_window_survives_being_the_only_window",
+      mod_ws._main_window([_real]) is _real, "lost the only window there is")
+check("preferences_screen_has_no_viewport_to_build_from",
+      not mod_ws._has_viewport(_prefs_win.screen),
+      "a PREFERENCES-only screen was accepted as a layout target")
+check("a_real_screen_does_have_a_viewport",
+      mod_ws._has_viewport(_real.screen), "the positive arm is broken")
+# ...and the choice itself, structurally.  Seeding `window = context.window`
+# back into `execute` is BLIND to every runtime check above -- headless there is
+# exactly one window, so `context.window` and `_main_window()` are the same
+# object, and the defect only appears in a second window a harness cannot open
+# (`temp_override` refuses a temporary screen outright).  A source GREP would be
+# worse than nothing: this module's own docstring says "context.window" four
+# times explaining why not to use it, so the string is present either way.  Read
+# the AST of `execute` instead, where a comment cannot satisfy the assertion.
+import ast as _ast
+import inspect as _inspect
+import textwrap as _textwrap
+
+try:
+    _ex_tree = _ast.parse(_textwrap.dedent(
+        _inspect.getsource(mod_ws.MAP_OT_add_workspace.execute)))
+    _bad = [n for n in _ast.walk(_ex_tree)
+            if isinstance(n, _ast.Attribute) and n.attr == "window"
+            and isinstance(n.value, _ast.Name) and n.value.id == "context"]
+    check("execute_reads_no_context_window", not _bad,
+          f"execute still reads `context.window` at line(s) "
+          f"{[n.lineno for n in _bad]} — clicked from the addon preferences "
+          f"that is the temporary Preferences window")
+except Exception as e:
+    check("execute_reads_no_context_window", False, repr(e))
+# The SECOND half of the same defect, and the second traceback the artist saw:
+# `temp_override` is refused outright while a temporary screen is ACTIVE --
+# `TypeError: Overriding context with an active temporary screen isn't
+# supported` -- whatever you override it TO.  A click made from Preferences
+# therefore cannot use one at all, even to reach the artist's own window.
+# Blind for the same reason as above (no second window headless), so it is read
+# off the AST of the two functions the click runs through.  The layout's own
+# overrides are fine and are NOT covered here: measured, a timer callback sees
+# the main window even with Preferences open.
+try:
+    _click_path = "".join(_textwrap.dedent(_inspect.getsource(f))
+                          for f in (mod_ws.MAP_OT_add_workspace.execute,
+                                    mod_ws.build))
+    _over = [n for n in _ast.walk(_ast.parse(_click_path))
+             if isinstance(n, _ast.Attribute) and n.attr == "temp_override"]
+    check("click_path_uses_no_temp_override", not _over,
+          f"`temp_override` at line(s) {[n.lineno for n in _over]} of the "
+          f"click path — it raises when the click came from Preferences")
+except Exception as e:
+    check("click_path_uses_no_temp_override", False, repr(e))
+# ...and the layout retries rather than raising, if a context ever does refuse.
+check("split_swallows_a_refused_context",
+      "TypeError" in _inspect.getsource(mod_ws._split),
+      "a refused override in _split would reach the artist as a traceback")
+# --- the workspace on import (ADR-0185 decision 4, Amendment 2) -------------
+# The decision said NOT hooked to import, on the reasoning that an import which
+# rearranges the artist's screen is a failure one level up.  Reported from use,
+# the artist wants it on a GNS or interchange import -- so the switch is theirs,
+# and BOTH arms are graded: on, it offers; off, it does not.
+_pf = bpy.context.preferences.addons["exmateria_map"].preferences
+check("workspace_on_import_preference_exists",
+      "workspace_on_import" in type(_pf).bl_rna.properties,
+      str([p for p in type(_pf).bl_rna.properties.keys()]))
+check("workspace_on_import_defaults_on",
+      type(_pf).bl_rna.properties["workspace_on_import"].default is True,
+      "the artist asked for it; off by default would be a surprise the other way")
+check("prefs_offers_the_import_switch",
+      "workspace_on_import" in _prefs_props, str(_prefs_props))
+# OFF must mean off.  This is the arm that protects the decision's objection.
+_pf.workspace_on_import = False
+check("import_hook_respects_off", mod_ws.ensure_on_import(bpy.context) == "off",
+      "the preference is drawn but not read")
+_pf.workspace_on_import = True
+check("import_hook_acts_when_on",
+      mod_ws.ensure_on_import(bpy.context) in ("built", "switched"),
+      "the hook did nothing with the preference on")
+# Both importers have to call it, or the switch is true of one format only --
+# and "on GNS OR interchange" was the request.  Read the AST: a grep would
+# match the `from .workspace import ensure_on_import` line in either file even
+# if nothing called it.
+for _name, _fn in (("interchange", mod.IMPORT_OT_interchange_document.execute),
+                   ("gns", __import__("exmateria_map.gns_bundle",
+                                      fromlist=["x"]).IMPORT_OT_gns.execute)):
+    _calls = [n for n in _ast.walk(_ast.parse(
+                  _textwrap.dedent(_inspect.getsource(_fn))))
+              if isinstance(n, _ast.Call)
+              and getattr(n.func, "id", None) == "ensure_on_import"]
+    check(f"{_name}_import_calls_the_workspace_hook", bool(_calls),
+          f"{_name} importer never calls ensure_on_import")
+# An import that succeeded must not fail because a screen could not be arranged.
+check("import_hook_never_raises",
+      "try:" in _inspect.getsource(mod_ws.ensure_on_import),
+      "ensure_on_import has no guard around the preferences lookup")
+
+# --- the Log (ADR-0185 decision 5) ------------------------------------------
+# What is gradeable here is the RECORD. Whether it is on screen is a claim
+# about a Text editor, and `-b` has none -- that half is graded headful by
+# `workspace/workspace_probe.py` phase `log`.
+from exmateria_map import report_log as mod_log
+
+check("log_reuses_the_existing_text_datablock_name",
+      mod_log.LOG_NAME == mod.REPORT_TEXT_NAME,
+      f"{mod_log.LOG_NAME!r} vs {mod.REPORT_TEXT_NAME!r} — a .blend saved "
+      f"before the Log would be orphaned beside it")
+if mod_log.LOG_NAME in bpy.data.texts:
+    bpy.data.texts[mod_log.LOG_NAME].clear()
+_b = mod_log.append("Push to PCSX-Redux", "MAP001.a0", ["wrote 1816 bytes"])
+check("log_writes_an_entry",
+      _b is not None and "wrote 1816 bytes" in _b.as_string(),
+      repr(getattr(_b, "as_string", lambda: None)()))
+check("log_stamps_and_names_the_subject",
+      "Push to PCSX-Redux" in _b.as_string() and "MAP001.a0" in _b.as_string(),
+      _b.as_string())
+# A LOG, not a rewrite. This is the whole difference from what `copy_report`
+# used to do, which was `clear()` then write -- every press destroying the
+# history it was meant to preserve.
+_n1 = len(_b.lines)
+mod_log.append("Export", "MAP001.a0", ["changed since import: nothing"])
+check("log_appends_rather_than_replacing",
+      len(_b.lines) > _n1 and "wrote 1816 bytes" in _b.as_string(),
+      f"{_n1} -> {len(_b.lines)}")
+check("log_keeps_the_entries_in_order",
+      _b.as_string().index("wrote 1816 bytes")
+      < _b.as_string().index("changed since import"),
+      "the newest entry is not last — sequence is the Log's whole job")
+# Copy must not make the artist's own history claim it happened twice.
+_n2 = len(_b.lines)
+mod_log.append("Export", "MAP001.a0", ["changed since import: nothing"],
+               unless_duplicate=True)
+check("log_refuses_a_duplicate_of_its_last_entry", len(_b.lines) == _n2,
+      f"{_n2} -> {len(_b.lines)}")
+# ...and the guard must compare BODIES, not rendered entries: every entry
+# carries a clock stamp, so comparing rendered text never matches and the
+# check above would pass for the wrong reason.
+check("the_duplicate_guard_ignores_the_stamp",
+      mod_log._last_body(_b.as_string())
+      == mod_log._body(["changed since import: nothing"]),
+      repr(mod_log._last_body(_b.as_string())))
+# ...and prove it END TO END across a stamp that DIFFERS. Two appends a
+# millisecond apart render identical text, so a guard that compared rendered
+# entries would pass this test by accident -- which is exactly what a seed
+# doing that turned out to do. Age the last entry's clock first.
+_txt = _b.as_string()
+_stamp = _txt.split("[")[-1].split("]")[0]
+_head, _sep, _tail = _txt.rpartition(_stamp)   # the LAST one: every entry in
+_b.from_string(_head + "00:00:01" + _tail)     # this block shares a second
+_n3 = len(_b.lines)
+mod_log.append("Export", "MAP001.a0", ["changed since import: nothing"],
+               unless_duplicate=True)
+check("the_duplicate_guard_holds_across_a_different_stamp",
+      len(_b.lines) == _n3, f"{_n3} -> {len(_b.lines)} — the guard is "
+                            f"comparing stamps, not bodies")
+# A different Outcome is not a duplicate.
+mod_log.append("Export", "MAP001.a0", ["1 face(s) moved"], unless_duplicate=True)
+check("log_still_appends_a_different_outcome",
+      "1 face(s) moved" in _b.as_string(), _b.as_string()[-200:])
+# One datablock per session, and bounded.
+check("log_uses_exactly_one_datablock",
+      sum(1 for t in bpy.data.texts
+          if t.name.startswith(mod_log.LOG_NAME)) == 1,
+      str([t.name for t in bpy.data.texts]))
+mod_log.append("Flood", "x", [f"line {i}" for i in range(mod_log.MAX_LINES * 2)])
+check("log_is_bounded", len(_b.lines) <= mod_log.MAX_LINES + 1,
+      f"{len(_b.lines)} lines, cap {mod_log.MAX_LINES}")
+check("log_keeps_the_NEWEST_when_it_trims",
+      f"line {mod_log.MAX_LINES * 2 - 1}" in _b.as_string(),
+      "the trim dropped the newest lines instead of the oldest")
+check("show_survives_having_no_text_editor",
+      isinstance(mod_log.show(), int), "show() did not return a count")
+# A real export, logged. "Does `execute` call `record` anywhere" is too weak:
+# export logs on three paths (refused, could-not-write, wrote), and deleting
+# the SUCCESS one leaves the other two matching. Only running it can tell.
+bpy.data.texts[mod_log.LOG_NAME].clear()
+_res = bpy.ops.export_map.document(filepath=EXPORT_DIR)
+_logged = bpy.data.texts[mod_log.LOG_NAME].as_string()
+check("a_real_export_lands_in_the_log", "FINISHED" in _res and "Export" in _logged,
+      f"{_res} / {_logged!r}")
+check("the_export_entry_names_what_it_wrote", "wrote into" in _logged
+      and ".json" in _logged, _logged)
+check("the_export_entry_carries_the_divergence_stats",
+      "changed since import" in _logged,
+      f"the stats went only to a toast: {_logged!r}")
+# Every Outcome-producing operator must actually call it, or the Log is true of
+# one gesture only.  AST again: a `from .report_log import record` line would
+# match a grep in a file where nothing calls it.
+#
+# READ THE TREE, NOT THE LOADED MODULE.  `inspect.getsource` reads the file the
+# module was imported from, which is the INSTALLED addon -- and
+# `bpy.ops.preferences.addon_install` does NOT reliably overwrite an existing
+# install on 5.2, so a mutated tree can be graded through a stale copy and read
+# green.  Measured: a seed that deleted the push's `record` call left
+# `_ui.__file__` pointing at `~/.config/blender/.../live_link_ui.py`, whose
+# source still had it.  Parsing the file under `PKG` grades what the harness
+# was actually pointed at.
+import os.path as _osp
+
+
+def _tree_path(relpath):
+    return _osp.join(PKG, "exmateria_map", relpath)
+
+
+def _tree_func(relpath, name, cls=None):
+    """The AST of one function, read from the source tree under test."""
+    with open(_tree_path(relpath)) as _fh:
+        tree = _ast.parse(_fh.read())
+    scope = tree
+    if cls is not None:
+        scope = next(n for n in tree.body
+                     if isinstance(n, _ast.ClassDef) and n.name == cls)
+    return next(n for n in scope.body
+                if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef))
+                and n.name == name)
+
+
+def _calls_named(node, fname):
+    return [n for n in _ast.walk(node)
+            if isinstance(n, _ast.Call) and getattr(n.func, "id", None) == fname]
+
+
+check("the_ast_checks_read_the_tree_not_the_installed_copy",
+      _osp.exists(_tree_path("live_link_ui.py"))
+      and PKG not in str(bpy.utils.user_resource("SCRIPTS")),
+      f"PKG {PKG} is the installed addon directory — the seeds would be blind")
+for _tag, _rel, _cls, _fn in (
+        ("export", "export_document.py", "EXPORT_OT_interchange_document",
+         "execute"),
+        ("bundle", "gns_bundle.py", "EXPORT_OT_bundle", "execute"),
+        ("push", "live_link_ui.py", "MAP_OT_live_push", "execute"),
+        ("lamp_authority", "lighting_bake.py", None, "_authority_update")):
+    try:
+        check(f"{_tag}_records_an_outcome_in_the_log",
+              bool(_calls_named(_tree_func(_rel, _fn, _cls), "record")),
+              f"{_tag} never calls report_log.record")
+    except Exception as e:
+        check(f"{_tag}_records_an_outcome_in_the_log", False, repr(e))
+# The live handler must NOT: it bakes on every lamp change, and an entry per
+# depsgraph update would bury every export and push in the same pane.
+try:
+    check("the_live_bake_handler_does_not_flood_the_log",
+          not _calls_named(_tree_func("lighting_bake.py", "_live_handler"),
+                           "record"),
+          "the depsgraph handler records an Outcome on every lamp change")
+except Exception as e:
+    check("the_live_bake_handler_does_not_flood_the_log", False, repr(e))
+
+# ===========================================================================
+# ADR-0185 Amendment 4 -- landing 1.
+#
+# SEEDED, because most of what follows states what must not be LOST, and an arm
+# that has never been red is decoration. Eight defects, one at a time, into a
+# scratch copy of the package (never this worktree -- another agent commits
+# here), each re-run through the whole file. 8/8 caught, none blind, none
+# SEED-BROKEN:
+#
+#   both copies shout NO_EDITOR_HINT ....... the_image_editor_copy_does_not_say_it
+#   neither copy says it .................... the_viewport_copy_still_says_where_the_sheet_went
+#   an UNTAGGED workspace claimed as ours ... an_untagged_map_workspace_is_the_artists_and_is_left_alone
+#   the export panel loses its report ....... the_export_panel_still_shows_the_last_export
+#   the report loses its copy button ........ the_report_still_offers_the_copy_button
+#   `marker_in_scene` back to the selection . no_panel_polls_itself_away_with_the_map_deselected
+#   the rig table drops light 3 ............. the_table_still_draws_every_authorable_rig_control
+#   `_timeline` takes a DOPE SHEET .......... the_band_finder_does_not_take_a_dope_sheet_for_a_timeline
+#
+# The two arms of the placement RATCHET are seeds by construction: they run the
+# predicate against a synthetic yesterday-shaped panel and a compliant one.
+# ===========================================================================
+
+# --- ADR-0185 Amendment 4: the layout is the home, Properties is vacated ----
+# The rule, which replaces decision 3: "Every map panel lives in the `Map` tab
+# of the 3D viewport sidebar.  One leaves it, and only when a different editor
+# is RENDERING ITS ACTUAL SUBJECT: Paint, because the sheet's pixels are in the
+# Image Editor."  Reported from use, twice: "I don't want it mixed with the
+# regular properties menu."
+#
+# Graded as a RATCHET WITH BOTH ARMS, because "no panel of ours is in
+# PROPERTIES" is exactly the claim that goes quietly vacuous.  A check walking a
+# hand-kept tuple of class names passes forever once a class leaves the tuple; a
+# check walking `bpy.types` for `MAP_PT_*` passes if the addon never registered.
+# So the roster is DISCOVERED from the registered types, the table has to name
+# every member of it, and the predicate is then run against a synthetic
+# offender to prove it can still say no.
+_HOMES = {
+    # editor,       bl_order within that editor
+    "MAP_PT_paint":             ("IMAGE_EDITOR", 0),
+    "MAP_PT_paint_view":        ("VIEW_3D", 2),
+    "MAP_PT_map_transform":     ("VIEW_3D", 0),
+    "MAP_PT_preview":           ("VIEW_3D", 1),
+    "MAP_PT_terrain":           ("VIEW_3D", 3),
+    "MAP_PT_lighting_bake":     ("VIEW_3D", 4),
+    "MAP_PT_export":            ("VIEW_3D", 5),
+    "MAP_PT_live_push":         ("VIEW_3D", 6),
+    "MAP_PT_live_push_carries": ("VIEW_3D", 7),
+}
+_roster = sorted(n for n in dir(bpy.types) if n.startswith("MAP_PT_"))
+check("the_panel_roster_is_the_one_the_rule_was_written_for",
+      set(_roster) == set(_HOMES),
+      f"registered {_roster}, the Amendment-4 table names "
+      f"{sorted(_HOMES)} -- a panel with no home in the table is a seventh "
+      f"judgement call, which is what the one rule exists to prevent")
+
+
+def _misplaced(cls, want_space):
+    """Every way a panel can fail to live where the rule says it does."""
+    bad = []
+    if getattr(cls, "bl_space_type", None) != want_space:
+        bad.append(f"bl_space_type={getattr(cls, 'bl_space_type', None)!r}")
+    if getattr(cls, "bl_region_type", None) != "UI":
+        bad.append(f"bl_region_type={getattr(cls, 'bl_region_type', None)!r}")
+    if getattr(cls, "bl_category", None) != mod_ws.TAB:
+        bad.append(f"bl_category={getattr(cls, 'bl_category', None)!r}")
+    # `bl_context` is the Properties editor's own field.  Left behind on a
+    # sidebar panel it is inert, and inert is how the next reader learns the
+    # wrong rule.
+    if getattr(cls, "bl_context", "") != "":
+        bad.append(f"bl_context={getattr(cls, 'bl_context', None)!r}")
+    return bad
+
+
+_wrong = {n: _misplaced(getattr(bpy.types, n), _HOMES[n][0])
+          for n in _roster if n in _HOMES}
+_wrong = {n: v for n, v in _wrong.items() if v}
+check("every_panel_lives_where_the_rule_says", not _wrong, str(_wrong))
+# Stated separately from the table, because THIS is the sentence the artist
+# said and the one a future reader will look for.
+check("no_panel_of_ours_is_registered_for_properties",
+      not [n for n in _roster
+           if getattr(bpy.types, n).bl_space_type == "PROPERTIES"],
+      str([n for n in _roster
+           if getattr(bpy.types, n).bl_space_type == "PROPERTIES"]))
+# The ratchet's second arm: the predicate itself, against a panel shaped
+# exactly like the six this landing moved.  Without it, `_misplaced` returning
+# `[]` unconditionally would read as nine panels in the right place.
+class _WasInProperties:
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "object"
+    bl_category = "Map"
+
+
+class _IsInTheSidebar:
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Map"
+
+
+check("the_placement_rule_still_catches_a_properties_panel",
+      len(_misplaced(_WasInProperties, "VIEW_3D")) == 3,
+      f"the yesterday-shaped panel scored {_misplaced(_WasInProperties, 'VIEW_3D')} "
+      f"-- it must be caught on space, region AND the leftover bl_context")
+check("the_placement_rule_passes_a_panel_that_obeys_it",
+      _misplaced(_IsInTheSidebar, "VIEW_3D") == [],
+      str(_misplaced(_IsInTheSidebar, "VIEW_3D")))
+# Order is per EDITOR now, so the old global 0-5 cannot survive: two panels in
+# different editors may share a number and two in the same one may not.
+# Asserted as a PERMUTATION rather than against the literals above, which would
+# only restate the table.
+for _sp in sorted({s for s, _ in _HOMES.values()}):
+    _there = {n: o for n, (s, o) in _HOMES.items() if s == _sp}
+    _live = {n: getattr(bpy.types, n, None) for n in _there}
+    check(f"bl_order_is_a_permutation_in_{_sp.lower()}",
+          all(c is not None and getattr(c, "bl_order", None) == _there[n]
+              for n, c in _live.items())
+          and sorted(_there.values()) == list(range(len(_there))),
+          f"{ {n: getattr(c, 'bl_order', None) for n, c in _live.items()} } "
+          f"vs {_there}")
+# Nothing is DEFAULT_CLOSED except the push's reference sub-panel, whose
+# closed-ness is a decision of its own (checked above, with its parentage).
+# The artist's words were "move and UNCOLLAPSE the controls".
+_closed = [n for n in _roster
+           if "DEFAULT_CLOSED" in getattr(getattr(bpy.types, n),
+                                          "bl_options", set())]
+check("only_the_push_reference_subpanel_opens_closed",
+      _closed == ["MAP_PT_live_push_carries"], str(_closed))
+# Decision 8 -- "prefix where there is no tab, bare name where there is" --
+# under the new rule resolves to BARE EVERYWHERE, because every panel now sits
+# under a tab that already says `Map`.
+_prefixed = [(n, getattr(bpy.types, n).bl_label) for n in _roster
+             if getattr(bpy.types, n).bl_label.startswith("ExMateria Map")]
+check("no_panel_repeats_the_addon_name_under_the_Map_tab",
+      not _prefixed, str(_prefixed))
+
+# --- Amendment 4: NO panel is selection-scoped ------------------------------
+# "There is only really one map in the scene -- and having to have that map
+# SELECTED to see the properties is annoying."  Decision 3 would have codified
+# the split as intentional; measured, only three of six panels obeyed the rule
+# their own docstrings state, and Preview's blank-on-deselect sat 38 lines
+# above `marker_in_scene` in the same file without using it.
+#
+# Aiming a lamp means SELECTING the lamp, which makes it the ACTIVE object.  So
+# the deselect is staged with a lamp and not with `None`: `None` is reachable
+# by clicking empty space, but a lamp is the gesture the artist makes on the
+# way to the panel they are about to lose.
+#
+# "Survives" is not "does not raise".  A panel that draws nothing is, to the
+# artist, the same as one that crashed -- so every arm counts what reached the
+# layout as well.
+class _SinkLayout(_FakeLayout):
+    """A `_FakeLayout` with its own tape, so one panel's draw cannot be
+    satisfied by another panel's output."""
+
+    def __init__(self):
+        _FakeLayout.__init__(self, [])
+        self.drawn = []
+
+    def label(self, text="", icon=None, **kw):
+        self.drawn.append(("label", text))
+        return self
+
+    def operator(self, bl_idname, text="", icon=None, **kw):
+        self.drawn.append(("operator", bl_idname))
+
+        class _Op:
+            pass
+        return _Op()
+
+    def operator_menu_enum(self, bl_idname, prop, text="", icon=None, **kw):
+        self.drawn.append(("operator", bl_idname))
+        return self
+
+    def menu(self, menu_id, text="", icon=None, **kw):
+        self.drawn.append(("menu", menu_id))
+        return self
+
+    def prop(self, data, prop_name, **kw):
+        # The DATA, not its name: what makes the transform block right is
+        # WHOSE transform reached the layout, and a name read back later is a
+        # dead StructRNA by the end of this file.
+        self.drawn.append(("prop", data, prop_name))
+        return self
+
+    def template_palette(self, data, prop, *a, **kw):
+        # the DATA as well: what makes the palette the legal set is whose it
+        # is, and `template_palette` takes TWO arguments on 5.2 -- `color=` is
+        # a TypeError, so `*a` catches a caller that puts it back.
+        self.drawn.append(("palette", data, prop, a, sorted(kw)))
+        return self
+
+
+def _draw_deselected(cls):
+    """Drive one panel's real `draw` with a lamp as the active object."""
+    sink = _SinkLayout()
+    try:
+        cls.draw(_panel_shim(cls, sink), bpy.context)
+    except Exception as e:
+        return sink, f"{type(e).__name__}: {e}"
+    return sink, None
+
+
+_prev_active2 = bpy.context.view_layer.objects.active
+_lamp2 = bpy.data.objects.new("deselect_probe_lamp",
+                              bpy.data.lights.new("dpl", "POINT"))
+bpy.context.scene.collection.objects.link(_lamp2)
+bpy.context.view_layer.objects.active = _lamp2
+# The precondition, or every arm below passes for the wrong reason.
+check("the_deselect_arm_really_deselects_the_map",
+      bpy.context.object is _lamp2
+      and "exmateria_map/preview_state" not in bpy.context.object,
+      f"active object is {getattr(bpy.context.object, 'name', None)!r}")
+_deselected = {}
+for _n in _roster:
+    _deselected[_n] = _draw_deselected(getattr(bpy.types, _n))
+_raised = {n: err for n, (_s, err) in _deselected.items() if err}
+check("no_panel_raises_with_the_map_deselected", not _raised, str(_raised))
+_blank = sorted(n for n, (s, err) in _deselected.items() if not err and not s.drawn)
+check("every_panel_still_draws_with_the_map_deselected",
+      not _blank,
+      f"{_blank} went BLANK with a lamp active -- the panel disappears at "
+      f"exactly the moment the artist reached for it")
+# ...and the `poll`s, which are the other half of disappearing.
+#
+# The two Paint copies are excluded BY NAME and that is the one exclusion here:
+# their poll answers a different question -- "is the other copy visible" -- and
+# is graded on its own arms below, with a fake screen.  Everything else's poll
+# is about the MAP, which is what this arm is about.
+_polled_away = sorted(n for n in _roster
+                      if getattr(bpy.types, n, None) is not None
+                      and hasattr(getattr(bpy.types, n), "poll")
+                      and n not in ("MAP_PT_paint", "MAP_PT_paint_view")
+                      and not getattr(bpy.types, n).poll(bpy.context))
+check("no_panel_polls_itself_away_with_the_map_deselected",
+      not _polled_away, str(_polled_away))
+
+# --- Amendment 4: the map marker's own Transform, first in the tab ----------
+# "I want to be able to see translate and other key parameters at the same
+# time."  Not a request for something new: in Properties > Object, Location /
+# Rotation / Scale and our five panels were ALREADY co-visible, and vacating
+# Properties would have taken that away.  A sidebar shows one tab at a time,
+# so Blender's `Item` tab is not an answer -- and `Item` follows the selection,
+# which is the same annoyance again.
+_tf_sink, _tf_err = _deselected.get("MAP_PT_map_transform", (None, "not registered"))
+check("the_transform_panel_drew", _tf_err is None, str(_tf_err))
+_tf = [row for row in (_tf_sink.drawn if _tf_sink else []) if row[0] == "prop"]
+_tf_on = [r[1] for r in _tf]
+check("the_transform_panel_draws_the_MARKERS_transform",
+      [r[2] for r in _tf] == ["location", "rotation_euler", "scale"]
+      and len(set(_tf_on)) == 1
+      and _tf_on[0] is not _lamp2
+      and "exmateria_map/preview_state" in _tf_on[0],
+      f"{[(getattr(o, 'name', o), n) for _k, o, n in _tf]} -- with a lamp "
+      f"active, a panel reading `context.object` draws the LAMP's transform, "
+      f"which is the annoyance one layer down.  Graded on the OBJECT rather "
+      f"than on what `marker_in_scene` returns, which would be the panel "
+      f"agreeing with itself")
+# Editable, and that is a decision rather than a convenience: the transform is
+# INVISIBLE to export -- `export_document` never reads it -- but it IS an input
+# to the lighting bake, which bakes `ob.matrix_world @ v.co` and reads
+# `lamp.matrix_world` for direction.  Rotating or scaling the map relative to
+# its lamps changes the baked normals, and those reach the disc.  A control
+# that looks cosmetic and silently writes bytes is what this package says out
+# loud.
+check("the_transform_is_editable",
+      _tf_sink is not None and _tf_sink.enabled is True,
+      "the transform block is drawn disabled -- the artist asked to SEE and "
+      "SET translate, and a greyed row reads as broken")
+_tf_words = " ".join(r[1] for r in (_tf_sink.drawn if _tf_sink else [])
+                     if r[0] == "label").lower()
+check("the_transform_panel_states_the_bake_consequence",
+      "bake" in _tf_words and "normal" in _tf_words,
+      f"the block says nothing about what moving the map costs: {_tf_words!r}")
+bpy.data.objects.remove(_lamp2, do_unlink=True)
+bpy.context.view_layer.objects.active = _prev_active2
+
+# --- Amendment 4: Paint is present exactly ONCE, always ---------------------
+# Registered only for `IMAGE_EDITOR`, Paint does not draw AT ALL in a layout
+# without one -- which is every factory workspace except `UV Editing` /
+# `Texture Paint` / `Shading` / `Compositing`.  So it is registered for
+# `VIEW_3D` too, and that copy polls itself away whenever `context.screen`
+# already holds an Image Editor.
+#
+# The poll MUST NOT use `image_editor_spaces()`.  That helper deliberately
+# walks `bpy.data.screens` -- every screen in every workspace -- which is the
+# right answer to "can the sheet be loaded into an editor somewhere" and the
+# WRONG answer to "is one visible right now".  Pointed at the second question
+# it finds `UV Editing`'s Image Editor on a screen the artist is not looking at
+# and suppresses the viewport copy everywhere, re-introducing the exact defect
+# its own docstring says it was written to fix.
+#
+# That is what the second arm below actually discriminates, which is why the
+# precondition is asserted first: with Image Editors reachable through
+# `bpy.data.screens`, a poll built on the helper answers False for a screen
+# that has none, and this arm goes red.
+def _screen_ctx(screen):
+    return type("_C", (), {"screen": screen})()
+
+
+check("the_paint_poll_arms_can_tell_the_two_questions_apart",
+      len(pnt.image_editor_spaces()) >= 4,
+      f"only {len(pnt.image_editor_spaces())} Image Editor(s) reachable "
+      f"through bpy.data.screens -- the arm below cannot distinguish a poll "
+      f"that walks them from one that reads context.screen")
+_scr_hit = _FakeScreen(False, ["VIEW_3D", "IMAGE_EDITOR", "OUTLINER"])
+_scr_miss = _FakeScreen(False, ["VIEW_3D", "OUTLINER"])
+try:
+    _p_hit = bool(pnt.MAP_PT_paint_view.poll(_screen_ctx(_scr_hit)))
+    _p_miss = bool(pnt.MAP_PT_paint_view.poll(_screen_ctx(_scr_miss)))
+except Exception as e:
+    _p_hit, _p_miss = repr(e), repr(e)
+check("the_viewport_paint_copy_stands_down_beside_an_image_editor",
+      _p_hit is False,
+      f"poll={_p_hit!r} on a screen that already shows the sheet -- Paint "
+      f"would be drawn twice in the Map workspace")
+check("the_viewport_paint_copy_draws_where_there_is_no_image_editor",
+      _p_miss is True,
+      f"poll={_p_miss!r} on a screen with no Image Editor -- Paint is "
+      f"unreachable from every factory workspace but four")
+# The Image Editor copy has nothing to stand down FOR.
+check("the_image_editor_paint_copy_never_stands_itself_down",
+      not hasattr(pnt.MAP_PT_paint, "poll")
+      or bool(pnt.MAP_PT_paint.poll(_screen_ctx(_scr_hit))),
+      "the copy that lives beside the pixels polls itself away")
+# `NO_EDITOR_HINT` is NOT deleted, contrary to decision 3: it survives in the
+# viewport copy, where it is true.  Told "no Image Editor open" INSIDE one, the
+# artist would be reading a lie.
+check("only_the_viewport_copy_says_where_the_sheet_went",
+      pnt.MAP_PT_paint_view.says_where_the_sheet_went is True
+      and pnt.MAP_PT_paint.says_where_the_sheet_went is False,
+      f"{pnt.MAP_PT_paint.says_where_the_sheet_went!r} / "
+      f"{pnt.MAP_PT_paint_view.says_where_the_sheet_went!r}")
+check("the_hint_itself_is_not_deleted",
+      isinstance(pnt.NO_EDITOR_HINT, str) and pnt.NO_EDITOR_HINT,
+      "decision 3 would have deleted it; Amendment 4 keeps it")
+
+# --- Amendment 4: the interchange export is offered ONCE --------------------
+# "We already have the interchange format in the export drop down under file --
+# we don't need it twice."  The panel keeps the REPORT, which the File menu
+# cannot show; it loses the button, which the File menu already is.
+try:
+    _ex_draw = _tree_func("import_document.py", "draw", "MAP_PT_export")
+    _dupe = [n.lineno for n in _ast.walk(_ex_draw)
+             if isinstance(n, _ast.Call)
+             and getattr(n.func, "attr", None) == "operator"
+             and n.args and isinstance(n.args[0], _ast.Constant)
+             and n.args[0].value == "export_map.document"]
+    check("the_export_panel_does_not_repeat_the_File_menu_entry", not _dupe,
+          f"`export_map.document` still drawn at line(s) {_dupe} of "
+          f"MAP_PT_export.draw")
+except Exception as e:
+    check("the_export_panel_does_not_repeat_the_File_menu_entry", False, repr(e))
+# ...and the door it defers to has to actually be there, or the deletion leaves
+# no way to export at all.  `_draw_funcs` hangs off the DISPATCHER, not the
+# class (addon CLAUDE.md, "Menu wiring").
+check("the_File_Export_entry_the_panel_defers_to_exists",
+      exp.menu_func in getattr(bpy.types.TOPBAR_MT_file_export.draw,
+                               "_draw_funcs", []),
+      str([getattr(f, "__name__", "?") for f in
+           getattr(bpy.types.TOPBAR_MT_file_export.draw, "_draw_funcs", [])]))
+# The report is what the panel is FOR now, so it must still be drawn.
+try:
+    _rep_calls = _calls_named(_ex_draw, "_stored_report")
+    check("the_export_panel_still_shows_the_last_export", bool(_rep_calls),
+          "deleting the button took the report with it -- the toast is gone by "
+          "the time the artist looks up, which is why the store exists")
+except Exception as e:
+    check("the_export_panel_still_shows_the_last_export", False, repr(e))
+
+# --- Amendment 4: the workspace is write-once, and this is revision 2 -------
+# `ensure_on_import` looked a workspace up BY NAME and, finding one, switched
+# to it and never rebuilt -- so an artist holding a workspace from the previous
+# layout would have imported a map, been switched into the OLD panes, and
+# reported that nothing changed, for the third time.  `build`'s `_free_name()`
+# would meanwhile have handed a second workspace the name `Map.001`.
+#
+# A `Map` workspace with a STALE tag is ours and is rebuilt.  A `Map` workspace
+# with NO tag was not built by us and is left alone -- which is what makes the
+# removal safe rather than presumptuous.
+_wsn = mod_ws.WORKSPACE_NAME
+# Sentinel, never a bare attribute read: a check that ABORTS takes the whole
+# report with it, and "no report written" reads as a broken harness rather
+# than as the one arm that is actually red.
+_LV = getattr(mod_ws, "LAYOUT_VERSION", "<no LAYOUT_VERSION>")
+_live_ws = bpy.data.workspaces.get(_wsn)
+check("a_workspace_we_built_says_which_layout_it_is",
+      _live_ws is not None
+      and _live_ws.get("exmateria_map/layout_version") == _LV,
+      f"tag={None if _live_ws is None else _live_ws.get('exmateria_map/layout_version')!r} "
+      f"vs LAYOUT_VERSION={_LV!r}")
+if _live_ws is not None:
+    _live_ws["exmateria_map/layout_version"] = -1        # a previous revision
+    try:
+        _act = mod_ws.ensure_on_import(bpy.context)
+    except Exception as e:
+        _act = repr(e)
+    _rebuilt = bpy.data.workspaces.get(_wsn)
+    check("a_stale_map_workspace_is_REBUILT_not_switched_to", _act == "rebuilt",
+          f"ensure_on_import said {_act!r} -- switching lands the artist in "
+          f"the old panes and they report that nothing changed")
+    check("the_rebuilt_workspace_carries_the_current_layout_version",
+          _rebuilt is not None
+          and _rebuilt.get("exmateria_map/layout_version") == _LV,
+          f"tag={None if _rebuilt is None else _rebuilt.get('exmateria_map/layout_version')!r}")
+    check("the_rebuild_keeps_the_name_and_leaves_no_Map_001",
+          f"{_wsn}.001" not in bpy.data.workspaces,
+          str(sorted(w.name for w in bpy.data.workspaces)))
+    # ...and the arm that makes the removal safe: no tag means not ours.
+    _mine = bpy.data.workspaces.get(_wsn)
+    if _mine is not None and "exmateria_map/layout_version" in _mine.keys():
+        del _mine["exmateria_map/layout_version"]
+    try:
+        _act2 = mod_ws.ensure_on_import(bpy.context)
+    except Exception as e:
+        _act2 = repr(e)
+    _after = bpy.data.workspaces.get(_wsn)
+    check("an_untagged_map_workspace_is_the_artists_and_is_left_alone",
+          _act2 == "switched" and _after is not None
+          and "exmateria_map/layout_version" not in _after.keys(),
+          f"ensure_on_import said {_act2!r} and the workspace now tags "
+          f"{None if _after is None else _after.get('exmateria_map/layout_version')!r} "
+          f"-- a workspace we did not build is not ours to remove OR to claim")
+else:
+    check("a_stale_map_workspace_is_REBUILT_not_switched_to", False,
+          "no Map workspace to stage the arm on")
+
+# --- decision 5's in-panel half: the panel is a STATUS ROW ------------------
+# Reports render into the LOG pane now -- a running Text datablock, selectable,
+# in sequence, with a header per entry, because "I pushed, then exported, and
+# the export refused" is a sequence the three-key model cannot express.  So the
+# in-panel block stops being a second, worse copy of it and goes back to being
+# one status row plus the copy button: the `[:12]` cut, the `[:3]` refusal cut,
+# the 88-column wrap and `exmateria_map_report_expanded` all lose their reason
+# to exist.  Amendment 3 deferred this waiting for exactly the column space
+# Amendment 4 recovers.
+#
+# **Refusals stay in-panel in full** -- that rule is untouched, and "in full"
+# means every refusal LINE, none dropped and none cut short.  A refusal is the
+# whole reason the report exists, so it is never behind a disclosure triangle.
+_mk = exp.markers(bpy.context.scene)[0]
+_saved_rep = _mk.get("exmateria_map/last_export")
+_long_refusal = "REFUSE: " + "the reason lives at the end of the line, " * 5
+_planted = ([f"informational line {i}" for i in range(20)]
+            + [f"REFUSE: reason {i}" for i in range(6)]
+            + [_long_refusal])
+_mk["exmateria_map/last_export"] = json.dumps(_planted)
+_rep_sink = _SinkLayout()
+try:
+    mod.MAP_PT_export.draw(_panel_shim(mod.MAP_PT_export, _rep_sink),
+                           bpy.context)
+    _rep_err = None
+except Exception as e:
+    _rep_err = f"{type(e).__name__}: {e}"
+check("the_export_panel_drew_its_report", _rep_err is None, str(_rep_err))
+_rep_labels = [r[1] for r in _rep_sink.drawn if r[0] == "label"]
+_want_ref = [ln for ln in _planted if ln.startswith("REFUSE")]
+check("every_refusal_is_drawn_in_the_panel_whole_and_in_order",
+      [t for t in _rep_labels if t.startswith("REFUSE")] == _want_ref,
+      f"drew {[t for t in _rep_labels if t.startswith('REFUSE')]!r} for "
+      f"{_want_ref!r} -- a cut at three, or an 88-column wrap that splits the "
+      f"seventh, and the reason stops being readable where it lives")
+check("the_panel_does_not_reprint_the_whole_report",
+      not [t for t in _rep_labels if t.startswith("informational line")],
+      f"{len([t for t in _rep_labels if t.startswith('informational line')])} "
+      f"of 20 informational lines redrawn -- that is the Log's job now")
+check("the_panel_never_says_it_cut_something",
+      not [t for t in _rep_labels if "more" in t and "..." in t],
+      str([t for t in _rep_labels if "more" in t]))
+check("the_status_row_counts_what_it_is_not_showing",
+      any(f"{len(_planted)} line(s)" in t and f"{len(_want_ref)} refusal(s)" in t
+          for t in _rep_labels),
+      f"no row states the totals: {_rep_labels[:4]!r}")
+check("the_report_still_offers_the_copy_button",
+      "map.copy_report" in [r[1] for r in _rep_sink.drawn
+                            if r[0] == "operator"],
+      str(_rep_sink.drawn))
+# The disclosure triangle is RETIRED, not merely defaulted open: the property
+# is what made the refusals hideable in the first place.
+check("the_report_disclosure_triangle_is_retired",
+      not hasattr(bpy.types.Object, "exmateria_map_report_expanded"),
+      "exmateria_map_report_expanded is still registered on Object")
+check("the_panel_draws_no_disclosure_prop",
+      not [r for r in _rep_sink.drawn
+           if r[0] == "prop" and r[2] == "exmateria_map_report_expanded"],
+      str([r for r in _rep_sink.drawn if r[0] == "prop"]))
+if _saved_rep is None:
+    del _mk["exmateria_map/last_export"]
+else:
+    _mk["exmateria_map/last_export"] = _saved_rep
+
+# --- decision 6: the rig draws as a TABLE, not a list -----------------------
+# `Light 1 | Light 2 | Light 3` side by side -- ~24 rows to ~9, measured at the
+# sidebar's 280 px as ~610 px of column against ~175 px
+# (`workspace/README.md`, gate 3; `gate3_rig_table_vs_list.png`).  The data is
+# three instances of ONE shape and a list makes them incomparable: you cannot
+# see that light 2 is twice light 1 without scrolling between them.  A `UIList`
+# was rejected -- it is Blender's stock answer for N-of-a-kind and it shows one
+# and hides two, which is the opposite of the goal.
+#
+# `_FakeLayout` cannot grade this: it returns ITSELF from every container, so a
+# stacked list and a three-column table record identically -- and side-by-side
+# is the whole of the decision.  This one remembers its shape.
+class _TreeLayout:
+    def __init__(self, kind="root"):
+        self.kind = kind
+        self.children = []
+        self.items = []
+        self.enabled = True
+
+    def _child(self, kind):
+        c = _TreeLayout(kind)
+        self.children.append(c)
+        return c
+
+    def box(self, **kw):
+        return self._child("box")
+
+    def row(self, **kw):
+        return self._child("row")
+
+    def column(self, align=False, **kw):
+        return self._child("column")
+
+    def grid_flow(self, **kw):
+        return self._child("grid_flow")
+
+    def separator(self, **kw):
+        return self
+
+    def label(self, text="", icon=None, **kw):
+        self.items.append(("label", text))
+        return self
+
+    def prop(self, data, prop_name, **kw):
+        self.items.append(("prop", prop_name))
+        return self
+
+    def operator(self, idname, text="", icon=None, **kw):
+        self.items.append(("operator", idname))
+
+        class _Op:
+            pass
+        return _Op()
+
+    def operator_menu_enum(self, idname, prop, **kw):
+        self.items.append(("operator", idname))
+        return self
+
+    def menu(self, mid, text="", icon=None, **kw):
+        self.items.append(("menu", mid))
+        return self
+
+    def template_palette(self, *a, **kw):
+        return self
+
+    def walk(self):
+        yield self
+        for c in self.children:
+            yield from c.walk()
+
+    def all_items(self):
+        return [it for n in self.walk() for it in n.items]
+
+
+_rig_tree = _TreeLayout()
+try:
+    mod.MAP_PT_preview.draw(_panel_shim(mod.MAP_PT_preview, _rig_tree),
+                            bpy.context)
+    _rig_err = None
+except Exception as e:
+    _rig_err = f"{type(e).__name__}: {e}"
+check("the_preview_panel_drew_for_the_rig_shape_arms", _rig_err is None,
+      str(_rig_err))
+# A row whose children are three columns, one light's controls in each.
+_tables = [[[p for k, p in c.items if k == "prop"]
+            for c in n.children if c.kind == "column"]
+           for n in _rig_tree.walk()
+           if n.kind == "row"
+           and len([c for c in n.children if c.kind == "column"]) == 3]
+check("the_rig_draws_the_three_lights_SIDE_BY_SIDE",
+      _tables == [[["gain_1", "dir_1"], ["gain_2", "dir_2"],
+                   ["gain_3", "dir_3"]]],
+      f"{_tables} -- one row of three columns, one light in each, is what "
+      f"makes them comparable; stacked, you cannot see that light 2 is twice "
+      f"light 1 without scrolling between them")
+_rig_items = _rig_tree.all_items()
+_rig_props = [p for k, p in _rig_items if k == "prop"]
+# Nothing AUTHORABLE is lost by re-laying it out.
+check("the_table_still_draws_every_authorable_rig_control",
+      set(_rig_props) >= {"ambient", "gain_1", "gain_2", "gain_3",
+                          "dir_1", "dir_2", "dir_3"}
+      and all(_rig_props.count(n) == 1 for n in
+              ("gain_1", "gain_2", "gain_3", "dir_1", "dir_2", "dir_3")),
+      str(_rig_props))
+# The gradient collapses to ONE LINE.  Its six values stay in the Override, so
+# the rig is still the whole 45 bytes; they stop occupying a third of the box
+# to be un-editable, which reads as broken rather than as deliberate.  This is
+# NOT the sky-gradient work, which is parked.
+check("the_gradient_collapses_to_one_line",
+      "gradient" not in _rig_props
+      and len([t for k, t in _rig_items
+               if k == "label" and "gradient" in t.lower()]) == 1,
+      f"gradient drawn as a prop: {'gradient' in _rig_props}; gradient "
+      f"labels: {[t for k, t in _rig_items if k == 'label' and 'gradient' in t.lower()]}")
+_ov_now = mod.find_override(_mk, int(_mk["exmateria_map/preview_state"]))
+check("the_gradient_values_are_still_CARRIED",
+      _ov_now is not None and len(list(_ov_now.gradient)) == 6,
+      f"the Override must still hold all six bytes or the rig stops being 45: "
+      f"{None if _ov_now is None else list(_ov_now.gradient)}")
+
+# --- Amendment 4: the console runs along the BOTTOM -------------------------
+# "Can you move the CONSOLE looking panel so it runs across the bottom like in
+# most sane programs with a console. And then on the right (where the console
+# is now) can you move and uncollapse the controls."
+#
+# The band is SOURCED by converting the inherited Timeline, and splitting only
+# as a fallback.  The workspace is a duplicate, so it inherits the factory
+# Outliner + Properties column -- the Log was never the rightmost thing on
+# screen, and "where the console is now" named the middle-right slot.  And
+# Blender's own Timeline already stops at that column, so a bottom band
+# spanning ~2107 of 2560 px is the engine's idiom rather than a truncation.
+# Converting it also costs no split and takes no height from the viewport.
+#
+# `-b` can grade the SOURCE and nothing about the panes: the screen never lays
+# out, the timers never tick, and `area.type` is the field that LIES.  The
+# geometry belongs to `workspace/workspace_probe.py` phase `build`, and that
+# restraint is deliberate -- see this section's header.
+_factory = bpy.data.workspaces.get("Layout")
+_factory_screen = _factory.screens[0] if _factory else None
+_strip = (mod_ws._timeline(_factory_screen)
+          if _factory_screen is not None and hasattr(mod_ws, "_timeline")
+          else None)
+check("the_factory_layout_still_ships_the_timeline_the_band_comes_from",
+      _factory_screen is not None
+      and any(a.type == "DOPESHEET_EDITOR" and a.ui_type == "TIMELINE"
+              for a in _factory_screen.areas),
+      f"no Timeline in the factory Layout: "
+      f"{[] if _factory_screen is None else sorted((a.type, a.ui_type) for a in _factory_screen.areas)} "
+      f"-- the fallback split is then the only path and this arm is blind")
+check("the_log_band_is_sourced_from_the_inherited_timeline",
+      _strip is not None and _strip.ui_type == "TIMELINE",
+      f"_timeline() found {getattr(_strip, 'ui_type', None)!r} -- the band has "
+      f"to come from the strip the duplicate already has, or the viewport pays "
+      f"for it in height")
+# ...and it must not answer YES on a screen that has none, or the fallback
+# split is unreachable and every workspace without a Timeline gets no Log.
+class _StripArea:
+    def __init__(self, t, ui):
+        self.type, self.ui_type = t, ui
+
+
+class _StripScreen:
+    def __init__(self, pairs):
+        self.areas = [_StripArea(t, u) for t, u in pairs]
+
+
+check("the_band_finder_says_no_when_there_is_no_timeline",
+      hasattr(mod_ws, "_timeline")
+      and mod_ws._timeline(_StripScreen(
+          [("VIEW_3D", "VIEW_3D"), ("OUTLINER", "OUTLINER")])) is None,
+      "a screen with no Timeline was handed one anyway")
+# A DOPESHEET area is not automatically the Timeline: `ui_type` is what tells
+# them apart, and the Animation workspace ships both.
+check("the_band_finder_does_not_take_a_dope_sheet_for_a_timeline",
+      hasattr(mod_ws, "_timeline")
+      and mod_ws._timeline(_StripScreen(
+          [("DOPESHEET_EDITOR", "DOPESHEET")])) is None,
+      "the artist's dope sheet would be converted into a Log")
+# The Log pane is DROPPED, not moved: the viewport widens to fill it and its
+# own `Map` sidebar comes to rest against Blender's Properties column.  A third
+# pane would buy a second 280 px column, which is width the panels cannot use
+# -- they are too TALL, not too narrow.
+check("there_is_no_second_vertical_split_factor_left",
+      not hasattr(mod_ws, "LOG_SPLIT"),
+      "LOG_SPLIT still exists -- the layout still cuts a third pane out of the "
+      "viewport")
+
+# --- NO_EDITOR_HINT is MOVING, not going away -------------------------------
+# Decision 3 would have DELETED this block: drawn inside an Image Editor the
+# "no Image Editor open / every editor holds a render" box and its wrapped
+# instructions are unreachable.  Amendment 4 keeps Paint in the viewport as
+# well, where the block is true -- so it survives, in that copy only.  The
+# operator's own report (`paint_sheet_warns_when_no_editor` and the three arms
+# around it) is unchanged and stays where it is; what moved is the PANEL half,
+# and "not deleted" is a claim about a constant until something renders it.
+_ie = [(_sc, _a, _a.type) for _sc in bpy.data.screens for _a in _sc.areas
+       if _a.type == "IMAGE_EDITOR"]
+for _sc, _a, _t in _ie:
+    _a.type = "VIEW_3D"
+check("the_hint_arm_really_leaves_no_image_editor",
+      bool(_ie) and not pnt.image_editor_spaces(),
+      f"{len(_ie)} editor(s) taken away, {len(pnt.image_editor_spaces())} "
+      f"still reachable -- without this the arm below is blind")
+_hint_v, _hint_i = _SinkLayout(), _SinkLayout()
+try:
+    pnt.MAP_PT_paint_view.draw(
+        _panel_shim(pnt.MAP_PT_paint_view, _hint_v), bpy.context)
+    pnt.MAP_PT_paint.draw(_panel_shim(pnt.MAP_PT_paint, _hint_i), bpy.context)
+    _hint_err = None
+except Exception as e:
+    _hint_err = f"{type(e).__name__}: {e}"
+check("both_paint_copies_draw_with_no_image_editor_anywhere",
+      _hint_err is None, str(_hint_err))
+_hv_txt = " ".join(r[1] for r in _hint_v.drawn if r[0] == "label")
+_hi_txt = " ".join(r[1] for r in _hint_i.drawn if r[0] == "label")
+check("the_viewport_copy_still_says_where_the_sheet_went",
+      "no Image Editor open" in _hv_txt
+      and all(w in _hv_txt for w in ("UV Editing", "Texture Paint")),
+      f"the hint is not rendered by the copy that is allowed to say it: "
+      f"{_hv_txt!r}")
+check("the_image_editor_copy_does_not_say_it",
+      "no Image Editor open" not in _hi_txt and "UV Editing" not in _hi_txt,
+      f"told 'no Image Editor open' INSIDE one, the artist is reading a lie: "
+      f"{_hi_txt!r}")
+for _sc, _a, _t in _ie:                    # put the artist's screens back
+    _a.type = _t
+check("the_hint_arm_put_the_editors_back",
+      len(pnt.image_editor_spaces()) == len(_ie),
+      f"{len(pnt.image_editor_spaces())} of {len(_ie)} restored")
+
+# --- the picker and the palette in ONE tab ----------------------------------
+# SEEDED, 5/5 caught, each by exactly ONE arm:
+#   `color=True` put back ............. the_palette_template_is_called_with_the_arity_5_2_accepts
+#   any palette blessed as legal ...... a_palette_we_did_not_build_is_never_shown_as_the_legal_set
+#   grid drawn as well as the palette . the_reference_grid_stands_down_when_the_palette_is_live
+#   the picker left in the Tool tab ... the_paint_panel_reaches_for_the_BRUSH_colour
+#   the template pointed at the shelf . the_paint_panel_hands_the_sixteen_to_the_brush_in_one_click
+# The first is the historical defect itself, which is why it is seeded rather
+# than merely described.
+# Reported from use: "map has the palette I need to eye drop from, tool has the
+# color picker -- and I can't see them at the same time."  A sidebar region
+# shows exactly ONE tab, always, so this cannot be arranged around -- it is the
+# same wall Amendment 4 hit with Blender's `Item` tab, and it takes the same
+# answer: bring what is needed into OUR tab rather than chase theirs.
+#
+# Measured headful (probe phase `swatches`), because two of the three facts are
+# claims about Blender that introspection cannot settle:
+#   - `TOOLS` is a real 56 px region in an Image Editor, and a panel registered
+#     to it does NOT draw.  There is no second sidebar to have.
+#   - `template_palette` RENDERS -- in Texture Paint AND in Edit Mode, with its
+#     add/remove buttons greyed in the latter.  The shipped comment saying it
+#     "draws NOTHING without an active paint brush" was measuring
+#     `TypeError: UILayout.template_palette(): takes at most 2 arguments, got
+#     3` -- the `color=True` kwarg, which does not exist on 5.2.  A `draw` that
+#     raises renders everything emitted BEFORE it and nothing after, which is
+#     indistinguishable from a template that drew nothing.  That is how the
+#     wrong reason got recorded.
+# The template's swatches are natively click-to-arm, so the eyedrop round trip
+# the artist was making disappears rather than being made easier.
+_ip = bpy.context.scene.tool_settings.image_paint
+_shelf_now = bpy.data.palettes.get(pnt.PALETTE_SHELF)
+check("the_swatch_arms_have_a_shelf_to_grade",
+      _shelf_now is not None and len(_shelf_now.colors) == 16,
+      f"shelf={None if _shelf_now is None else len(_shelf_now.colors)} -- "
+      f"without it the arms below cannot tell the branches apart")
+# THE PICKER HALF IS NOT GRADEABLE HERE, and this is the control that says so
+# rather than an arm that quietly never runs. `ImagePaint.brush` is READ-ONLY
+# on 5.2 -- a brush is resolved from the asset system on entering a paint mode,
+# `bpy.data.brushes` is empty under `-b --factory-startup`, and assigning one
+# raises `bpy_struct: attribute "brush" from "ImagePaint" is read-only`. So the
+# `if brush is not None` branch is unreachable in background mode whatever the
+# panel does. Written to go RED if a future Blender makes it assignable, which
+# is the signal to replace the AST arm below with a real one.
+try:
+    _ip.brush = (bpy.data.brushes.get("_check_brush")
+                 or bpy.data.brushes.new("_check_brush", mode="TEXTURE_PAINT"))
+    _brush_assignable = True
+except Exception as e:                                             # noqa: BLE001
+    _brush_assignable = f"{type(e).__name__}: {e}"
+check("the_brush_is_unreachable_headless_so_the_PROBE_grades_the_picker",
+      getattr(_ip, "brush", None) is None and _brush_assignable is not True,
+      f"brush={getattr(getattr(_ip, 'brush', None), 'name', None)!r}, "
+      f"assignment={_brush_assignable!r} -- a brush can be had headless now, "
+      f"so grade the picker here instead of on the AST")
+_ip.palette = _shelf_now
+
+
+def _draw_paint_panel():
+    sink = _SinkLayout()
+    try:
+        pnt.MAP_PT_paint.draw(_panel_shim(pnt.MAP_PT_paint, sink), bpy.context)
+        return sink, None
+    except Exception as e:
+        return sink, f"{type(e).__name__}: {e}"
+
+
+_ps, _ps_err = _draw_paint_panel()
+check("the_paint_panel_drew_with_the_shelf_bound", _ps_err is None, str(_ps_err))
+_pal_calls = [r for r in _ps.drawn if r[0] == "palette"]
+# `==`, NOT `is`: bpy hands back a FRESH Python wrapper for a nested struct on
+# every access, so `context.tool_settings.image_paint` is a different object
+# each time and an identity test fails on the correct call. (ID datablocks ARE
+# wrapper-cached, which is why the palette comparisons either side of this hold
+# under `is` -- the two cases do not behave the same, so compare by `==`.)
+check("the_paint_panel_hands_the_sixteen_to_the_brush_in_one_click",
+      len(_pal_calls) == 1 and _pal_calls[0][1] == _ip
+      and _pal_calls[0][2] == "palette",
+      f"{_pal_calls} -- `template_palette` on the paint settings is what makes "
+      f"a swatch ARM the brush; a read-only `prop(slot, 'color')` grid only "
+      f"opens a picker on the shelf slot, which edits the SHELF and not the "
+      f"CLUT, and is overwritten on the next sync")
+# TWO arguments.  `color=True` raises `TypeError: takes at most 2 arguments,
+# got 3` on 5.2 -- and a `draw` that raises renders everything emitted BEFORE
+# it and nothing after, which is why the shipped comment recorded the symptom
+# ("the label rendered and the swatches did not") against the wrong cause.
+check("the_palette_template_is_called_with_the_arity_5_2_accepts",
+      len(_pal_calls) == 1 and not _pal_calls[0][3] and not _pal_calls[0][4],
+      f"extra args={_pal_calls[0][3] if _pal_calls else None}, "
+      f"kwargs={_pal_calls[0][4] if _pal_calls else None}")
+# ...and it must NOT also draw the read-only grid, which would be sixteen more
+# rows of the same colours in a column two decisions just spent shortening.
+# `paint_owner`, not `_ip.brush`: the colour row now draws whoever actually
+# owns the colour, and with `use_unified_color` at its default that is
+# `unified_paint_settings` -- so an exclusion written against the brush would
+# count the painting colour as a stray reference swatch.
+# `==`, NOT `is`, on the owner -- for the third time in this file. bpy hands
+# back a FRESH Python wrapper for a nested struct on every access, so
+# `paint_owner`'s `UnifiedPaintSettings` is a different object each time it is
+# read and an identity test misses the correct row. (`_ip.brush` beside it is
+# compared with `is` because it is None here, which is a different question.)
+_colour_owner = pnt.paint_owner(_ip, "use_unified_color")
+_slot_props = [r for r in _ps.drawn if r[0] == "prop" and r[2] == "color"
+               and r[1] is not getattr(_ip, "brush", None)
+               and not (r[1] == _colour_owner)]
+check("the_reference_grid_stands_down_when_the_palette_is_live",
+      not _slot_props,
+      f"{len(_slot_props)} read-only swatch(es) drawn as well as the palette")
+
+# The safety arm, and the reason the branch is on OUR shelf rather than on
+# `ip.palette` merely existing: the artist can point the palette anywhere from
+# the `Tool` tab, and a palette we did not build is not the legal set.
+_theirs = (bpy.data.palettes.get("_check_not_ours")
+           or bpy.data.palettes.new("_check_not_ours"))
+_ip.palette = _theirs
+_ps2, _ps2_err = _draw_paint_panel()
+check("the_paint_panel_drew_with_a_foreign_palette", _ps2_err is None,
+      str(_ps2_err))
+_pal2 = [r for r in _ps2.drawn if r[0] == "palette"]
+_slot2 = [r for r in _ps2.drawn if r[0] == "prop" and r[2] == "color"
+          and r[1] is not getattr(_ip, "brush", None)
+          and not (r[1] == _colour_owner)]
+check("a_palette_we_did_not_build_is_never_shown_as_the_legal_set",
+      not _pal2 and len(_slot2) == 16,
+      f"template calls={_pal2}, reference swatches={len(_slot2)} -- pointing "
+      f"the palette elsewhere in the `Tool` tab must fall back to the "
+      f"read-only sixteen, not present someone else's colours as legal")
+_ip.palette = _shelf_now
+# The picker itself. This used to be graded on the AST -- "the branch cannot be
+# reached in this mode" -- and that stopped being true with the fix it is now
+# grading: the row draws whoever OWNS the colour, and at the default
+# `use_unified_color = True` that owner is `unified_paint_settings`, which
+# exists headless. Only the `use_unified_color = False` leg still needs a brush,
+# and the control above is what says so.
+#
+# SEEDED, 2/2 caught here; 14/14 across this leg, listed per block. Run each
+# seed with its own `BLENDER_USER_RESOURCES` -- see the note below the seed
+# block for why a shared one grades the wrong code.
+# SEEDED, 2/2 caught:
+#   `prop(_ip.brush, "color")` put back .. the_paint_panel_draws_the_colour_that_PAINTS
+#     (headless the brush is None, so the row vanishes entirely and the arm
+#      reads 0 -- which is the same defect the artist saw as a BLACK swatch)
+#   the unified toggle dropped ........... the_panel_says_WHICH_colour_is_the_live_one
+#
+# Measured headful, probe phases `brush` and `swatchclick`: one stroke armed
+# with `brush.color` red and `unified.color` blue lands BLUE at the default and
+# RED with the flag off, and a swatch click -- clicked for real through
+# `Window.event_simulate` -- writes the same owner and leaves the other one
+# untouched. So `brush.color` is neither what paints nor what the click arms,
+# and drawing it is why `painting with:` photographed BLACK.
+_paint_colour = [r for r in _ps.drawn if r[0] == "prop" and r[2] == "color"
+                 and r[1] == _colour_owner]
+check("the_paint_panel_draws_the_colour_that_PAINTS",
+      _colour_owner is not None and len(_paint_colour) == 1,
+      f"owner={_colour_owner!r}, rows={len(_paint_colour)} -- with "
+      f"use_unified_color={_ip.unified_paint_settings.use_unified_color} the "
+      f"colour that lands is on {type(_colour_owner).__name__}, and a row "
+      f"drawn against the brush shows a value that neither paints nor "
+      f"receives the swatch click")
+_unified_toggles = [r for r in _ps.drawn if r[0] == "prop"
+                    and r[2] in ("use_unified_size", "use_unified_strength")]
+check("the_panel_says_WHICH_colour_is_the_live_one",
+      len(_unified_toggles) >= 1,
+      f"{_unified_toggles} -- the unified flags decide whether the number "
+      f"above them is the one that paints, they default to ON, and that is "
+      f"exactly why `brush.size = 1` went nowhere; a row without its flag is "
+      f"a number the artist cannot trust")
+
+# --- the brush controls, and the SEED ---------------------------------------
+# "I like how you put the tool options at the bottom now so I can have both --
+# but can we also expose other things down there, especially brush size. And
+# also default the brush to pixel and size to 1."
+#
+# The second half is a SEED, not the force ADR-0004 asked for: *"I don't know,
+# I want to force it -- just when I open the workspace, that should be my brush
+# as a default."*  So it needs BOTH arms -- it lands on a fresh scene, and it
+# does NOT come back after the artist has moved the value.  The second is the
+# one that separates a default from a force, and it is the one a later session
+# would drop.
+#
+# SEEDED, 5/5 caught -- three by exactly one arm, two by their own arm AND a
+# second that legitimately depends on the same property:
+#   the mark never written ............... the_seed_does_not_come_back_after_the_artist_moves_it
+#   the mark written with nothing set .... a_seed_that_set_nothing_does_not_mark_itself_done
+#                                          (+ the real-scene control, which is
+#                                           the same claim about a real Scene)
+#   size written to the brush always ..... the_seed_writes_the_size_to_whoever_OWNS_it
+#                                          (+ the_button_is_the_way_BACK, which
+#                                           reads the size off the same owner)
+#   the falloff left alone ............... the_seed_sets_the_falloff_the_gate_needs
+#   `force` ignored ...................... the_button_is_the_way_BACK_to_the_default
+#
+# The seeded audit itself needed one fix before it could say anything: the
+# harness's RUNTIME checks grade the INSTALLED addon, not the tree under `PKG`
+# (`addon_enable` imports `exmateria_map` from `bpy.utils.user_resource`, so the
+# later `sys.path.insert` hands back an already-cached module), and four seeds
+# run in parallel installed over each other -- three of them were graded against
+# a fourth's code and the audit read 4/13. Give each run its own
+# `BLENDER_USER_RESOURCES` or run them one at a time. Only the AST arms were
+# honest under the race, because those do read the tree.
+_size_rows = [r for r in _ps.drawn if r[0] == "prop" and r[2] == "size"]
+check("the_panel_exposes_the_brush_size_in_the_Map_tab",
+      len(_size_rows) == 1
+      and _size_rows[0][1] == pnt.paint_owner(_ip, "use_unified_size"),
+      f"{_size_rows} -- a sidebar shows ONE tab, so the size the artist asked "
+      f"for has to be drawn here, on whoever owns it")
+check("the_panel_offers_the_way_back_to_the_pixel_default",
+      any(r[0] == "operator" and r[1] == pnt.MAP_OT_seed_brush.bl_idname
+          for r in _ps.drawn),
+      f"{[r for r in _ps.drawn if r[0] == 'operator']}")
+
+
+class _FakeUPS:
+    def __init__(self, size=100, colour=True, unified_size=True):
+        self.size = size
+        self.color = (0.0, 0.0, 0.0)
+        self.strength = 1.0
+        self.use_unified_color = colour
+        self.use_unified_size = unified_size
+        self.use_unified_strength = False
+
+
+class _FakeBrush:
+    def __init__(self):
+        self.size = 70
+        self.color = (0.0, 0.0, 0.0)
+        self.strength = 1.0
+        self.curve_distance_falloff_preset = "CUSTOM"
+
+
+class _FakeIP:
+    def __init__(self, brush=True, **kw):
+        self.brush = _FakeBrush() if brush else None
+        self.unified_paint_settings = _FakeUPS(**kw)
+
+
+class _FakeScene(dict):
+    """A scene is a dict-like ID with `tool_settings` -- which is all
+    `seed_brush` touches, and the whole reason it takes a scene rather than a
+    context: the seam is testable in a mode that cannot hold a brush."""
+
+    def __init__(self, ip):
+        dict.__init__(self)
+        self.tool_settings = type("_TS", (), {"image_paint": ip})()
+
+
+_sc = _FakeScene(_FakeIP())
+check("the_seed_sets_the_falloff_the_gate_needs",
+      pnt.seed_brush(_sc) == "seeded"
+      and _sc.tool_settings.image_paint.brush.curve_distance_falloff_preset
+      == "CONSTANT",
+      f"falloff="
+      f"{_sc.tool_settings.image_paint.brush.curve_distance_falloff_preset!r} "
+      f"-- measured 18.0% of a stroke off-palette at the `CUSTOM` default and "
+      f"0.0% at `CONSTANT` (probe phase `brush`), and the export gate is an "
+      f"exact byte match, so a feathered edge is a refusal and not a soft one")
+check("the_seed_writes_the_size_to_whoever_OWNS_it",
+      _sc.tool_settings.image_paint.unified_paint_settings.size == 1
+      and _sc.tool_settings.image_paint.brush.size == 70,
+      f"unified={_sc.tool_settings.image_paint.unified_paint_settings.size}, "
+      f"brush={_sc.tool_settings.image_paint.brush.size} -- "
+      f"`use_unified_size` defaults to True and REPLACES the brush's value, "
+      f"so a size written to the brush is a size the artist never paints with")
+_sc_off = _FakeScene(_FakeIP(unified_size=False))
+pnt.seed_brush(_sc_off)
+check("the_seed_follows_the_flag_when_the_artist_turns_it_off",
+      _sc_off.tool_settings.image_paint.brush.size == 1
+      and _sc_off.tool_settings.image_paint.unified_paint_settings.size == 100,
+      f"brush={_sc_off.tool_settings.image_paint.brush.size}, "
+      f"unified={_sc_off.tool_settings.image_paint.unified_paint_settings.size}")
+# THE ARM THAT MAKES IT A DEFAULT. The artist sets the size to 4; it stays 4,
+# this session and across a save, because `tool_settings` lives in the `.blend`
+# and nothing re-asserts it.
+_sc.tool_settings.image_paint.unified_paint_settings.size = 4
+_sc.tool_settings.image_paint.brush.curve_distance_falloff_preset = "SMOOTH"
+_again = pnt.seed_brush(_sc)
+check("the_seed_does_not_come_back_after_the_artist_moves_it",
+      _again == "already"
+      and _sc.tool_settings.image_paint.unified_paint_settings.size == 4
+      and _sc.tool_settings.image_paint.brush.curve_distance_falloff_preset
+      == "SMOOTH",
+      f"returned {_again!r}, size="
+      f"{_sc.tool_settings.image_paint.unified_paint_settings.size}, falloff="
+      f"{_sc.tool_settings.image_paint.brush.curve_distance_falloff_preset!r} "
+      f"-- ADR-0004 says FORCE and the artist ruled that out; a seed that "
+      f"re-asserts is the force under another name")
+check("the_button_is_the_way_BACK_to_the_default",
+      pnt.seed_brush(_sc, force=True) == "seeded"
+      and _sc.tool_settings.image_paint.unified_paint_settings.size == 1,
+      f"size={_sc.tool_settings.image_paint.unified_paint_settings.size} -- "
+      f"`force` is what `MAP_OT_seed_brush` presses, and it is the only thing "
+      f"that may write over the artist")
+_sc_none = _FakeScene(_FakeIP(brush=False))
+_none_got = pnt.seed_brush(_sc_none)
+check("a_seed_that_set_nothing_does_not_mark_itself_done",
+      _none_got == "no brush" and not _sc_none.get(pnt.BRUSH_SEED_MARK)
+      and _sc_none.tool_settings.image_paint.unified_paint_settings.size == 100,
+      f"returned {_none_got!r}, mark={_sc_none.get(pnt.BRUSH_SEED_MARK)!r} -- "
+      f"`ImagePaint.brush` is resolved from the asset system on entering a "
+      f"paint mode and is None before it, so a seed that marked itself done "
+      f"having set nothing is a default that never happened")
+# ...which is exactly what the REAL scene does in this mode. The control, again:
+# every positive arm above runs on a fake, and this is what says the fake is
+# standing in for something `-b` genuinely cannot reach.
+_real_scene = bpy.context.scene
+_real_got = pnt.seed_brush(_real_scene)
+check("the_real_scene_cannot_be_seeded_headless_which_is_why_the_fakes_exist",
+      _real_got == "no brush" and not _real_scene.get(pnt.BRUSH_SEED_MARK),
+      f"returned {_real_got!r} -- a brush can be had headless now, so replace "
+      f"the fakes above with the real thing")
+# The brush box on BOTH authoring paths. Decision 17 returns early on a
+# converted map -- rightly, because the palette block above is a statement about
+# the indexed path -- and the brush is not part of that statement: size and
+# falloff are the same question whichever path the artist is on. Read off the
+# tree, because reaching the Painting branch needs a converted map.
+try:
+    _boxes = [n for n in _ast.walk(_tree_func("paint.py", "draw", "_PaintPanel"))
+              if isinstance(n, _ast.Call)
+              and getattr(n.func, "id", None) == "_brush_box"]
+    check("the_brush_box_is_drawn_on_BOTH_authoring_paths",
+          len(_boxes) >= 2,
+          f"{len(_boxes)} call(s) to `_brush_box` in the panel -- the "
+          f"converted-map branch returns early, so a single call at the bottom "
+          f"gives the artist brush size on one path and not the other")
+except Exception as e:
+    check("the_brush_box_is_drawn_on_BOTH_authoring_paths", False, repr(e))
+# Both moments the artist named reach it. `build` cannot run here (it needs a
+# window to duplicate a workspace into) and `execute` needs a map, so the CALL
+# is read off the tree -- a grep would match the docstrings explaining it.
+for _rel, _fn, _cls in (("workspace.py", "build", None),
+                        ("paint.py", "execute", "MAP_OT_paint_sheet")):
+    try:
+        _seeds = [n for n in _ast.walk(_tree_func(_rel, _fn, _cls))
+                  if isinstance(n, _ast.Call)
+                  and getattr(n.func, "attr", None) == "seed_brush"
+                  or isinstance(n, _ast.Call)
+                  and getattr(n.func, "id", None) == "seed_brush"]
+        check(f"the_seed_is_reached_from_{_cls or _rel.split('.')[0]}_{_fn}",
+              bool(_seeds),
+              f"nothing in {_rel}:{_fn} calls `seed_brush` -- the workspace "
+              f"being built is the moment the artist named, and `Paint sheet` "
+              f"is the one that still has a brush when it was not")
+    except Exception as e:
+        check(f"the_seed_is_reached_from_{_cls or _rel.split('.')[0]}_{_fn}",
+              False, repr(e))
+# The rule itself, both ways round, on a fake that can hold a brush.
+# `isinstance`, and no attribute read on the result: an arm that RAISES takes
+# the whole run down and reports nothing, which is the same failure shape as a
+# panel `draw` that raises. Seeded with the rule inverted, the first version of
+# this arm reached `.use_unified_color` on a `_FakeBrush` and killed the file.
+_own_on = pnt.paint_owner(_FakeIP(), "use_unified_color")
+_own_off = pnt.paint_owner(_FakeIP(colour=False), "use_unified_color")
+check("paint_owner_hands_back_the_unified_settings_while_the_flag_is_on",
+      isinstance(_own_on, _FakeUPS) and isinstance(_own_off, _FakeBrush),
+      f"flag on -> {type(_own_on).__name__}, flag off -> "
+      f"{type(_own_off).__name__} -- the flag decides the owner, and this is "
+      f"Blender's own rule from `bl_ui/properties_paint_common.py`")
+# The attribute genuinely ABSENT, not merely None: `getattr(<None>, flag,
+# False)` already copes with None, so a `None` stub grades nothing.
+# CAUGHT, because the claim IS "must not raise": seeded with a bare attribute
+# read, the uncaught version took the whole run down and reported no checks at
+# all -- a fatal that reads as an infrastructure problem rather than as this
+# arm going red.
+try:
+    _own_bare = pnt.paint_owner(type("_NoUPS", (), {"brush": _FakeBrush()})(),
+                                "use_unified_size")
+except Exception as _e:                                            # noqa: BLE001
+    _own_bare = f"{type(_e).__name__}: {_e}"
+check("paint_owner_falls_back_to_the_brush_with_no_unified_settings_at_all",
+      isinstance(_own_bare, _FakeBrush),
+      f"{type(_own_bare).__name__} -- a missing `unified_paint_settings` must "
+      f"not raise inside a panel `draw`: a draw that raises renders everything "
+      f"emitted before it and nothing after")
 
 json.dump({"checks": checks, "counts": {"faces": len(polys), "verts": n_distinct}},
           open(OUT, "w"), indent=1)

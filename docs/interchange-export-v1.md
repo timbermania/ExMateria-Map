@@ -143,7 +143,10 @@ Export reads five kinds of scene state, all created or flagged by the addon:
   image data block, 256 × 1024, pixels 0–15; the mesh-preview source), and the
   paint image (256 × 1024 RGB under the active palette; the artist's paint
   target; §4). Per state with valid palettes: the 16 × 16 CLUT image (import
-  §4), preview-only.
+  §4) — the palette **edit surface**, and the source `map_states[].palettes` is
+  re-emitted from (§2, schema §6.4). A state the document gives no palettes has
+  a CLUT image fabricated from the sidecar's display-only PLTE; those pixels are
+  not that state's data and are never written back.
 
 The grid and tile objects carry addon-internal object-property flags stamped at
 import / by the drift checker / by the growth commit. Export reads only flagged
@@ -156,11 +159,11 @@ What export fills, per document field (schema §11's table, as amended by §2.1)
 
 | doc field | export source |
 |---|---|
-| `format`, `version` | the constants — `"exmateria-map/interchange"`, `1` |
+| `format`, `version` | `"exmateria-map/interchange"`; `version` is `2` when any state carries an `authored_light_rig` and `1` otherwise — the oldest `build` that can read the document, tested on the FIELD rather than on whether this export declared anything |
 | `base` | marker JSON verbatim, **except** `terrain_grid` ← the grid object's `size_x`/`size_z` props; `null` when no grid object (import §7's inverse read; no grid object ⇔ dump wrote `null`, schema §4) |
 | `polygons` | the scene graph: `kind` ← the face `textured` flag + corner count; `positions` ← loop positions → inverse map → i16; `normals` ← corner attribute → inverse map → i16; `uv` ← `UVMap` decode; the palette/texture and `terrain`-binding face attributes (§8.1). Emitted in bucket order tt→tq→ut→uq (schema §3); a new face keeps its mesh-loop position within its bucket |
 | `terrain` | level-0 records from the flagged tile objects (declared fields only; an object with no declared field produces no record, §6.3, §7.4) + level-1 records from the marker's `terrain_records` JSON. **`null` when nothing is declared — never `[]`** — else the array |
-| `map_states` | marker JSON verbatim, except each buffer's `texture_sheet` ← its buffer's sidecar name (§4.5) |
+| `map_states` | marker JSON, except each buffer's `texture_sheet` ← its buffer's sidecar name (§4.5); `palettes` ← the state's 16 × 16 CLUT image, row by row, at the row's own declared length, with `stp` carried (a `null` stays `null`); `authored_light_rig` ← the state's Override **only when the artist moved something on it** (decision 25 Amendment 1) |
 | `carry` | marker JSON verbatim (§2.1) |
 
 ### 2.1 Carry is written back verbatim from the marker
@@ -176,7 +179,10 @@ and in #521's resolution only — the schema document is not amended.
 
 `export(import(doc)) == doc` for an untouched document holds field by field:
 `carry`, `base`, and `map_states` round-trip from the marker JSON (an
-unchanged sheet buffer reproduces its sidecar's hash and hence its name);
+unchanged sheet buffer reproduces its sidecar's hash and hence its name; an
+untouched CLUT image reproduces its colours byte-exactly, because schema §6.4's
+8-bit expansion and the image read-back land on the same lattice; an untouched
+rig declares nothing, so no `authored_light_rig` key appears);
 `polygons` round-trip through the attributes import wrote — the `_shadow`
 twins are the divergence watch (§5.3), not a second source; `terrain` is
 `null` on both sides because an untouched document declares nothing (decision

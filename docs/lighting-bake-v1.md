@@ -255,7 +255,7 @@ Two limits on that:
 
 - It **writes rigs on states the artist never opened**. Decision 27 permits that
   explicitly, and requires every state the bake touched to be named in its report.
-- It **cannot mint a rig where none exists**, and the population is far smaller
+- It **cannot create a rig where the resource holds none**, and the population is far smaller
   than this page first said. The original text joined **two different
   populations** with an "and" — *"38.5% of states carry no rig of their own
   (decision 25) **and** a resource whose `0x64` pointer is `0` has no 45-byte chunk
@@ -268,7 +268,7 @@ Two limits on that:
   |---|---|---|
   | **mesh rows carrying a `0x64` chunk — the write population** | **717** | 52.3% |
   | texture rows, which cannot hold a rig **by kind** | 640 | 46.7% |
-  | **mesh rows with `0x64 == 0` — the real cannot-mint set** | **13** | 1.8% of mesh rows |
+  | **mesh rows with `0x64 == 0` — the real cannot-write set** | **13** | 1.8% of mesh rows |
 
   So 13 rows, not 691 states: `MAP001.11`, `MAP006.31`, `MAP012.10`, `MAP014.9`,
   `MAP041.5`, `MAP041.11`, `MAP053.10`, `MAP053.19`, `MAP053.22`, `MAP061.9`,
@@ -408,11 +408,12 @@ dark cap, its 34.38% already saturating, and §4's genuinely infeasible. Measure
 at ~19 ms on the corpus's largest mesh (MAP096 a0, 3,307 corners), so pressing it
 repeatedly *is* the loop.
 
-**Lamps arrive only when asked**, through a *Seed Lamps from Rig* button — the
-shape decision 25 already established for the Override's mint button. Seeding on
-every import would put three lamps into every scene the render-graded checks
-build, which is the by-construction guarantee decision 25 said "stops holding
-without anyone noticing".
+**Lamps arrive only when asked**, through a *Seed Lamps from Rig* button.
+Seeding on every import would put three lamps into every scene the render-graded
+checks build, which is the by-construction guarantee decision 25 said "stops
+holding without anyone noticing". Note this is **not** the shape the rig itself
+now takes: the rig is exposed on every state without asking, because exposing a
+number changes no picture, while seeding a lamp adds an object that does.
 
 **All three lamps, even the dead one.** §2 measured a dead third slot on 77.02% of
 rig-bearing resources. It seeds at strength 0 keeping the ROM's direction, and
