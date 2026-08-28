@@ -20,9 +20,13 @@ Blender shows —
 - an **Install…** button, on a Blender whose Extensions system isn't running.
 
 — pick the zip, and tick the checkbox beside **ExMateria Map** to enable it.
-Dragging the zip onto the Blender window does the same thing on 4.2 and up.
 The two panels differ only in the button: this is a legacy `bl_info` add-on,
 and both routes land it in `scripts/addons/exmateria_map` and register it.
+Which one you get is decided by whether Blender's own Extensions add-on
+registered, not by anything shipped here. (Dropping the zip onto the Blender
+window goes through that same Extensions machinery on 4.2 and up; the
+Preferences route above works either way, which is why it is the one written
+down.)
 
 It has no dependencies to install — the package is stdlib-only and the addon
 vendors it, which is the whole reason for that rule (a Blender addon cannot
