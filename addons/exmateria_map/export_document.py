@@ -663,7 +663,7 @@ def export_source_art(ob, states, base):
     """
     from .convert_op import source_art_name
     stem = f"{base['map']}.a{base['arrangement']}"
-    files, out, by_hash = {}, {}, {}
+    files, out, by_hash, digests = {}, {}, {}, {}
     for i, st in enumerate(states):
         sheet = st.get("texture_sheet")
         if not sheet:
@@ -672,14 +672,16 @@ def export_source_art(ob, states, base):
         if img is None or tuple(img.size) != (SHEET_W, SHEET_H):
             continue
         rgb = image_rgb(img)
-        digest = hashlib.sha256(rgb).hexdigest()[:8]
+        full = hashlib.sha256(rgb).hexdigest()
+        digests[sheet] = full
+        digest = full[:8]
         name = by_hash.get(digest)
         if name is None:
             name = by_hash[digest] = f"{stem}.source-{digest}.png"
             files[name] = png_indexed.write_rgb_png(rgb, SHEET_W, SHEET_H)
             out[name] = {"states": []}
         out[name]["states"].append(i)
-    return files, out
+    return files, out, digests
 
 
 def off_palette_list(ob):
@@ -879,8 +881,16 @@ def _assemble(ob):
     # BEFORE the rename: `source_art` keys its entries by STATE INDEX, and the
     # paintings are named from the sheet the marker knows, not from the hashed
     # name this export is about to give it.
-    art_files, source_art = export_source_art(ob, states, base)
+    art_files, source_art, art_digests = export_source_art(ob, states, base)
     files.update(art_files)
+    # ADR-0186 Amendment 5: the Sheet is a cache and a stale one still ships
+    # (decision 13), so this WARNS and never refuses.  It is free here -- the
+    # digest is the one `export_source_art` already computed to name the
+    # sidecar -- which is why the check lives on this path rather than in the
+    # push, and why both the export report and the push report carry it.
+    from .compile_op import compare_stamp
+    for note in compare_stamp(ob, art_digests):
+        rep.warn(note)
     states = [dict(st) for st in states]
     for st in states:
         if st.get("texture_sheet") in rename:

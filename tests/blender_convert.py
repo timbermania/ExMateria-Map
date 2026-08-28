@@ -7,7 +7,9 @@ operator, and `bpy`-gated code ships green under `pytest` -- the addon's
 
   * the mesh -> polygons read and the UV write-back are inverses, so a face
     reads the same texels through its rewritten UVs as it did before;
-  * every chart owns its texels afterwards (no texel with two chart readers);
+  * every POLYGON owns its texels afterwards (no texel with two polygon
+    readers -- ADR-0186 Amendment 6 decision 22, the strictly stronger form
+    of the chart oracle this used to check);
   * `texture_page` follows the island the face landed in;
   * the operator is registered and reachable, and the Paint panel draws it.
 
@@ -56,7 +58,7 @@ def stage_real_map(number=22, arrangement=0):
 
 
 SCRIPT = r'''
-import json, sys, bpy
+import array, json, sys, bpy
 sys.path.insert(0, r"@ADDONPKG@")
 import exmateria_map
 exmateria_map.register()
@@ -81,7 +83,6 @@ ck("the fixture imported", ob is not None)
 from exmateria_map.convert_op import _face_ordered
 from exmateria_map.export_document import image_indices
 from exmateria_map.paint import active_palette, index_image, sheet_of_state
-from exmateria_map import charts as C
 
 state, _ = active_palette(ob)
 img = index_image(ob, sheet_of_state(ob, state))
@@ -134,14 +135,23 @@ def index_blocks(polys, indices):
                     for y in range(min(vs), max(vs)+1)])
     return out
 
-def chart_sharing(polys, chart_of):
+def polygon_sharing(polys):
+    """Texels with more than one POLYGON reader (ADR-0186 Amdt 6 dec. 22).
+
+    Strictly stronger than the chart form this replaced: a chart that FOLDS
+    reads one rectangle from several of its own faces, and a chart-keyed
+    count cannot see that.  Polygon identity needs no carrying either --
+    conversion rewrites `texture_page` and `charts()` cuts at a page change,
+    so re-deriving charts after a conversion reports a finer partition and a
+    sharing residue that is not there.  An index is an index.
+    """
     own = {}
     for n, q in enumerate(polys):
         if "uv" not in q: continue
         us = [c[0] for c in q["uv"]]; vs = [c[1] for c in q["uv"]]
         for x in range(min(us), max(us)+1):
             for y in range(min(vs), max(vs)+1):
-                own.setdefault((q["texture_page"], x, y), set()).add(chart_of[n])
+                own.setdefault((q["texture_page"], x, y), set()).add(n)
     return sum(1 for s in own.values() if len(s) > 1)
 
 from exmateria_map.convert_op import clut_rows_of, source_art_name
@@ -151,10 +161,7 @@ ck("the state's CLUT resolved", rows is not None and len(rows) == 16)
 before_polys = _face_ordered(me)
 before_idx = image_indices(img)
 before = colour_blocks(before_polys, before_idx, rows)
-chart_of = {}
-for c, mem in enumerate(C.charts(before_polys)):
-    for m in mem: chart_of[m] = c
-shared_before = chart_sharing(before_polys, chart_of)
+shared_before = polygon_sharing(before_polys)
 pages_before = [q.get("texture_page") for q in before_polys]
 
 # ADR-0186 Amendment 3 decision 17: `Paint sheet` is polymorphic and the
@@ -202,6 +209,16 @@ def emits(log, needle):
 # The direct-paint path first, as the CONTROL: every arm below is a claim that
 # something STOPS being drawn, and an arm that was never drawn proves nothing.
 bpy.ops.exmateria_map.paint_sheet()
+# The CONTROL for the paint-mode arm after the conversion. `Paint sheet` puts
+# the brush in `IMAGE` mode on an explicit canvas, and that setting is
+# scene-wide and saved in the `.blend`. Captured HERE so that "MATERIAL after
+# convert" is a claim about a CHANGE and not about a default that was never
+# anything else.
+mode_before_convert = bpy.context.tool_settings.image_paint.mode
+canvas_before_convert = getattr(
+    bpy.context.tool_settings.image_paint.canvas, "name", None)
+ck("control: Paint sheet leaves the brush in IMAGE mode before conversion",
+   mode_before_convert == "IMAGE", mode_before_convert)
 before_draw = drawn()
 ck("control: the gate IS drawn before conversion (Apply paint)",
    emits(before_draw, "apply_paint"))
@@ -256,8 +273,67 @@ ck("the operator finished", r == {"FINISHED"}, r)
 ck("and it put the artist back in Edit Mode", ob.mode == "EDIT", ob.mode)
 bpy.ops.object.mode_set(mode="OBJECT")
 
+# ---------------------------------------------------------------------------
+# ADR-0185 Amendment 5 -- painting on the MODEL, and where a stroke lands.
+#
+# Texture Paint in `MATERIAL` mode writes into the material's ACTIVE image
+# texture node; `nodes.active` and `Material.paint_active_slot` are two views
+# of one pointer. Our preview graph carries THREE image texture nodes, so
+# Blender's default slot 0 is the CLUT -- unlinked by the conversion's rewire
+# and therefore invisible, and still read back by `export_document` §6.4 to
+# re-emit `map_states[].palettes`. A stroke there is silent and it ships.
+#
+# These arms MUST run before the `Paint sheet` call further down: that button
+# re-arms `IMAGE` mode, which would make the paint-mode arm below vacuous.
+_pmat = None
+for _slot in ob.material_slots:
+    if _slot.material is not None and _slot.material.name.endswith("_preview"):
+        _pmat = _slot.material
+_pnt = getattr(_pmat, "node_tree", None)
+_texnodes = [n.name for n in _pnt.nodes if n.type == "TEX_IMAGE"] if _pnt else []
+# The control: with one image texture node there is nothing to choose and the
+# arms below would pass on any code at all.
+ck("control: the preview material carries MORE than one image texture node",
+   len(_texnodes) > 1, _texnodes)
+ck("control: and the source art is NOT the first of them (slot 0 is not it)",
+   bool(_texnodes) and _texnodes[0] != "exmateria_map.source_art",
+   _texnodes)
+ck("the conversion makes the source art the material's ACTIVE image node",
+   getattr(getattr(_pnt, "nodes", None), "active", None) is not None
+   and _pnt.nodes.active.name == "exmateria_map.source_art",
+   getattr(getattr(_pnt, "nodes", None), "active", None)
+   and _pnt.nodes.active.name)
+ck("...so paint_active_slot resolves to the source art too",
+   _pmat is not None
+   and 0 <= _pmat.paint_active_slot < len(_texnodes)
+   and _texnodes[_pmat.paint_active_slot] == "exmateria_map.source_art",
+   f"slot {getattr(_pmat, 'paint_active_slot', None)} of {_texnodes}")
+# `Paint sheet` before a conversion aims `IMAGE` mode at the index-derived
+# paint copy, and the conversion DELETES that copy. Left alone, the artist
+# strokes into a hole and nothing says why.
+ck("the conversion puts the brush back into MATERIAL mode",
+   bpy.context.tool_settings.image_paint.mode == "MATERIAL",
+   bpy.context.tool_settings.image_paint.mode)
+ck("...and the canvas it was aimed at really is gone (the reason it must)",
+   canvas_before_convert is not None
+   and bpy.data.images.get(canvas_before_convert) is None,
+   canvas_before_convert)
+
+# The viewport copy of the Paint panel no longer polls itself away, because
+# the model IS the paint surface (ADR-0185 Amendment 5). The hint it carries
+# is guarded separately, inside `draw`, and that guard is what makes deleting
+# the poll safe -- so grade the guard, not only the absence.
+ck("MAP_PT_paint_view defines no poll of its own",
+   "poll" not in vars(P.MAP_PT_paint_view),
+   sorted(k for k in vars(P.MAP_PT_paint_view) if not k.startswith("__")))
+ck("control: there IS a free Image Editor space for the guard to see",
+   any(not protected for _, protected in P.image_editor_spaces()),
+   len(P.image_editor_spaces()))
+ck("...so the viewport copy still withholds the no-editor hint",
+   not emits(drawn(says_where=True), "no Image Editor open"))
+
 after_polys = _face_ordered(me)
-shared_after = chart_sharing(after_polys, chart_of)
+shared_after = polygon_sharing(after_polys)
 
 art_img = bpy.data.images.get(source_art_name(sheet_of_state(ob, state)))
 ck("the source art image exists", art_img is not None)
@@ -300,7 +376,7 @@ ck("the index sheet is still a legal 4bpp plane",
    len(after_idx))
 ck("the UVs actually moved",
    [q.get("uv") for q in after_polys] != [q.get("uv") for q in before_polys])
-ck("no texel is read by two charts afterwards",
+ck("no texel is read by two POLYGONS afterwards",
    shared_after == 0, f"before {shared_before}, after {shared_after}")
 ck("there was sharing to remove (the control)", shared_before > 0, shared_before)
 ck("texture_page is written, and stays legal",
@@ -409,6 +485,80 @@ ck("...and the map still shows what was painted",
 ck("both compile buttons poll on a converted map",
    CO.MAP_OT_recalculate_palettes.poll(bpy.context)
    and CO.MAP_OT_reselect_clusters.poll(bpy.context))
+
+# ---------------------------------------------------------------------------
+# ADR-0186 Amendment 5 -- staleness is SHOWN, never gated on.
+#
+# Decision 13 keeps a stale Sheet a complete, legal map, so nothing here may
+# refuse. What it may do is stop being silent: an artist who paints, pushes and
+# sees nothing move cannot otherwise tell "my stroke was lost" from "the cache
+# has not been rebuilt", and only one of those is a problem. Reported from use.
+# ---------------------------------------------------------------------------
+painting_now = bpy.data.images.get(source_art_name(sheet_of_state(ob, state)))
+sheet_key = sheet_of_state(ob, state)
+
+ck("straight after a compile the panel says the sheet is fresh",
+   CO.freshness(ob, sheet_key, painting_now)[0] == "fresh",
+   CO.freshness(ob, sheet_key, painting_now))
+ck("...and the compile cleared the painting's dirty bit",
+   not painting_now.is_dirty)
+ck("...and an assemble raises no staleness warning",
+   not any("stale" in w or "never been compiled" in w
+           for w in assemble(ob)[2].warnings),
+   assemble(ob)[2].warnings)
+
+# Paint. `foreach_set` is the same datablock mutation a brush makes, and it is
+# the only one available with no paint context (`ImagePaint.brush` is
+# read-only and `bpy.data.brushes` is empty under --factory-startup).
+_px = array.array("f", [0.0]) * (256 * 1024 * 4)
+painting_now.pixels.foreach_get(_px)
+for _i in range(0, 4000, 4):
+    _px[_i], _px[_i + 1], _px[_i + 2] = 0.0, 1.0, 0.0      # green lines
+painting_now.pixels.foreach_set(_px)
+painting_now.update()
+
+ck("painting on it makes the panel say STALE",
+   CO.freshness(ob, sheet_key, painting_now)[0] == "stale",
+   CO.freshness(ob, sheet_key, painting_now))
+_warn = assemble(ob)[2].warnings
+ck("...and a push/export report NAMES it rather than refusing",
+   any("compiled from an EARLIER painting" in w for w in _warn), _warn)
+ck("...and it is a WARNING, never a refusal (decision 13)",
+   not any("painting" in r for r in assemble(ob)[2].refusals))
+
+r = bpy.ops.exmateria_map.recalculate_palettes()
+ck("recompiling clears it", r == {"FINISHED"}
+   and CO.freshness(ob, sheet_key, painting_now)[0] == "fresh",
+   f"{r} {CO.freshness(ob, sheet_key, painting_now)}")
+ck("...and the warning is gone",
+   not any("EARLIER painting" in w for w in assemble(ob)[2].warnings))
+
+# THE HOLE, and the reason `is_dirty` alone is not the answer. A `.blend` save
+# packs the image, so a map that was painted, saved and reopened WITHOUT being
+# compiled comes back with `is_dirty` False and a stamp that no longer
+# describes it. Reproduced by putting the session into exactly that state:
+# paint, clear the dirty bit the way a save would, and forget what this
+# process verified. Saying `fresh` here is the one wrong answer, because it is
+# wrong in the direction that ships.
+# DIFFERENT pixels, or this arm tests nothing: re-writing what the painting
+# already holds leaves it genuinely fresh, and the check would be right to say
+# so. (It did, on the first draft of this arm.)
+for _i in range(8000, 12000, 4):
+    _px[_i], _px[_i + 1], _px[_i + 2] = 1.0, 0.0, 0.0      # red, elsewhere
+painting_now.pixels.foreach_set(_px)
+painting_now.update()
+painting_now.pack()                       # what a save does to a packed image
+CO._VERIFIED.clear()                      # what a fresh process starts with
+
+_said = CO.freshness(ob, sheet_key, painting_now)    # BEFORE assemble, which
+_warn2 = assemble(ob)[2].warnings                    # verifies as a side effect
+ck("a painted-then-saved-then-reopened map is NOT reported fresh",
+   _said[0] != "fresh", _said)
+ck("...it is reported UNKNOWN -- the cheap bit cannot know",
+   _said[0] == "unknown", _said)
+ck("...and the exact check on the way out still catches it",
+   any("EARLIER painting" in w for w in _warn2), _warn2)
+bpy.ops.exmateria_map.recalculate_palettes()
 
 # ---------------------------------------------------------------------------
 # ADR-0186 decisions 4, 5 and 6 -- the Painting survives OUTSIDE the `.blend`.
@@ -521,10 +671,17 @@ def main():
                       .replace("@JSON@", str(staged))
                       .replace("@TMP@", str(TMP))
                       .replace("@OUT@", str(REPORT)))
+    # Isolate this Blender from the artist's OWN install. Without it the
+    # `addon_install` in the script above overwrites the addon they are
+    # clicking, and `addon_enable` then grades that copy rather than this
+    # tree. `--factory-startup` does NOT do this -- see `blender_env`.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from blender_env import isolated_env
     proc = subprocess.run(
         [sys.argv[1] if len(sys.argv) > 1 else "blender",
          "--background", "--factory-startup", "--python", str(script)],
-        capture_output=True, text=True)
+        capture_output=True, text=True,
+                          env=isolated_env())
     if not REPORT.exists():
         sys.stdout.write(proc.stdout[-3000:])
         sys.stdout.write("\n[stderr]\n" + proc.stderr[-3000:])

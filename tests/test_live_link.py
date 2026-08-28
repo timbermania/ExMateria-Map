@@ -22,6 +22,7 @@ sys.path.insert(0, str(ADDON))
 
 import live_link  # noqa: E402
 import live_link as L  # noqa: E402
+import json  # noqa: E402
 import struct  # noqa: E402
 
 FIXTURE = (Path(__file__).resolve().parent / "fixtures"
@@ -1255,6 +1256,96 @@ def test_the_refusal_reports_EVERY_plan_not_the_first_one_to_fail():
     assert "4,000" in said and "7,589" in said and "1,444" in said
 
 
+# --- the SWAP mode's proof: bounds, not content ------------------------------
+# `selfcheck` demands RAM ALREADY HOLDS the document's own bytes. That is the
+# identity claim decision 7 recovered as a side effect, and it is exactly what
+# replacing the loaded map violates on purpose. Deleting it is not on the
+# table -- it is what catches an off-by-one in a stride, a vertex offset or a
+# field mask before thousands of bytes go to a guessed address. What is on the
+# table is a WEAKER proof that a swap can still pass: every planned address
+# lands inside the array it names.
+
+
+def test_the_array_extents_land_exactly_where_the_disassembly_says():
+    """The oracle for the bound, and it is not a restatement of it.
+
+    `SINKS`' six bases were measured one at a time against a live battle;
+    `ENGINE_CAPACITY`'s four numbers are the `slti` immediates at
+    `0x800F2A68`, `0x800F2BE4`, `0x800F2C2C` and `0x800F2C50`; the strides are
+    the vertex counts. Three separately-sourced sets of constants, and each
+    array's END has to land on the next thing that was measured -- the
+    textured-quad normal array on `FUN_8012cc54`'s first byte, which is why
+    that address is in the module at all. A wrong capacity or a wrong stride
+    breaks the chain here rather than 22,720 bytes into somebody's map.
+    """
+    end = lambda b, f: live_link.array_extent(b, f)[1]
+    assert end("textured_triangle", "positions") == \
+        live_link.SINKS["textured_quad"].positions
+    assert end("untextured_triangle", "positions") == \
+        live_link.SINKS["untextured_quad"].positions
+    assert end("textured_triangle", "normals") == \
+        live_link.SINKS["textured_quad"].normals
+    assert end("textured_quad", "normals") == \
+        live_link.TEXTURED_TRIANGLE_RENDERER
+
+
+def test_metadata_is_bounded_by_the_POSITION_array_it_lives_in():
+    """Bytes 6-7 of a position vertex, not an array of its own."""
+    assert live_link.array_extent("textured_quad", "metadata") == \
+        live_link.array_extent("textured_quad", "positions")
+
+
+def test_a_plan_that_runs_off_the_end_of_its_array_is_refused():
+    """Ten quads planned from slot 705 of a 710-slot array.
+
+    `check_capacity` cannot see this. It grades the DESCRIPTOR's counts, and a
+    plan built at a wrong origin carries counts that fit perfectly -- which is
+    the whole class of bug the content self-check was standing in front of.
+    """
+    stride = live_link.POLYGON_STRIDE["textured_quad"]
+    origin = live_link.SINKS["textured_quad"].positions + 705 * stride
+    plans = {("textured_quad", "positions"):
+             live_link.plan_at(origin, "textured_quad", [[(0, 0, 0)] * 4] * 10)}
+    with pytest.raises(live_link.LiveLinkError,
+                       match="textured_quad positions"):
+        live_link.check_plan_bounds(plans)
+
+
+def test_a_legal_swap_plan_passes_and_the_line_COUNTS_what_it_proved():
+    """A bound that reported nothing would read exactly like a bound that
+    checked nothing, which is the failure mode `interpret` exists for one
+    field over. Ten quads of four vertices is 240 planned bytes -- the
+    document's shape, not the plan's own len().
+    """
+    d = live_link.Descriptor(index=0, starts=(0, 5, 0, 0),
+                             counts=(0, 361, 0, 0))
+    plans = {("textured_quad", "positions"):
+             live_link.plan(d, "textured_quad", "positions",
+                            [[(1, 2, 3)] * 4] * 10)}
+    said = " ".join(live_link.check_plan_bounds(plans))
+    assert "240" in said, said
+    assert "textured_quad positions" in said, said
+
+
+def test_the_bounds_proof_names_what_it_CANNOT_catch():
+    """A weaker check reported in the same words as the strong one is worse
+    than no check at all -- the artist reads "self-check passed" and believes
+    the thing that was not proved. So the line has to say, in the artist's
+    terms, which class of bug walks straight through it: the strides, vertex
+    offsets and field masks `selfcheck` was standing in front of, all of which
+    can be wrong and still land inside the array.
+    """
+    d = live_link.Descriptor(index=0, starts=(0, 0, 0, 0),
+                             counts=(0, 361, 0, 0))
+    plans = {("textured_quad", "positions"):
+             live_link.plan(d, "textured_quad", "positions",
+                            [[(1, 2, 3)] * 4] * 10)}
+    said = " ".join(live_link.check_plan_bounds(plans)).lower()
+    assert "stride" in said, said
+    assert "weaker" in said, said
+    assert "self-check passed" not in said, said
+
+
 # ---------------------------------------------------------------------------
 # The palette leg: `map_states[].palettes`, and its sink is main RAM.
 # ---------------------------------------------------------------------------
@@ -1552,3 +1643,271 @@ def test_apply_delegates_so_either_transport_drives_the_same_plan():
     writes = [(live_link.RAM_BASE + 16, b"xyz")]
     assert live_link.apply(client, writes) == 3
     assert http.ram[16:19] == b"xyz"
+
+
+# --- the stock path (#606 part 2) -------------------------------------------
+# Everything below exists because the addon must run on an UNMODIFIED
+# pcsx-redux. The one constraint that shapes it: on stock, a Lua handler
+# receives its payload only through the URL -- a POST body is not exposed to
+# Lua at all -- and the URL is capped, where overflowing it is a silent 404
+# rather than an error. So these are length tests as much as transport tests.
+
+
+class _FakeLua:
+    """Enough of `LuaClient` to record what went over the wire.
+
+    Records the *path*, not the pairs: the whole risk on this leg is a URL that
+    got too long, and a fake that only remembered the writes could not see it.
+    """
+
+    def __init__(self, replies=None, raises=None):
+        self.calls, self.replies, self.raises = [], replies, raises
+        self.host, self.port = "localhost", 8080
+
+    def call(self, handler, query="", timeout=30.0):
+        if self.raises is not None:
+            raise self.raises
+        self.calls.append(f"/api/v1/lua/{handler}" + (f"?{query}" if query else ""))
+        if self.replies is not None:
+            return self.replies.pop(0)
+        return str(len(query.split("&"))) + "\n"
+
+
+def test_the_rig_reaches_the_gte_through_the_url_not_a_posted_body():
+    """The headline of the stock port. `apply_gte` used to POST Lua source,
+    which is the one thing a stock pcsx-redux cannot receive: `req.body` does
+    not exist for a Lua handler, an urlencoded POST arrives with `req.form`
+    empty, and a multipart POST hands over the part headers with the values
+    concatenated. Measured, all four content types."""
+    lua = _FakeLua()
+    writes = [(13, 111), (14, 222), (15, 333), (16, 444),
+              (17, 555), (18, 666), (19, 777), (20, 0xFFFFFFFF)]
+    assert live_link.apply_gte(lua, writes) == 8
+    assert lua.calls == ["/api/v1/lua/gte?13=111&14=222&15=333&16=444"
+                         "&17=555&18=666&19=777&20=4294967295"]
+
+
+def test_the_whole_light_rig_is_one_request_and_half_the_url_budget():
+    """Eight registers is what `plan_rig_gte` emits, and it fits with room --
+    which is the reason this leg is possible at all. If a rig change ever made
+    this two requests the push still works; if it made one request too long it
+    would 404 in silence, which is what `URL_LIMIT` exists to prevent."""
+    lua = _FakeLua()
+    live_link.apply_gte(lua, live_link.plan_rig_gte(_rig()))
+    assert len(lua.calls) == 1
+    assert len(lua.calls[0]) < live_link.URL_LIMIT // 2
+
+
+def test_a_long_write_list_splits_by_MEASURED_length_not_a_pair_count():
+    """A pair is 3 to 13 bytes wide depending on the value, so any fixed
+    pairs-per-request either wastes the budget or -- the direction that
+    matters -- occasionally overruns it. Every chunk must fit, including the
+    path prefix the client will put in front of it."""
+    writes = [(i % 32, 0xFFFFFFFF) for i in range(60)]
+    queries = live_link.gte_queries(writes)
+    assert len(queries) > 1
+    for q in queries:
+        assert len(f"/api/v1/lua/gte?{q}") <= live_link.URL_LIMIT
+    rebuilt = "&".join(queries).split("&")
+    assert rebuilt == [f"{i}={v}" for i, v in writes]
+
+
+def test_a_url_past_the_ceiling_is_a_named_refusal_not_a_silent_404():
+    """`BUFFER_SIZE = 256` in `web-server.cc` and `onUrl` parses each read
+    chunk as a whole URI instead of accumulating, so an over-long request line
+    resolves to a path that does not exist. Bisected on a live emulator: 251
+    bytes runs the handler, 252 does not. Left to the server, a caller reads
+    that as "the handler is missing" and goes looking for the launch flag."""
+    client = live_link.LuaClient()
+    with pytest.raises(live_link.LiveLinkError) as e:
+        client.call("gte", "x" * live_link.URL_LIMIT)
+    assert "silent 404" in str(e.value)
+
+
+def test_a_dropped_register_is_an_error_and_not_a_half_applied_rig():
+    """The handler skips anything its `%d+` cannot parse, in silence. An
+    unchecked count is the difference between a rig that failed and a rig that
+    half-applied and looked plausible on screen."""
+    lua = _FakeLua(replies=["3\n"])
+    with pytest.raises(live_link.TransportError) as e:
+        live_link.apply_gte(lua, [(13, 1), (14, 2), (15, 3), (16, 4)])
+    assert "3 of 4" in str(e.value)
+
+
+def test_the_guards_that_make_the_query_string_safe_to_build_are_still_there():
+    """Older than the transport and the reason it is safe: an index outside
+    0-31 or a value outside 32 bits is refused before it reaches a URL. A
+    negative in particular would not match the handler's `%d+` and would be
+    dropped there without a word."""
+    for bad in [(32, 1), (-1, 1), (13, -1), (13, 0x100000000)]:
+        with pytest.raises(live_link.LiveLinkError):
+            live_link.apply_gte(_FakeLua(), [bad])
+    assert _FakeLua().calls == []
+
+
+def test_the_ping_gate_tells_a_missing_handler_from_a_missing_emulator():
+    """Three states, not two. `-dofile` is the step artists forget, and an
+    emulator running without it answers every upstream endpoint perfectly and
+    404s ours -- so folding that into "no emulator answering" misdiagnoses an
+    emulator that is plainly on their screen."""
+    ready = _FakeLua(replies=["pong\n"])
+    assert live_link.LuaClient.check(ready) == ""
+
+    missing = _FakeLua(raises=live_link.NoHandlerError("no `ping` handler"))
+    assert "handler" in live_link.LuaClient.check(missing)
+
+    absent = _FakeLua(raises=live_link.TransportError("refused"))
+    assert "no emulator answering" in live_link.LuaClient.check(absent)
+
+
+def test_the_launch_command_names_the_handler_file_that_ships_with_the_addon():
+    """The route for an artist who starts the emulator their own way, so the
+    addon has to be able to hand the whole line over. The path has to be the
+    installed one -- an artist who unzipped the addon somewhere has no way to
+    reconstruct it."""
+    line = live_link.launch_command(9000)
+    assert "-webserver-port 9000" in line
+    assert line.endswith("pcsx_handlers.lua")
+    assert Path(live_link.HANDLERS).is_file()
+
+
+def test_the_shipped_handler_file_calls_nothing_the_fork_alone_has():
+    """The whole point of shipping it. One fork-only binding in here and an
+    artist's unmodified emulator stops answering -- and it would fail on THEIR
+    machine, not on ours, where every fork binding resolves fine."""
+    source = Path(live_link.HANDLERS).read_text()
+    body = "\n".join(l for l in source.splitlines() if not l.startswith("--"))
+    for fork_only in ("getLuaConsole", "PCSX.SPU", "PCSX.GPU."):
+        assert fork_only not in body
+    assert "req.body" not in body and "req.form" not in body
+    for handler in ("H.ping", "H.gte"):
+        assert handler in body
+    assert "H.exec" not in body
+
+
+# --- getting the handlers loaded without a terminal --------------------------
+# Three routes, because the emulator loads nothing by itself. `launch_argv` is
+# Blender starting it; the shim is the artist's own double-click working. The
+# shim has two halves and one without the other accomplishes nothing, which is
+# the property most of these arms are about.
+
+
+def test_ONE_folder_answers_both_routes(tmp_path):
+    """The artist is asked for a folder, not a folder and a binary. It works
+    because the launch SETS the working directory to that same folder -- so
+    "where the emulator lives" and "where it runs" are made to be one thing
+    rather than being two questions with two answers to get wrong.
+
+    The `cwd=` that makes that true is the operator's, not this function's;
+    what is asserted here is that the argv it hands over came from the folder.
+    """
+    (tmp_path / "pcsx-redux").write_text("#!/bin/sh\n")
+    (tmp_path / "pcsx-redux").chmod(0o755)
+    argv = live_link.launch_argv(str(tmp_path), 9000)
+    assert argv[0] == str(tmp_path / "pcsx-redux")
+    assert argv[1:5] == ["-webserver", "-webserver-port", "9000", "-dofile"]
+    assert argv[5] == live_link.HANDLERS
+    # The shim goes in that same folder, and that is the whole point.
+    assert Path(live_link.install_shim(str(tmp_path))).parent == tmp_path
+
+
+def test_the_launch_argv_is_a_list_because_paths_can_hold_spaces(tmp_path):
+    """`Program Files` is not an edge case. A string through a shell would need
+    quoting rules; not having a shell needs none."""
+    d = tmp_path / "My Emulators"
+    d.mkdir()
+    (d / "pcsx-redux").write_text("#!/bin/sh\n")
+    (d / "pcsx-redux").chmod(0o755)
+    assert live_link.launch_argv(str(d))[0] == str(d / "pcsx-redux")
+
+
+def test_a_folder_with_no_emulator_in_it_is_named_not_guessed(tmp_path):
+    """The launch is the only half that needs the executable -- the shim just
+    needs somewhere to write. So this refusal names the folder and what was
+    looked for, rather than letting `Popen` answer with a `FileNotFoundError`
+    about a path the artist never typed."""
+    with pytest.raises(live_link.LiveLinkError) as e:
+        live_link.launch_argv(str(tmp_path))
+    assert str(tmp_path) in str(e.value) and "pcsx-redux" in str(e.value)
+    with pytest.raises(live_link.LiveLinkError):
+        live_link.launch_argv("")
+    # ...and the OTHER route still works in that same folder.
+    assert live_link.install_shim(str(tmp_path))
+
+
+def test_a_binary_that_is_not_executable_is_not_the_binary(tmp_path):
+    """A README named `pcsx-redux`, or a download that never finished. Handing
+    it to `Popen` produces a permission error naming a path, which reads as a
+    broken button rather than a wrong folder."""
+    (tmp_path / "pcsx-redux").write_text("not an emulator\n")
+    (tmp_path / "pcsx-redux").chmod(0o644)
+    assert live_link.find_binary(str(tmp_path)) == ""
+
+
+def test_the_shim_loads_the_addons_handlers_rather_than_copying_them(tmp_path):
+    """Two lines, not a copy: reinstalling the addon has to change what the
+    emulator runs, and it cannot if the artist is running a snapshot taken the
+    day they pressed the button."""
+    path = live_link.install_shim(str(tmp_path))
+    text = Path(path).read_text()
+    assert Path(path).name == live_link.SHIM_NAME
+    assert live_link.HANDLERS in text
+    assert "Support.extra.dofile" in text
+    assert "H.gte" not in text                 # loads them, does not carry them
+
+
+def test_the_shim_refuses_to_clobber_a_pcsx_lua_it_did_not_write(tmp_path):
+    """The one file in this flow holding something the addon cannot
+    regenerate. PCSX-Redux's Lua editor has `Auto save` ON by default, so
+    `pcsx.lua` is a document it writes back -- which means an existing one is
+    probably the artist's own script, and overwriting it destroys work."""
+    theirs = tmp_path / live_link.SHIM_NAME
+    theirs.write_text("-- my own debugging script\nprint('hello')\n")
+    with pytest.raises(live_link.LiveLinkError) as e:
+        live_link.install_shim(str(tmp_path))
+    assert "not ours" in str(e.value)
+    assert theirs.read_text().startswith("-- my own")
+    assert "Support.extra.dofile" in str(e.value)   # tells them what to add
+
+
+def test_a_shim_we_wrote_is_rewritten_rather_than_refused(tmp_path):
+    """Otherwise moving the addon strands the artist on a shim pointing at a
+    path that no longer exists, with a button that refuses to fix it."""
+    live_link.install_shim(str(tmp_path), handlers="/old/pcsx_handlers.lua")
+    path = live_link.install_shim(str(tmp_path), handlers="/new/pcsx_handlers.lua")
+    text = Path(path).read_text()
+    assert "/new/" in text and "/old/" not in text
+
+
+def test_install_shim_names_the_setting_rather_than_writing_a_stray_file():
+    """An empty directory is not a path to write to -- it is the artist not
+    having told us where their emulator runs."""
+    with pytest.raises(live_link.LiveLinkError) as e:
+        live_link.install_shim("")
+    assert "PCSX-Redux folder" in str(e.value)
+
+
+def test_enabling_the_lua_editor_changes_one_key_and_leaves_the_rest(tmp_path):
+    """The other half of the shim, and the half that is somebody else's config
+    file. Measured: with `ShowLuaEditor` off the emulator is up and answering
+    `cpu/ram` while `lua/ping` is a 404 -- so the shim alone does nothing, and
+    this must not be skipped as the invasive-looking step."""
+    settings = tmp_path / "pcsx.json"
+    settings.write_text(json.dumps({
+        "gui": {"ShowLuaEditor": False, "ShowLuaConsole": False},
+        "emulator": {"Debug": {"WebServer": True, "WebServerPort": 8080}}}))
+    assert live_link.enable_lua_editor(str(settings)) is True
+    data = json.loads(settings.read_text())
+    assert data["gui"]["ShowLuaEditor"] is True
+    assert data["gui"]["ShowLuaConsole"] is False          # untouched
+    assert data["emulator"]["Debug"]["WebServerPort"] == 8080
+    assert live_link.enable_lua_editor(str(settings)) is False   # idempotent
+
+
+def test_missing_emulator_settings_are_named_not_created(tmp_path):
+    """Writing a `pcsx.json` the emulator never wrote is how you hand it a
+    settings file with one key in it. Ask them to start it once instead."""
+    with pytest.raises(live_link.LiveLinkError) as e:
+        live_link.enable_lua_editor(str(tmp_path / "nope.json"))
+    assert "start it once" in str(e.value)
+    assert not (tmp_path / "nope.json").exists()

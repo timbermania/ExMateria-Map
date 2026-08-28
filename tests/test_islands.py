@@ -1,15 +1,21 @@
-"""What region of the sheet a chart owns (ADR-0186 dec. 2, Amendment 1).
+"""What region of the sheet a POLYGON owns (ADR-0186 Amendment 6 dec. 22).
 
-A chart's island cannot be its shipped UV bounding box: 76 of 147 resources
-exceed the sheet on area alone that way, because a scattered chart's hull is
-almost entirely air (`workspace/chartisland.py`).  It is instead the chart's
-UV-CONNECTED pieces -- and a piece is kept whole only while its hull costs no
-more than its members do apart.
+An island is a polygon.  Every textured polygon gets its own rectangle of the
+sheet, so after a conversion no texel is read by two polygons.
+
+That supersedes Amendment 1, which made an island a chart's UV-connected
+piece and kept a piece whole only while its hull cost no more than its
+members did apart.  Amendment 1 was reaching for the same property one level
+up -- a chart's shipped bounding box puts 76 of 147 resources over the sheet
+on area alone -- and it stopped at the chart because Amendment 2 believed a
+manifold chart needed a resampling unwrap.  A copy is not an unwrap:
+`workspace/island_split_cost.py` measures full one-to-one at +1.5pp of the
+sheet at the median and 0 refusals of 147.
 
 Every island stays a verbatim copy of texels the disc already ships, so a
-conversion is an integer blit and is exactly lossless.  A chart may own
-several islands; they move together, so decision 3's "a chart is never split
-between CLUT rows" is untouched.
+conversion is an integer blit and is exactly lossless.  A chart owns many
+islands; they carry `chart` and move together, so decision 3's "a chart is
+never split between CLUT rows" is untouched.
 """
 
 import sys
@@ -33,12 +39,12 @@ needs_corpus = pytest.mark.skipif(
     reason="corpus absent; set EXMATERIA_ASSETS_DIR to the extracted disc tree",
 )
 
-#: Measured by `workspace/chartisland.py` over the 147 textured resources.
-#: The whole corpus packs, with more headroom than the per-polygon bound the
-#: ADR kept as its conservative case (median 49.3% against 50.8%, max 83.4%
-#: against 89.2%) and on 48,361 islands rather than 62,838.
+#: Measured by `workspace/island_split_cost.py` arm C over the 147 textured
+#: resources.  One island per textured polygon: 62,838 of them, and the whole
+#: corpus still packs -- median 50.8% of the sheet, p90 65.3%, max 89.2%,
+#: which is +1.5pp at the median over Amendment 1's 48,361 chart pieces.
 CORPUS_RESOURCES = 147
-CORPUS_ISLANDS = 48_361
+CORPUS_ISLANDS = 62_838
 
 
 def quad(uv, positions, palette_id=0, texture_page=0):
@@ -56,20 +62,64 @@ CONTIGUOUS = [
 ]
 
 
-def test_a_chart_the_disc_laid_out_contiguously_is_one_island():
-    """The median chart on the disc: its members touch in UV space, so the
-    hull wastes nothing and the whole chart is one blit."""
+def test_a_chart_the_disc_laid_out_contiguously_is_one_island_PER_POLYGON():
+    """The median chart on the disc, and what decision 22 changed about it.
+
+    Its two members abut in UV space, so Amendment 1 kept them as one 17x9
+    blit: the hull wasted nothing.  Under decision 22 they are two islands
+    anyway.
+
+    What that costs is the shared column at u=8, which both quads read and
+    which is now copied twice -- the seam Amendment 2 is right to call
+    *correct*.  Preserving it buys 0.2pp of the sheet (arm B against arm C)
+    and costs the whole distinction: two rules instead of one, mesh adjacency
+    consulted during packing, and a class of texel the artist cannot reason
+    about locally.  At that price the simpler property wins.
+    """
     found = I.islands(CONTIGUOUS)
-    assert len(found) == 1
-    assert found[0]["members"] == [0, 1]
-    assert found[0]["source"] == (0, 0)
-    assert found[0]["size"] == (17, 9)
+    assert len(found) == 2
+    assert [i["members"] for i in found] == [[0], [1]]
+    assert [i["source"] for i in found] == [(0, 0), (8, 0)]
+    assert all(i["size"] == (9, 9) for i in found)
+    assert {i["chart"] for i in found} == {0}, "still ONE chart"
+
+
+def test_two_polygons_of_one_chart_reading_ONE_rectangle_get_TWO_islands():
+    """The fold, and the whole of decision 22.
+
+    Two welded faces reading the identical UV rectangle: on the disc they are
+    one surface painted twice, and 8.5% of the corpus's charts do it
+    (Amendment 2).  Under Amendment 1's rule they were a single UV-connected
+    piece whose hull wasted nothing, so they stayed ONE island -- and a stroke
+    on one face repainted the other, mirrored, somewhere else in the map.
+
+    Two copies of one rectangle is still an integer blit of the same source
+    texels, so the conversion stays lossless; the copies diverge only when
+    something paints one of them.  Amendment 2 called that irreconcilable
+    with "the first compile is a no-op".  It is not: an unwrap resamples, a
+    copy does not.
+    """
+    fold = [
+        quad([(0, 0), (8, 0), (0, 8), (8, 8)],
+             [(0, 0, 0), (1, 0, 0), (0, 0, 1), (1, 0, 1)]),
+        quad([(0, 0), (8, 0), (0, 8), (8, 8)],
+             [(1, 0, 0), (2, 0, 0), (1, 0, 1), (2, 0, 1)]),
+    ]
+    assert I.charts(fold) == [[0, 1]], "the fixture must be ONE chart"
+
+    found = I.islands(fold)
+    assert len(found) == 2, "the fold shares one rectangle between two faces"
+    assert [i["members"] for i in found] == [[0], [1]]
+    assert all(i["source"] == (0, 0) and i["size"] == (9, 9) for i in found)
+    assert {i["chart"] for i in found} == {0}, "still ONE chart"
 
 
 def test_pieces_of_a_chart_that_do_not_touch_in_uv_are_separate_islands():
     """Two welded quads at opposite corners of the page are one chart, but
     their hull is 249x249 for 162 texels of surface.  Copying that hull is
-    what puts 76 of 147 resources over the sheet, so the piece is split."""
+    what puts 76 of 147 resources over the sheet.  Under decision 22 the
+    question never arises -- a hull is never a candidate, because the unit of
+    placement is the polygon."""
     scattered = [
         quad([(0, 0), (8, 0), (0, 8), (8, 8)],
              [(0, 0, 0), (1, 0, 0), (0, 0, 1), (1, 0, 1)]),
@@ -84,10 +134,14 @@ def test_pieces_of_a_chart_that_do_not_touch_in_uv_are_separate_islands():
 
 
 @needs_corpus
-def test_every_textured_resource_packs_with_chart_islands():
-    """Amendment 1's resolution, corpus-wide.  This is the claim the ADR's
-    'charts can only do better' was reaching for, and the shipped bounding
-    box could not deliver: 38/147 that way, 147/147 this way."""
+def test_every_textured_resource_packs_with_polygon_islands():
+    """Decision 22's price, corpus-wide, and the reason it was affordable.
+
+    The bijection is the *most* islands any rule in this ADR has produced --
+    62,838 against Amendment 1's 48,361 -- and it still refuses on nothing.
+    The claim the ADR's 'charts can only do better' was reaching for, which
+    the shipped bounding box could not deliver: 38/147 that way, 147/147
+    this way, and the tightest map lands at 89.2% of the sheet."""
     fitted = refused = total_islands = 0
     for num in range(1, 130):
         try:
@@ -131,34 +185,6 @@ def test_every_textured_polygon_belongs_to_exactly_one_island():
             assert len(owned) == len(set(owned)), "a polygon in two islands"
 
 
-def test_a_touching_piece_whose_hull_is_mostly_air_is_split_to_its_members():
-    """The rule the corpus figure rests on, in isolation.
-
-    Four quads chained corner to corner: every one abuts the next, so they
-    are a single UV-connected piece -- but the hull of a diagonal staircase
-    is mostly air.  Keeping it whole costs 33x33 = 1,089 texels for 4x81 =
-    324 of surface, so the piece is split back to its members.
-
-    Without this the corpus reads 143/147, not 147/147.
-    """
-    staircase = [
-        quad([(8 * k, 8 * k), (8 * k + 8, 8 * k),
-              (8 * k, 8 * k + 8), (8 * k + 8, 8 * k + 8)],
-             [(k, 0, 0), (k + 1, 0, 0), (k, 0, 1), (k + 1, 0, 1)])
-        for k in range(4)
-    ]
-    assert len(I.islands(staircase[:1])) == 1, "one quad is one island"
-
-    found = I.islands(staircase)
-    assert {i["chart"] for i in found} == {0}, "the staircase is ONE chart"
-    hull_area = 33 * 33
-    apart = 4 * 9 * 9
-    assert hull_area > apart, "the fixture must have a wasteful hull"
-    assert len(found) == 4, (
-        "the hull was kept whole: 1,089 texels claimed for 324 of surface")
-    assert all(i["size"] == (9, 9) for i in found)
-
-
 def air_in(polygons, island):
     """Texels inside the island that NO member reads."""
     w, h = island["size"]
@@ -175,16 +201,20 @@ def air_in(polygons, island):
 
 
 def test_an_island_never_carries_a_texel_none_of_its_members_reads():
-    """The split rule has to compare the hull against the members' UNION, not
-    their sum.  When two members OVERLAP -- and 16.14% of the disc's read
-    texels have more than one reader -- the sum double-counts the overlap,
-    so a hull with air in it passes a test it should fail.
+    """A texel no member reads is another surface's paint carried inside this
+    island, which puts a second surface in it and defeats decision 2.
 
-    Here: boxes 0..9 x 0..9 and 5..14 x 0..19, welded, one chart.  Hull 15x20
-    = 300.  Sum of boxes = 100 + 200 = 300, so a sum test merges them.  Their
-    union is only 250 -- the 5x10 block at the bottom left is read by
-    neither.  Those 50 texels are another chart's paint on the disc, and
-    carrying them into this island puts a second surface inside it.
+    Amendment 1 had to work for this: its hull had to be compared against the
+    members' UNION and not their sum, because 16.14% of the disc's read texels
+    have more than one reader, so a sum double-counts the overlap and admits
+    a hull with air in it.  This fixture is that trap -- boxes 0..9 x 0..9 and
+    5..14 x 0..19, welded, one chart; hull 15x20 = 300, sum of boxes also 300,
+    union only 250, and the 5x10 block at the bottom left read by neither.
+
+    Under decision 22 an island is one polygon's rectangle, so air is
+    structurally unreachable rather than ruled out.  The arm is kept pointed
+    at the property and not at the rule: decision 23 consolidates islands
+    again, and anything that groups rectangles can put air back.
     """
     overlapping = [
         quad([(0, 0), (9, 0), (0, 9), (9, 9)],

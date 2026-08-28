@@ -462,10 +462,17 @@ def main():
                       .replace("@ZIP@", str(ensure_addon()))
                       .replace("@OUT@", str(REPORT))
                       .replace("@FACTS@", json.dumps(f)))
+    # Isolate this Blender from the artist's OWN install. Without it the
+    # `addon_install` in the script above overwrites the addon they are
+    # clicking, and `addon_enable` then grades that copy rather than this
+    # tree. `--factory-startup` does NOT do this -- see `blender_env`.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from blender_env import isolated_env
     proc = subprocess.run(
         [sys.argv[1] if len(sys.argv) > 1 else "blender",
          "--background", "--factory-startup", "--python", str(script)],
-        capture_output=True, text=True)
+        capture_output=True, text=True,
+                          env=isolated_env())
     sys.stdout.write(proc.stdout)
     if proc.stderr:
         sys.stdout.write("\n[stderr]\n" + proc.stderr[-4000:])

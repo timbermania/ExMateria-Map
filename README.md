@@ -7,6 +7,61 @@ consumer: `fft-iso-patcher` (3.11), the `godot-learning` tools venv (3.13), and
 Blender 5.2's system Python (3.14). A Blender addon cannot `pip install`, so the
 no-dependency rule is a constraint, not a preference.
 
+## Installing the Blender addon
+
+Download **`exmateria_map-<version>.zip`** from
+[Releases](https://github.com/timbermania/ExMateria-Map/releases). Leave it
+zipped — Blender installs the zip and unpacks it itself.
+
+In Blender: **Edit ▸ Preferences ▸ Add-ons**, then whichever of these your
+Blender shows —
+
+- the **▾** menu at the top right ▸ **Install from Disk…**, or
+- an **Install…** button, on a Blender whose Extensions system isn't running.
+
+— pick the zip, and tick the checkbox beside **ExMateria Map** to enable it.
+Dragging the zip onto the Blender window does the same thing on 4.2 and up.
+The two panels differ only in the button: this is a legacy `bl_info` add-on,
+and both routes land it in `scripts/addons/exmateria_map` and register it.
+
+It has no dependencies to install — the package is stdlib-only and the addon
+vendors it, which is the whole reason for that rule (a Blender addon cannot
+`pip install`). Blender 4.0 is the declared floor; 5.2 is what it is developed
+and tested against.
+
+**Check that it took.** On enable the addon prints its own provenance to the
+console:
+
+```
+EXMATERIA-MAP: addon 0.1.0 loaded from /…/scripts/addons/exmateria_map
+```
+
+That line exists because "am I looking at my own work?" had no answer once and
+cost a round trip. On Windows the console is **Window ▸ Toggle System Console**;
+on Linux and macOS, start Blender from a terminal.
+
+**To update**, install the newer zip the same way — it overwrites — and restart
+Blender, because Python caches imported modules for the life of the process.
+
+**Working from a clone** instead of a release: don't copy the tree, link it.
+`tools/dev_install.sh` symlinks `addons/exmateria_map` into every Blender it
+finds under `~/.config/blender`, so there is only ever one copy and "did my
+edit land" stops being a question you can get wrong.
+
+### Building the zip
+
+```bash
+python3 tools/make_addon_zip.py            # -> dist/exmateria_map-<version>.zip
+python3 tests/blender_release_zip.py       # installs it into a scratch Blender and grades it
+```
+
+The builder is deterministic and drops `__pycache__`, `*.pyc` and the
+agent-facing `CLAUDE.md`; the version comes from `bl_info`. The grader is the
+one that matters — a zip missing `_vendor/` still installs, still enables and
+still registers every operator, and only fails later when an artist picks a
+`MAP###.GNS`, so the suite installs the actual artifact into an isolated
+Blender and checks that what registered came from the zip.
+
 ## The two legs
 
 `dump` reads a base map into the schema-v1 interchange document

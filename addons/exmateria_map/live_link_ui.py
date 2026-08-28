@@ -73,8 +73,7 @@ from . import live_link as L
 from . import live_vram as VR
 from .export_document import (assemble, describe_divergence, find_marker,
                               markers)
-from .import_document import (_prefs, _stored_report, marker_in_scene,
-                              state_rig)
+from .import_document import _prefs, marker_in_scene, state_rig
 
 #: `(bucket, field) -> writes` of the last push this **process** made, per
 #: marker object name. See the module docstring: it is what lets the artist
@@ -240,16 +239,25 @@ def unpushed_lines(pushed_fields):
 
 
 def picture_plan(at, at_vram, sheets, clut_ram, clut_vram):
-    """The sheet's rectangles and the palettes' RAM writes, or a refusal.
+    """The sheet's rectangles, the palettes' TWO sinks, or a refusal.
 
     Decision 2's atom, planned as one. `bpy`-free and pure so the composition
     itself is testable -- the operator around it is neither.
 
-    Returns `(rects, writes, notes)`. A `note` is a thing the artist must be
-    told that is not a failure: decision 10's "this state declares no palettes,
-    so none were pushed" is the common one, and 38.5% of corpus states are in
-    exactly that position. A genuine problem raises instead, and takes the
-    whole atom with it.
+    Returns `(rects, clut_rects, writes, notes)`: the sheet's VRAM rectangles,
+    the palettes' VRAM rectangles, and the palettes' RAM writes. A `note` is a
+    thing the artist must be told that is not a failure: decision 10's "this
+    state declares no palettes, so none were pushed" is the common one, and
+    38.5% of corpus states are in exactly that position. A genuine problem
+    raises instead, and takes the whole atom with it.
+
+    **The palettes are planned into both memories, and that is a correction.**
+    This function used to plan the RAM block alone, on a measurement that the
+    engine re-uploads it every frame. It does -- on the **42** textured
+    resources of 169 whose `0x70` chunk carries a palette ANIMATION, which is
+    what performs that re-upload. On the other **127** nothing re-uploads it
+    and a RAM-only push is byte-perfect and invisible. Neither sink is a
+    fallback for the other; see `live_link.plan_palettes` and §2.3.
     """
     notes = []
     if at.sheet_row is None:
@@ -270,7 +278,22 @@ def picture_plan(at, at_vram, sheets, clut_ram, clut_vram):
     for rc in rects:
         VR.check_rect(rc)
 
-    writes = []
+    # #646: the sheet goes to the address MOST of the engine's packets agree
+    # on, and the ones that named a different page are a note rather than a
+    # refusal. They are not a rounding error to the artist -- they are the
+    # faces that will still be wearing the old map's picture, and five stale
+    # faces read as "the push half worked" unless somebody says otherwise.
+    if at_vram.sheet_dissent or at_vram.clut_dissent:
+        notes.append(
+            f"{at_vram.sheet_dissent} polygon(s) of {at_vram.witnesses} point "
+            f"at a different texture PAGE and {at_vram.clut_dissent} at "
+            f"different CLUT rows. The sheet went to "
+            f"({at_vram.sheet_x}, {at_vram.sheet_y}), which the rest agree on, "
+            "so those keep the texture that was already in VRAM. 23 of the "
+            "corpus's 169 textured resources carry a second page band; a "
+            "tenth dissenting is still a refusal (#646)")
+
+    writes, clut_rects = [], []
     if at.palette_row is None or not at.palette_row.get("palettes"):
         notes.append(
             f"palettes: none pushed -- the group night={at.night} "
@@ -279,24 +302,42 @@ def picture_plan(at, at_vram, sheets, clut_ram, clut_vram):
             "states are like this and render with a keyed partner's")
     else:
         # Decision 5 at the RAM sink: the block is checked against what the GPU
-        # is actually showing before a byte of it is written, because a second,
-        # INERT copy of the same 512 bytes sits elsewhere in RAM and pushing
-        # into that one moves nothing at all.
+        # is actually showing before a byte of it is written, because a second
+        # copy of the same 512 bytes sits elsewhere in RAM and pushing into
+        # that one moves nothing at all.
+        #
+        # What this check does NOT establish is that a write to `CLUT_BLOCK`
+        # arrives. It passed on Orbonne -- both sides held Orbonne's -- and the
+        # push still never reached the screen, because on a map with no palette
+        # animation nothing re-uploads the block. Agreement means the address
+        # is the right one; the VRAM rectangles below are what makes it visible.
         L.check_clut_block(clut_ram, clut_vram)
-        writes = L.plan_palettes(at.palette_row["palettes"])
-    return rects, writes, notes
+        rows = L.clut_rows(at.palette_row["palettes"])
+        writes = [(L.CLUT_BLOCK + i * L.CLUT_ROW_BYTES, b) for i, b in rows]
+        clut_rects = VR.plan_clut(rows, at_vram)
+        for rc in clut_rects:
+            VR.check_rect(rc)
+    return rects, clut_rects, writes, notes
 
 
 def picture_lines(at, rects, writes, sheet_changed, clut_changed,
-                  unheld_rects, clut_differ, notes):
+                  unheld_rects, clut_differ, notes,
+                  clut_vram_changed=0, unheld_clut=()):
     """What the sheet-and-palette push moved, and what did not hold.
 
     Decision 3 lives here: the rows that did not take are NAMED from a
     readback, never predicted. Some CLUT rows are engine-animated -- rows 13-15
     on MAP022 a0 -- and a push cannot make those stick, but an artist who is
     not told WHICH ones reads one reverting swatch as a rig that does not work.
+
+    The palette line carries **two** byte counts because the palettes have two
+    sinks, and an artist reading one number could not tell the two failures
+    apart: a RAM-only push is invisible on the 127 resources with no palette
+    animation, and a VRAM-only one is overwritten within a frame on the 42
+    that have one.
     """
     out = [f"picture: {sheet_changed:,} VRAM byte(s) of texture sheet + "
+           f"{clut_vram_changed:,} VRAM byte(s) of palette + "
            f"{clut_changed:,} RAM byte(s) of palette, aimed at "
            f"night={at.night} weather={at.weather} kind {at.kind}"]
     if not sheet_changed and rects:
@@ -305,9 +346,17 @@ def picture_lines(at, rects, writes, sheet_changed, clut_changed,
     for rc, n in unheld_rects:
         out.append(f"  {rc.label} did NOT hold: {n:,} byte(s) read back "
                    "different -- the game has reloaded the map over the push")
+    if writes and not clut_vram_changed and not clut_changed:
+        out.append("  the palettes were already live in both memories")
+    for rc, n in unheld_clut:
+        out.append(
+            f"  {rc.label} did not hold in VRAM: {n:,} byte(s) read back "
+            "different. On a map that ANIMATES its palettes the RAM block is "
+            "re-uploaded over these rows every frame and wins, which is "
+            "expected -- the RAM sink is the durable one there")
     if clut_differ:
         out.append(
-            f"  {clut_differ} palette byte(s) did not hold. The engine "
+            f"  {clut_differ} palette byte(s) did not hold in RAM. The engine "
             "repaints some CLUT rows itself (rows "
             + ", ".join(str(r) for r in L.CLUT_ANIMATED_MEASURED)
             + " on MAP022 a0), and it wins every frame -- this is the "
@@ -322,7 +371,7 @@ def push_picture(client, vram, at, at_vram, sheets, say):
     try:
         clut_vram = VR.clut_block(vram.read(), at_vram)
         clut_ram = client.read(L.CLUT_BLOCK, L.CLUT_BLOCK_BYTES)
-        rects, writes, notes = picture_plan(
+        rects, clut_rects, writes, notes = picture_plan(
             at, at_vram, sheets, clut_ram, clut_vram)
     except (L.LiveLinkError, VR.VramError) as e:
         say("WARNING", f"sheet and palettes NOT pushed: {e}")
@@ -330,15 +379,25 @@ def push_picture(client, vram, at, at_vram, sheets, say):
 
     try:
         sheet_changed = VR.apply(vram, rects)
+        # RAM last, and that ordering is the one thing here that matters. On
+        # the 42 resources that animate their palettes the engine re-uploads
+        # `CLUT_BLOCK` over these rows every frame, so whichever sink is
+        # written last is not what the artist sees -- but a VRAM write made
+        # AFTER the RAM one would be reverted to the same bytes, while a RAM
+        # write made after a VRAM one is what makes both agree. The readback
+        # below then reports what actually held.
+        clut_vram_changed = VR.apply(vram, clut_rects)
         clut_changed = L.apply(client, writes)
     except (L.LiveLinkError, VR.VramError) as e:
         say("ERROR", f"the picture push FAILED part way: {e}")
         return []
 
     unheld = VR.verify(vram, rects)
+    unheld_clut = VR.verify(vram, clut_rects)
     clut_differ, _compared = L.verify(client, writes)
     return picture_lines(at, rects, writes, sheet_changed, clut_changed,
-                         unheld, clut_differ, notes)
+                         unheld, clut_differ, notes,
+                         clut_vram_changed, unheld_clut)
 
 
 def rig_lines(states, index, rig_source, ram, registers):
@@ -380,6 +439,23 @@ class MAP_OT_live_push(Operator):
         name="Skip the write-path self-check", default=False,
         options={"HIDDEN", "SKIP_SAVE"})
 
+    #: The artist's declaration that the emulator holds a DIFFERENT map, and
+    #: that replacing it is the point. It is a MODE, not a skip: the content
+    #: self-check is exchanged for `check_plan_bounds`, never dropped. The
+    #: distinction is the whole of why `skip_selfcheck` above stays hidden --
+    #: a swap has a proof it can pass, so an artist never needs the escape
+    #: hatch that has none.
+    replace_loaded_map: BoolProperty(
+        name="Replace the loaded map", default=False,
+        description=(
+            "Push this document over whatever map the emulator has loaded, "
+            "instead of editing the one it holds. The write-path self-check "
+            "cannot run -- it proves the addresses by asking RAM for the "
+            "document's own bytes, which a different map does not hold -- so "
+            "the addresses are bounds-checked against the engine's arrays "
+            "instead. Weaker, and the report says so"),
+        options={"SKIP_SAVE"})
+
     @classmethod
     def poll(cls, context):
         return bool(markers(context.scene))
@@ -397,10 +473,20 @@ class MAP_OT_live_push(Operator):
             if ob is not None:
                 ob[LAST_PUSH_KEY] = json.dumps(lines)
             # Every finish, refusals included -- a push that refused is the one
-            # the artist most wants to read, and the panel truncates.
+            # the artist most wants to read.
             from .report_log import record
             record("Push to PCSX-Redux", ob.name if ob is not None else "",
                    lines)
+            # ...and to the TERMINAL.  The panel used to draw a status row and
+            # the refusals; the artist's rule is that a run's output is console
+            # output, so this is where the deleted rows went.  Printed from the
+            # OPERATOR, once per push -- never from a `draw`, which runs on
+            # every redraw of the region.  `record` above keeps the selectable
+            # copy in the Log; this is the one a terminal `tail -f` sees, and
+            # between them the deleted panel text has two homes rather than
+            # none.
+            for line in lines:
+                print(f"EXMATERIA-MAP push: {line}")
             return {status}
 
         ob, problem = find_marker(context)
@@ -413,17 +499,28 @@ class MAP_OT_live_push(Operator):
         prefs = _prefs(context)
         host = getattr(prefs, "live_host", "") or L.DEFAULT_HOST
         port = int(getattr(prefs, "live_port", 0) or L.DEFAULT_PORT)
-        # #606 part 1: main RAM has two transports. `client` is whichever the
-        # artist chose; `lua` is kept regardless, because the light rig's GTE
-        # half writes coprocessor control registers that are not `m_wram` and
-        # no HTTP endpoint reaches them. That leg is the ONLY thing here that
-        # still needs our pcsx-redux fork.
+        # #606: two clients, because the push writes two things that live in
+        # different places -- not because there is a choice to make. `client`
+        # is main RAM (`POST /api/v1/cpu/ram/raw`); `lua` is the light rig's
+        # GTE half, which writes coprocessor control registers that are not
+        # `m_wram` and that no HTTP endpoint reaches. Both are stock
+        # pcsx-redux. The transport preference that used to pick between them
+        # is gone (part 3): its off position needed our fork, which is not a
+        # decision to put in front of an artist.
         lua = L.LuaClient(host=host, port=port)
-        over_http = bool(getattr(prefs, "live_ram_over_http", False))
-        client = L.RamClient(host=host, port=port) if over_http else lua
-        if not lua.ping():
-            say("ERROR", f"no emulator answering on {host}:{port} -- launch "
-                         "pcsx-redux with -webserver and load a battle")
+        client = L.RamClient(host=host, port=port)
+        problem = lua.check()
+        if problem:
+            # Three states, not two (`LuaClient.check`): an emulator running
+            # without the handlers is the likeliest failure here and the one a
+            # bare "no emulator answering" would misdiagnose.
+            #
+            # The remedy is named at the point of failure rather than left in
+            # the preferences, because this refusal IS the moment the artist
+            # finds out they need it.
+            say("ERROR", problem + "\n    -- or press 'Launch PCSX-Redux' "
+                                   "below, which starts it with the handlers "
+                                   "already loaded")
             return finish("CANCELLED", ob)
 
         # 1. the document, in memory. Export's own refusals, not a second copy.
@@ -488,7 +585,40 @@ class MAP_OT_live_push(Operator):
         if base is not None:
             base_counts = L.bucket_counts(base)
             base_plans = L.plan_document(primary, {"polygons": base})
-        if base is None:
+        if self.replace_loaded_map:
+            # The swap's proof, and it is a DIFFERENT question from the
+            # content check rather than a lenient version of it. `selfcheck`
+            # asks whether RAM holds the document's own bytes -- which is the
+            # identity claim decision 7 recovered as a side effect, and which
+            # this mode violates on purpose. What survives is the one fact
+            # about these addresses that does not depend on which map is
+            # loaded: the engine's four polygon arrays are fixed-capacity and
+            # engine-global (ADR-0004 decision 28), so a write outside one is
+            # corruption whatever is in RAM.
+            try:
+                bounded = L.check_plan_bounds(plans)
+            except L.LiveLinkError as e:
+                say("ERROR", str(e))
+                return finish("CANCELLED", ob)
+            # WARNING, not INFO. The artist has just stood down the highest-
+            # value check in the build, and a line they have to go looking for
+            # is a line that reads as "it passed".
+            for line in bounded:
+                say("WARNING", line)
+            # The leg a swap cannot deliver, said in swap terms. `UNPUSHED`
+            # already names the terrain grid on every push -- "the map looks
+            # right and COLLIDES wrong" -- and on the artist's own map that is
+            # a curiosity about one field. On somebody else's map it is the
+            # whole story: the tile records are the map that is still loaded,
+            # so the picture is this document and the walking is not. Said
+            # HERE, as its own warning, because a line that only appears in a
+            # list of two every push is a line that has been scrolled past.
+            say("WARNING",
+                "the terrain grid has no located sink, so units will walk "
+                "the map you replaced while looking at this one -- heights, "
+                "slopes and walkability are all still the loaded map's. This "
+                "is a picture, not a playable map; `build` is what ships one")
+        elif base is None:
             say("WARNING",
                 "self-check SKIPPED: this scene has faces that were not "
                 "imported (or no `_shadow` attributes), so there is no "
@@ -599,6 +729,25 @@ class MAP_OT_live_push(Operator):
             except (L.LiveLinkError, VR.VramError) as e:
                 say("WARNING", f"sheet and palettes NOT pushed: {e}")
             else:
+                # Where the sheet and the CLUT block live is DERIVED from the
+                # live packets rather than hard-coded (`derive_addresses`:
+                # neither base is FFT's to promise). Under a swap that
+                # derivation is self-consistent -- the packet plan keeps the
+                # loaded map's base bits and replaces only the two masked
+                # fields, so the polygons point at the same column the sheet
+                # is written to -- but it is the REPLACED map's layout that
+                # both halves agree on, and whether a foreign map's four page
+                # rectangles have the shape this document's sheet needs is
+                # unmeasured. Say which map the address came from; do not
+                # claim it is the right one.
+                if self.replace_loaded_map:
+                    say("WARNING",
+                        "the sheet's column and the CLUT block's row were "
+                        "derived from the map you replaced -- the engine's "
+                        "own packets are the only witness to either, and on a "
+                        "swap those packets are the loaded map's. Both halves "
+                        "agree with each other; whether that layout suits "
+                        "this document's sheet is not measured")
                 vram = VR.VramClient(host=host, port=port)
                 sheet_reported = push_picture(
                     client, vram, at, at_vram, rep.sheets, say)
@@ -637,19 +786,37 @@ class MAP_OT_live_push(Operator):
 
 
 class MAP_PT_live_push(Panel):
-    """`Map` sidebar, 3D viewport: push the scene into a running PCSX-Redux
-    battle.
+    """`Map` sidebar, 3D viewport, FIRST: push the scene into a running
+    PCSX-Redux battle.
 
-    Its own section, next to the operator it drives, rather than a tail on the
-    preview panel — reported from use as "the menus are a mess".  It also has
-    something to say that no other panel does, and that has to be said WHERE THE
-    BUTTON IS: what a push carries, and what it does not.
+    **Three controls and no prose.** It used to carry three blocks of text as
+    well -- a `What a push carries` sub-panel, a *"Set the PCSX-Redux folder"*
+    hint, and the last push's report -- and all three are gone.  Reported from
+    use: *"I don't care about the 'what a push carries' section.  delete it.
+    that belongs in a console or something.  same thing with the other 2
+    warnings.  you are putting console stuff in the ui area."*
+
+    That is a rule, not three deletions, and it is the one this panel is now
+    built to: **a panel holds things you PRESS; what a run had to say goes to
+    the console and to the Log.**  Nothing was lost to it -- see
+    `MAP_OT_live_push.execute`'s `finish`, which now prints every line it
+    stores.  The `UNPUSHED` list the sub-panel rendered is already one of those
+    lines on every push (`unpushed_lines`), so it is said once per run, in the
+    place a run's output belongs, instead of standing on screen forever.
     """
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "Map"
     bl_label = "Push to PCSX-Redux"
-    bl_order = 6
+    # FIRST in the tab.  Reported from use: *"the most important are going to
+    # be opening pcsx redux, and pushing to pcsx redux."*  Both live in this
+    # panel -- `Launch PCSX-Redux` and `Push to PCSX` -- which makes it the
+    # only panel holding two of the artist's top controls, and it was `6`:
+    # below Terrain, Lighting Bake and Export, at the bottom of the column.
+    # The loop it closes is the tightest one in the addon (edit -> push ->
+    # look at the emulator), so it goes where the loop's last click is a
+    # glance away rather than a scroll.
+    bl_order = 0
 
     @classmethod
     def poll(cls, context):
@@ -662,100 +829,70 @@ class MAP_PT_live_push(Panel):
             return
         layout.operator(MAP_OT_live_push.bl_idname, icon="PLAY",
                         text="Push to PCSX")
+        # Two buttons, not a checkbox beside one. They are different acts:
+        # the first edits the map the emulator has loaded and is proved by
+        # asking RAM for that map's own bytes; the second replaces whatever is
+        # loaded and cannot be proved that way, because a different map does
+        # not hold them. A checkbox reads as a setting on one act and would
+        # leave the artist to notice that the check quietly became a weaker
+        # one; a separate button is the declaration decision 2 says has to
+        # come from the person who loaded the savestate, since no RAM address
+        # holding the current map id is known.
+        swap = layout.operator(MAP_OT_live_push.bl_idname,
+                               icon="FILE_REFRESH",
+                               text="Replace the loaded map")
+        swap.replace_loaded_map = True
         prefs = _prefs(context)
         if prefs is not None:
             row = layout.row(align=True)
             row.prop(prefs, "live_host", text="")
             row.prop(prefs, "live_port", text="")
-
-        _stored_report(layout, ob, LAST_PUSH_KEY, "Last push:")
-
-
-#: One line per `live_link.UNPUSHED` field, keyed by that table's own
-#: field name.  A key that is not in `UNPUSHED` is never drawn and a field
-#: with no line here is drawn bare, so this can go stale in the direction
-#: of saying too little and never in the direction of claiming a sink is
-#: missing when it is not.
-NOT_CARRIED = {
-    "the terrain grid":
-        "Not the terrain GRID \u2014 the tile records. The per-polygon "
-        "BINDING is a different thing and does push.",
-    "polygons[].unknown_untextured":
-        "Not the untextured record's four raw property bytes \u2014 a "
-        "different thing from bytes 6-7, which every push writes.",
-}
+            # Launching the emulator belongs HERE, not only in the preferences.
+            # The moment an artist needs it is the moment a push has just come
+            # back "no emulator answering" -- and sending them to another window
+            # to fix that is the friction the launch button existed to remove.
+            # The binary is still a preference, because it is a property of
+            # their machine and not of this map; only the ACTION is here.
+            #
+            # Deliberately no live status light. `draw` runs on every redraw of
+            # this region, and a status would mean a socket connect on each one.
+            layout.operator("exmateria_map.launch_pcsx", icon="CONSOLE",
+                            text="Launch PCSX-Redux")
 
 
-class MAP_PT_live_push_carries(Panel):
-    """What a push carries, and what it does not — a CLOSED sub-panel.
-
-    Reported from use: "when I change map preview entry and hit push nothing
-    happens - shouldn't it update the texture?"  It cannot, and for two
-    independent reasons, neither of which was anywhere on screen:
-
-      1. the previewed state is VIEW state.  `export_document` never reads
-         `exmateria_map/preview_state`, so the document is byte-identical
-         whichever state is on screen -- and `apply` reports only CHANGED
-         bytes, so the second push of an unchanged document is a truthful zero.
-      2. what the push does NOT carry was nowhere on screen either.
-
-    `UNPUSHED` was already named in the last-push report, which is read AFTER
-    the click and only once there has been one.  A limit the artist has to
-    trigger the disappointment to discover is not documented.
-
-    So it stays on screen -- but as a HEADER, not as eight always-drawn label
-    rows.  It is reference, read once and then in the way, and the second
-    report from use was that this column is full of text nobody is re-reading.
-
-    **It reads `live_link.UNPUSHED`; it does not restate it.**  Reason 2 used
-    to say the texture sheet and the CLUT rows had no live sink and to use
-    `tools/live_push.py` -- which stopped being true when step 5c gained one,
-    and stayed on screen anyway.  ADR-0186 Amendment 3's Consequences named it:
-    *"the panel whose job is to say what a push carries is wrong about the leg
-    this loop depends on."*  A panel that RESTATES a table can disagree with
-    it; one that reads it cannot.  `NOT_CARRIED` is prose keyed by that
-    table's own field names, and a field with no prose is still named, bare,
-    rather than silently dropped.
-    """
-
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "Map"
-    bl_parent_id = "MAP_PT_live_push"
-    bl_label = "What a push carries"
-    bl_order = 7
-    bl_options = {"DEFAULT_CLOSED"}
-
-    def draw(self, context):
-        box = self.layout.box()
-        box.label(text="GEOMETRY, NORMALS, UVs, PALETTE IDs, TEXTURE PAGES,",
-                  icon="INFO")
-        box.label(text="the TEXTURE SHEET, the CLUT ROWS, the terrain "
-                       "BINDINGS, the polygon COUNTS and the LIGHT RIG.")
-        lines = ["A palette ID is a row INDEX, not the row's COLOURS."]
-        for field in sorted(L.UNPUSHED):
-            lines.append(NOT_CARRIED.get(field, f"Not {field}."))
-        lines.append("Not yet the preview state \u2014 decision 9 has the "
-                     "push AIM at it, but the legs it aims are not built.")
-        # Wrapped at 60, not `_stored_report`'s 88: at 88 the second line ran
-        # past the Properties editor's width in the default layout.
-        for line in lines:
-            for k, chunk in enumerate(textwrap.wrap(line, 60) or [""]):
-                box.label(text=("    " if k else "") + chunk)
-
+# --- `What a push carries`: DELETED (2026-08-27) -----------------------------
+#
+# It was `MAP_PT_live_push_carries`, a DEFAULT_CLOSED sub-panel, plus the
+# `NOT_CARRIED` prose table that keyed `live_link.UNPUSHED`'s own field names.
+# Reported from use: *"I don't care about the 'what a push carries' section.
+# delete it.  that belongs in a console or something."*
+#
+# **The limit it documented is not deleted with it.**  The panel existed
+# because *"I change map preview and hit push and nothing happens"* had two
+# causes and neither was on screen; `unpushed_lines()` still exists, every
+# push still calls it, and its lines still land in the operator report, in the
+# Log, and -- new with this deletion -- on stdout.  The difference is that they
+# are said ONCE PER PUSH, next to the push they describe, instead of standing
+# in the column forever being scrolled past.  That is strictly better
+# provenance: the old panel could not say whether a given push was affected,
+# because it was a static restatement of a table.
+#
+# `NOT_CARRIED`'s prose is the one thing that genuinely went.  It explained two
+# of `UNPUSHED`'s fields in the artist's terms ("Not the terrain GRID -- the
+# tile records").  `UNPUSHED`'s own `why` strings are what the lines carry now.
+# If those read badly in the console, fix them in `live_link.UNPUSHED`, which
+# is the table everything reads -- do not reintroduce a second copy here, which
+# is the defect ADR-0186 Amendment 3 already named once.
 
 
 def register():
     bpy.utils.register_class(MAP_OT_live_push)
     bpy.utils.register_class(MAP_PT_live_push)
-    bpy.utils.register_class(MAP_PT_live_push_carries)
 
 
 def unregister():
-    bpy.utils.unregister_class(MAP_PT_live_push_carries)
     bpy.utils.unregister_class(MAP_PT_live_push)
     bpy.utils.unregister_class(MAP_OT_live_push)
 
 
-classes = (MAP_OT_live_push, MAP_PT_live_push,
-           MAP_PT_live_push_carries)
+classes = (MAP_OT_live_push, MAP_PT_live_push)

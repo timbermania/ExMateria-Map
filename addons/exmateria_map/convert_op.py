@@ -198,6 +198,27 @@ def _show_source_art(ob, img):
         node.image = img
         node.interpolation = "Closest"
         node.extension = "CLIP"
+        # The material's ACTIVE image texture node is what Texture Paint in
+        # `MATERIAL` mode writes into.  `nodes.active` and
+        # `Material.paint_active_slot` are two views of ONE pointer -- measured
+        # both ways round: setting the slot moves the active node, and setting
+        # the active node moves the slot.
+        #
+        # This graph carries THREE image texture nodes -- `exmateria_map.clut`,
+        # `exmateria_map.index`, `exmateria_map.source_art`, in that creation
+        # order -- and Blender's default is slot 0.  So without this line,
+        # entering Texture Paint on a converted map and painting on the model
+        # lands the stroke in the **CLUT**.  Which is the worst place it could
+        # go: the node is unlinked by the rewire below, so nothing in the
+        # viewport changes and the artist sees no damage, while
+        # `export_document`'s §6.4 reads that image's pixels straight back to
+        # re-emit `map_states[].palettes`.  Silent, and it ships.
+        #
+        # An object with ONE image texture node needs none of this, which is
+        # why painting on any other Blender object "just works".  This makes
+        # ours behave the same, and is why the addon needs no `Paint on the
+        # model` button (ADR-0185 Amendment 5).
+        nt.nodes.active = node
         uv = nt.nodes.get("exmateria_map.index")
         if uv is not None and uv.inputs["Vector"].links:
             nt.links.new(uv.inputs["Vector"].links[0].from_socket,
@@ -291,6 +312,27 @@ surface. One-way, and it changes nothing you can see"""
         stale = bpy.data.images.get(paint_image_name(sheet))
         if stale is not None:
             bpy.data.images.remove(stale)
+
+        # ...and the brush has to come off it.  `Paint sheet` sets
+        # `image_paint.mode = "IMAGE"` and points `canvas` at the picture it
+        # hands over (`paint.py`), and that setting is scene-wide and saved in
+        # the `.blend`.  On the direct-paint path the picture it names is the
+        # image REMOVED just above -- so an artist who pressed `Paint sheet`
+        # before converting would enter Texture Paint on the model, stroke,
+        # and have nothing happen at all, with nothing said about why.
+        #
+        # Back to `MATERIAL`, where `_show_source_art`'s active node decides
+        # the destination.  This is cleanup of state THIS operator invalidated,
+        # not an override of a choice the artist made about this map: pressing
+        # `Paint sheet` again re-arms `IMAGE` mode on the painting, which is
+        # also correct and is the atlas route.
+        ip = getattr(getattr(context, "tool_settings", None),
+                     "image_paint", None)
+        if ip is not None:
+            try:
+                ip.mode = "MATERIAL"
+            except (AttributeError, TypeError):
+                pass
 
         faces = sum(1 for q in converted if "uv" in q)
         self.report({"INFO"},

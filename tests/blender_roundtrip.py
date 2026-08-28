@@ -42,8 +42,15 @@ ZIP = "@ZIP@"
 JSON = "@JSON@"
 OUT = "@OUT@"
 
-# Install + enable the addon in THIS process (--factory-startup uses a scratch
-# user dir, so nothing survives across headless invocations).
+# Install + enable the addon in THIS process.
+#
+# **`--factory-startup` does NOT give this a scratch user dir.** That claim
+# stood here and was false: the flag resets PREFERENCES, not the scripts
+# directory, so with no `BLENDER_USER_RESOURCES` this `addon_install` writes
+# into the artist's real `~/.config/blender/<ver>/scripts/addons/` -- and the
+# `addon_enable` below then grades whatever is there. The launcher sets that
+# variable for every run now (`tests/blender_env.py`); this comment is what
+# sent a session looking in the wrong place, so it says the opposite loudly.
 try:
     bpy.ops.preferences.addon_install(filepath=ZIP)
 except Exception as e:
@@ -804,8 +811,20 @@ _fl = _FakeLayout(_icons)
 try:
     class _Self:
         layout = _fl
-    mod.MAP_PT_preview.draw(_Self(), type("_Ctx", (), {
-        "object": ob2, "scene": bpy.context.scene})())
+    _ctx_pv = type("_Ctx", (), {"object": ob2, "scene": bpy.context.scene})()
+    mod.MAP_PT_preview.draw(_Self(), _ctx_pv)
+    # ...and the LIGHT panel, onto the same tape. The rig, its provenance line
+    # and the light-debug pair moved out of Preview and into Lighting Bake
+    # (2026-08-27, *"the light stuff in there should just go in the light
+    # panel"*), and the arms below are about the rig's SHAPE -- that it is
+    # drawn without a gesture, that the provenance line is said once, that the
+    # three lights are side by side. Those claims are about the TAB, not about
+    # which of its panels holds them, so both panels feed one tape and the
+    # arms are unchanged. WHICH panel now owns the rig is asserted separately,
+    # further down, in both directions -- a move that leaves a copy behind
+    # would satisfy this tape and fail that one.
+    from exmateria_map import lighting_bake as _lb_early
+    _lb_early.MAP_PT_lighting_bake.draw(_Self(), _ctx_pv)
     check("panel_draw", True)
 except Exception as e:
     check("panel_draw", False, repr(e))
@@ -936,33 +955,32 @@ check("push_panel_draws_the_button", "map.live_push" in _push_ops, str(_push_ops
 check("push_panel_icons_valid",
       all(i in _valid for i in _push_icons if i is not None),
       str([i for i in _push_icons if i is not None and i not in _valid]))
-# The question that sent this back: "I change map preview and hit push and
-# nothing happens -- shouldn't it update the texture?" It cannot, twice over:
-# the previewed state is VIEW state that never enters the document, and the
-# texture sheet and CLUT have no live sink in this module at all. The panel has
-# to say so where the button is, not in a report the artist reads afterwards.
-# It lives in a DEFAULT_CLOSED sub-panel now rather than eight always-drawn
-# rows -- reported from use as "it shoves a ton of crap in the right space".
-# The intent is unchanged and so is this check: the text must be WHERE THE
-# BUTTON IS, which a child panel satisfies and a different tab would not. So
-# drive the child too, and assert the parentage that makes it the same place.
-try:
-    _ccls = getattr(bpy.types, "MAP_PT_live_push_carries")
-    _ccls.draw(type("_S", (), {"layout": _PushLayout(_push_icons)})(),
-               type("_Ctx", (), {"object": ob2, "scene": bpy.context.scene})())
-    check("push_carries_subpanel_registered", True)
-except Exception as e:
-    check("push_carries_subpanel_registered", False, repr(e))
-check("push_carries_subpanel_is_a_child_of_the_push_panel",
-      getattr(bpy.types.MAP_PT_live_push_carries, "bl_parent_id", "")
-      == "MAP_PT_live_push"
-      and "DEFAULT_CLOSED" in bpy.types.MAP_PT_live_push_carries.bl_options,
-      str(bpy.types.MAP_PT_live_push_carries.bl_options))
-_push_text = " ".join(_push_labels).lower()
-check("push_panel_says_it_carries_no_texture",
-      "texture" in _push_text, str(_push_labels))
-check("push_panel_says_the_preview_state_is_not_pushed",
-      "preview" in _push_text or "state" in _push_text, str(_push_labels))
+# The question that sent the sub-panel here: "I change map preview and hit push
+# and nothing happens -- shouldn't it update the texture?" It cannot, twice
+# over, and neither reason was on screen. The answer was a DEFAULT_CLOSED
+# `What a push carries` child panel; the artist has since deleted it -- *"I
+# don't care about the 'what a push carries' section. delete it. that belongs
+# in a console or something ... you are putting console stuff in the ui area."*
+#
+# The LIMIT is not deleted with the panel, and that is what these two arms
+# grade. The panel is controls only, and the statement it used to hold is on
+# every push instead of on screen forever.
+check("the_push_panel_is_controls_only",
+      not _push_labels,
+      f"the push panel drew {len(_push_labels)} label row(s) — it holds things "
+      f"you PRESS; what a run had to say goes to the console and the Log: "
+      f"{_push_labels!r}")
+# Where it went. `unpushed_lines` is still called by the operator, so the
+# limit is stated once per push, next to the push it describes -- which the
+# static panel could never do, since it restated a table regardless of what
+# any given push actually covered.
+from exmateria_map import live_link_ui as _ui
+_unp = _ui.unpushed_lines(set())
+check("the_unpushed_limit_still_has_lines_to_say",
+      bool(_unp) and all("not pushed:" in ln for ln in _unp), str(_unp[:3]))
+# The two source-level halves of this -- that the operator still CALLS
+# `unpushed_lines`, and that `finish` PRINTS what it stores -- need
+# `_tree_func`, which is defined further down; they run in the AST section.
 
 # Aiming a lamp means SELECTING it, which makes it the active object. A panel
 # polling on `context.object` therefore disappears at exactly the moment the
@@ -974,13 +992,14 @@ _probe_lamp = bpy.data.objects.new("panel_poll_lamp",
                                    bpy.data.lights.new("ppl", "POINT"))
 bpy.context.scene.collection.objects.link(_probe_lamp)
 bpy.context.view_layer.objects.active = _probe_lamp
-check("export_panel_survives_selecting_a_lamp",
-      bool(bpy.types.MAP_PT_export.poll(bpy.context)))
+# Export's copy of this arm went with the panel; Push's is the one that
+# matters, and it matters more now that Push is FIRST in the tab -- the top
+# panel disappearing when a lamp is selected is the most visible form of the
+# defect this arm exists for.
 check("push_panel_survives_selecting_a_lamp",
       bool(bpy.types.MAP_PT_live_push.poll(bpy.context)))
-# ...and both still DRAW, or surviving the poll buys nothing.
-for _tag, _cls in (("export", bpy.types.MAP_PT_export),
-                   ("push", bpy.types.MAP_PT_live_push)):
+# ...and it still DRAWS, or surviving the poll buys nothing.
+for _tag, _cls in (("push", bpy.types.MAP_PT_live_push),):
     try:
         _cls.draw(type("_S", (), {"layout": _FakeLayout([])})(), bpy.context)
         check(f"{_tag}_panel_draws_with_a_lamp_active", True)
@@ -1114,8 +1133,10 @@ check("badge_reports_edited",
 _props.clear()
 _icons.clear()
 try:
-    mod.MAP_PT_preview.draw(_Self(), type("_Ctx", (), {
-        "object": ob2, "scene": bpy.context.scene})())
+    _ctx_ed = type("_Ctx", (), {"object": ob2, "scene": bpy.context.scene})()
+    mod.MAP_PT_preview.draw(_Self(), _ctx_ed)
+    # Both panels onto one tape again -- the rig lives in Lighting Bake now.
+    _lb_early.MAP_PT_lighting_bake.draw(_Self(), _ctx_ed)
     check("panel_draw_edited", True)
 except Exception as e:
     check("panel_draw_edited", False, repr(e))
@@ -2917,6 +2938,20 @@ _prefs_ops, _prefs_props = [], []
 
 
 class _PrefsLayout:
+    """Records what the preferences `draw` EMITS.
+
+    The `__getattr__` fallback is not optional, and this arm has already been
+    red for the want of it: `a8d9e7668` gave the preferences a `layout.box()`
+    of PCSX launch instructions, and a recorder that raises on an unknown
+    widget turned an unrelated feature into a red arm about the prefs panel.
+    `UILayout` is wide and a panel grows widgets.  `blender_convert.py`'s
+    `FakeLayout` carries the same fallback for the same reason.
+
+    A raising `draw` renders everything before it and nothing after, so an
+    incomplete recorder reads exactly like the panel having stopped drawing --
+    which is the failure this fallback exists to keep distinguishable.
+    """
+
     def operator(self, idname, **kw):
         _prefs_ops.append(idname)
         return self
@@ -2928,12 +2963,36 @@ class _PrefsLayout:
     def row(self, **kw):
         return self
 
+    def __getattr__(self, name):
+        def sub(*a, **kw):
+            return self
+        return sub
+
+
+class _PrefsSelf:
+    """`self` for the preferences `draw`: a recording layout over the REAL
+    preferences.
+
+    It used to be a bare object carrying nothing but `layout`, on the
+    reasoning that `draw` reads `self.layout`.  That stopped being true at
+    `a8d9e7668`, where `draw` grew a PCSX launch line built from
+    `self.live_port` -- and the arm went red naming the prefs panel for a
+    change that was about the live link.  Delegating is what keeps the arm
+    pointed at whether `draw` RUNS: the panel reads its own settings, so it
+    is handed its own settings, and only the layout is faked.
+    """
+
+    def __init__(self, prefs, layout):
+        self.layout = layout
+        self._prefs = prefs
+
+    def __getattr__(self, name):
+        return getattr(self._prefs, name)
+
 
 try:
-    # `draw` reads `self.layout`, so the fake carrying the layout IS `self` --
-    # the same shape the push-panel checks above use.
     _pf = bpy.context.preferences.addons["exmateria_map"].preferences
-    type(_pf).draw(type("_S", (), {"layout": _PrefsLayout()})(), None)
+    type(_pf).draw(_PrefsSelf(_pf, _PrefsLayout()), None)
     check("prefs_draw_ran", True)
 except Exception as e:
     check("prefs_draw_ran", False, repr(e))
@@ -3209,6 +3268,23 @@ def _calls_named(node, fname):
             if isinstance(n, _ast.Call) and getattr(n.func, "id", None) == fname]
 
 
+from exmateria_map import live_link_ui as ui
+
+#: Every panel we register, and where its `draw` is read from.  The two Paint
+#: classes share `_PaintPanel`'s body, so both map to the mixin.  Kept beside
+#: `_tree_func` because the arms that walk it are AST arms; the arms that walk
+#: the REGISTERED panels use `_HOMES`, and the roster check ties the two
+#: together by demanding `_HOMES` name exactly what `bpy.types` holds.
+_PANEL_SOURCES = {
+    "MAP_PT_paint":             ("paint.py", "_PaintPanel"),
+    "MAP_PT_paint_view":        ("paint.py", "_PaintPanel"),
+    "MAP_PT_preview":           ("import_document.py", "MAP_PT_preview"),
+    "MAP_PT_terrain":           ("authoring.py", "MAP_PT_terrain"),
+    "MAP_PT_lighting_bake":     ("lighting_bake.py", "MAP_PT_lighting_bake"),
+    "MAP_PT_live_push":         ("live_link_ui.py", "MAP_PT_live_push"),
+}
+
+
 check("the_ast_checks_read_the_tree_not_the_installed_copy",
       _osp.exists(_tree_path("live_link_ui.py"))
       and PKG not in str(bpy.utils.user_resource("SCRIPTS")),
@@ -3235,6 +3311,28 @@ try:
 except Exception as e:
     check("the_live_bake_handler_does_not_flood_the_log", False, repr(e))
 
+# The push panel's deleted rows, from the source side. The artist's rule is
+# that a run's output is CONSOLE output; the panel is controls only (graded
+# above, on the rendered rows), so both halves of the replacement have to be
+# real or the rows were simply lost.
+try:
+    _pexec = _tree_func("live_link_ui.py", "execute", "MAP_OT_live_push")
+    _pnames = [getattr(n.func, "id", None) or getattr(n.func, "attr", None)
+               for n in _ast.walk(_pexec) if isinstance(n, _ast.Call)]
+    check("the_push_operator_still_states_the_limit",
+          "unpushed_lines" in _pnames,
+          "MAP_OT_live_push no longer calls unpushed_lines -- deleting `What a "
+          "push carries` would then have deleted the LIMIT as well as the panel")
+    _fin = next(n for n in _ast.walk(_pexec)
+                if isinstance(n, _ast.FunctionDef) and n.name == "finish")
+    check("the_push_prints_what_it_stores",
+          bool([n for n in _ast.walk(_fin) if isinstance(n, _ast.Call)
+                and getattr(n.func, "id", None) == "print"]),
+          "finish() records to the Log but prints nothing -- the panel rows "
+          "were deleted TO the console, so the console has to receive them")
+except Exception as e:
+    check("the_push_operator_still_states_the_limit", False, repr(e))
+
 # ===========================================================================
 # ADR-0185 Amendment 4 -- landing 1.
 #
@@ -3247,8 +3345,15 @@ except Exception as e:
 #   both copies shout NO_EDITOR_HINT ....... the_image_editor_copy_does_not_say_it
 #   neither copy says it .................... the_viewport_copy_still_says_where_the_sheet_went
 #   an UNTAGGED workspace claimed as ours ... an_untagged_map_workspace_is_the_artists_and_is_left_alone
-#   the export panel loses its report ....... the_export_panel_still_shows_the_last_export
 #   the report loses its copy button ........ the_report_still_offers_the_copy_button
+#
+# `the_export_panel_still_shows_the_last_export` was the eighth and is RETIRED
+# with its subject: the salience pass deleted `MAP_PT_export`, and the claim it
+# seeded -- that the Outcome survives somewhere the artist can read it -- is now
+# `the_export_report_still_reaches_the_Log`, which is not a seeded arm because
+# it names a module rather than a rendered row.  The `_stored_report` behaviour
+# the deleted arms graded is graded on `MAP_PT_live_push` instead, which is a
+# live caller of the same helper.
 #   `marker_in_scene` back to the selection . no_panel_polls_itself_away_with_the_map_deselected
 #   the rig table drops light 3 ............. the_table_still_draws_every_authorable_rig_control
 #   `_timeline` takes a DOPE SHEET .......... the_band_finder_does_not_take_a_dope_sheet_for_a_timeline
@@ -3271,105 +3376,62 @@ except Exception as e:
 # So the roster is DISCOVERED from the registered types, the table has to name
 # every member of it, and the predicate is then run against a synthetic
 # offender to prove it can still say no.
+# Revision 2 (2026-08-27, the salience pass).  `Push to PCSX-Redux` is FIRST
+# -- it is the only panel holding two of the controls the artist named most
+# important, `Launch PCSX-Redux` and `Push to PCSX` -- and Transform and Export
+# are GONE from the tab, withdrawn by the same artist who asked for them in
+# Amendment 4.  The roster arm below demands this table name every registered
+# panel and no more, so a panel that comes back fails it and so does one that
+# quietly leaves.
 _HOMES = {
     # editor,       bl_order within that editor
     "MAP_PT_paint":             ("IMAGE_EDITOR", 0),
-    "MAP_PT_paint_view":        ("VIEW_3D", 2),
-    "MAP_PT_map_transform":     ("VIEW_3D", 0),
+    "MAP_PT_live_push":         ("VIEW_3D", 0),
     "MAP_PT_preview":           ("VIEW_3D", 1),
+    "MAP_PT_paint_view":        ("VIEW_3D", 2),
     "MAP_PT_terrain":           ("VIEW_3D", 3),
     "MAP_PT_lighting_bake":     ("VIEW_3D", 4),
-    "MAP_PT_export":            ("VIEW_3D", 5),
-    "MAP_PT_live_push":         ("VIEW_3D", 6),
-    "MAP_PT_live_push_carries": ("VIEW_3D", 7),
 }
+# The deletion, as its own arm.  A table entry going missing is otherwise
+# indistinguishable from a table entry never written, and these two leaving is
+# the DECISION -- so it is asserted against `bpy.types`, not against `_HOMES`.
+check("the_withdrawn_panels_are_gone_from_the_tab",
+      not [n for n in ("MAP_PT_map_transform", "MAP_PT_export",
+                       "MAP_PT_live_push_carries")
+           if getattr(bpy.types, n, None) is not None],
+      "a withdrawn panel is registered again. Transform -> Blender's own "
+      "`Item` tab; Export's report -> the Log; `What a push carries` -> the "
+      "console and the Log, once per push, via `unpushed_lines`")
+# ...and each has to have LEFT SOMETHING BEHIND, or a deletion is a removal.
+#
+# Export's report: `report_log` is the surface it deferred to.  This is the
+# reason the panel was safe to delete, so it is checked, not assumed.
+check("the_export_report_still_reaches_the_Log",
+      callable(getattr(mod_log, "record", None))
+      and callable(getattr(mod_log, "show", None)),
+      "MAP_PT_export was deleted BECAUSE report_log carries the Outcome; "
+      "without it an export refusal has no surface once the toast expires")
+# Transform's WARNING: the panel is gone, the consequence is not.  Moving the
+# map relative to its lamps still changes the baked normals and those still
+# reach the disc, so the sentence moved to the panel that owns the bake.
+_lb_doc = (bpy.types.MAP_PT_lighting_bake.__doc__ or "").lower()
+check("the_bake_consequence_outlived_the_transform_panel",
+      "transform" in _lb_doc and "normal" in _lb_doc and "disc" in _lb_doc,
+      "MAP_PT_map_transform carried the only statement that the map's "
+      "transform feeds the bake and therefore the disc; deleting the panel "
+      f"must not delete the sentence: {_lb_doc[:200]!r}")
 _roster = sorted(n for n in dir(bpy.types) if n.startswith("MAP_PT_"))
+# The AST sweep's table has to cover the same roster, or a panel added without
+# a `_PANEL_SOURCES` entry is simply skipped by every arm that walks sources --
+# which reads as "no panel repeats the File menu entry" rather than as a hole.
+check("the_ast_panel_table_covers_the_whole_roster",
+      set(_PANEL_SOURCES) == set(_roster),
+      f"_PANEL_SOURCES names {sorted(_PANEL_SOURCES)}, registered {_roster}")
 check("the_panel_roster_is_the_one_the_rule_was_written_for",
       set(_roster) == set(_HOMES),
       f"registered {_roster}, the Amendment-4 table names "
       f"{sorted(_HOMES)} -- a panel with no home in the table is a seventh "
       f"judgement call, which is what the one rule exists to prevent")
-
-
-def _misplaced(cls, want_space):
-    """Every way a panel can fail to live where the rule says it does."""
-    bad = []
-    if getattr(cls, "bl_space_type", None) != want_space:
-        bad.append(f"bl_space_type={getattr(cls, 'bl_space_type', None)!r}")
-    if getattr(cls, "bl_region_type", None) != "UI":
-        bad.append(f"bl_region_type={getattr(cls, 'bl_region_type', None)!r}")
-    if getattr(cls, "bl_category", None) != mod_ws.TAB:
-        bad.append(f"bl_category={getattr(cls, 'bl_category', None)!r}")
-    # `bl_context` is the Properties editor's own field.  Left behind on a
-    # sidebar panel it is inert, and inert is how the next reader learns the
-    # wrong rule.
-    if getattr(cls, "bl_context", "") != "":
-        bad.append(f"bl_context={getattr(cls, 'bl_context', None)!r}")
-    return bad
-
-
-_wrong = {n: _misplaced(getattr(bpy.types, n), _HOMES[n][0])
-          for n in _roster if n in _HOMES}
-_wrong = {n: v for n, v in _wrong.items() if v}
-check("every_panel_lives_where_the_rule_says", not _wrong, str(_wrong))
-# Stated separately from the table, because THIS is the sentence the artist
-# said and the one a future reader will look for.
-check("no_panel_of_ours_is_registered_for_properties",
-      not [n for n in _roster
-           if getattr(bpy.types, n).bl_space_type == "PROPERTIES"],
-      str([n for n in _roster
-           if getattr(bpy.types, n).bl_space_type == "PROPERTIES"]))
-# The ratchet's second arm: the predicate itself, against a panel shaped
-# exactly like the six this landing moved.  Without it, `_misplaced` returning
-# `[]` unconditionally would read as nine panels in the right place.
-class _WasInProperties:
-    bl_space_type = "PROPERTIES"
-    bl_region_type = "WINDOW"
-    bl_context = "object"
-    bl_category = "Map"
-
-
-class _IsInTheSidebar:
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "Map"
-
-
-check("the_placement_rule_still_catches_a_properties_panel",
-      len(_misplaced(_WasInProperties, "VIEW_3D")) == 3,
-      f"the yesterday-shaped panel scored {_misplaced(_WasInProperties, 'VIEW_3D')} "
-      f"-- it must be caught on space, region AND the leftover bl_context")
-check("the_placement_rule_passes_a_panel_that_obeys_it",
-      _misplaced(_IsInTheSidebar, "VIEW_3D") == [],
-      str(_misplaced(_IsInTheSidebar, "VIEW_3D")))
-# Order is per EDITOR now, so the old global 0-5 cannot survive: two panels in
-# different editors may share a number and two in the same one may not.
-# Asserted as a PERMUTATION rather than against the literals above, which would
-# only restate the table.
-for _sp in sorted({s for s, _ in _HOMES.values()}):
-    _there = {n: o for n, (s, o) in _HOMES.items() if s == _sp}
-    _live = {n: getattr(bpy.types, n, None) for n in _there}
-    check(f"bl_order_is_a_permutation_in_{_sp.lower()}",
-          all(c is not None and getattr(c, "bl_order", None) == _there[n]
-              for n, c in _live.items())
-          and sorted(_there.values()) == list(range(len(_there))),
-          f"{ {n: getattr(c, 'bl_order', None) for n, c in _live.items()} } "
-          f"vs {_there}")
-# Nothing is DEFAULT_CLOSED except the push's reference sub-panel, whose
-# closed-ness is a decision of its own (checked above, with its parentage).
-# The artist's words were "move and UNCOLLAPSE the controls".
-_closed = [n for n in _roster
-           if "DEFAULT_CLOSED" in getattr(getattr(bpy.types, n),
-                                          "bl_options", set())]
-check("only_the_push_reference_subpanel_opens_closed",
-      _closed == ["MAP_PT_live_push_carries"], str(_closed))
-# Decision 8 -- "prefix where there is no tab, bare name where there is" --
-# under the new rule resolves to BARE EVERYWHERE, because every panel now sits
-# under a tab that already says `Map`.
-_prefixed = [(n, getattr(bpy.types, n).bl_label) for n in _roster
-             if getattr(bpy.types, n).bl_label.startswith("ExMateria Map")]
-check("no_panel_repeats_the_addon_name_under_the_Map_tab",
-      not _prefixed, str(_prefixed))
 
 # --- Amendment 4: NO panel is selection-scoped ------------------------------
 # "There is only really one map in the scene -- and having to have that map
@@ -3472,89 +3534,290 @@ _polled_away = sorted(n for n in _roster
 check("no_panel_polls_itself_away_with_the_map_deselected",
       not _polled_away, str(_polled_away))
 
-# --- Amendment 4: the map marker's own Transform, first in the tab ----------
-# "I want to be able to see translate and other key parameters at the same
-# time."  Not a request for something new: in Properties > Object, Location /
-# Rotation / Scale and our five panels were ALREADY co-visible, and vacating
-# Properties would have taken that away.  A sidebar shows one tab at a time,
-# so Blender's `Item` tab is not an answer -- and `Item` follows the selection,
-# which is the same annoyance again.
-_tf_sink, _tf_err = _deselected.get("MAP_PT_map_transform", (None, "not registered"))
-check("the_transform_panel_drew", _tf_err is None, str(_tf_err))
-_tf = [row for row in (_tf_sink.drawn if _tf_sink else []) if row[0] == "prop"]
-_tf_on = [r[1] for r in _tf]
-check("the_transform_panel_draws_the_MARKERS_transform",
-      [r[2] for r in _tf] == ["location", "rotation_euler", "scale"]
-      and len(set(_tf_on)) == 1
-      and _tf_on[0] is not _lamp2
-      and "exmateria_map/preview_state" in _tf_on[0],
-      f"{[(getattr(o, 'name', o), n) for _k, o, n in _tf]} -- with a lamp "
-      f"active, a panel reading `context.object` draws the LAMP's transform, "
-      f"which is the annoyance one layer down.  Graded on the OBJECT rather "
-      f"than on what `marker_in_scene` returns, which would be the panel "
-      f"agreeing with itself")
-# Editable, and that is a decision rather than a convenience: the transform is
-# INVISIBLE to export -- `export_document` never reads it -- but it IS an input
-# to the lighting bake, which bakes `ob.matrix_world @ v.co` and reads
-# `lamp.matrix_world` for direction.  Rotating or scaling the map relative to
-# its lamps changes the baked normals, and those reach the disc.  A control
-# that looks cosmetic and silently writes bytes is what this package says out
-# loud.
-check("the_transform_is_editable",
-      _tf_sink is not None and _tf_sink.enabled is True,
-      "the transform block is drawn disabled -- the artist asked to SEE and "
-      "SET translate, and a greyed row reads as broken")
-_tf_words = " ".join(r[1] for r in (_tf_sink.drawn if _tf_sink else [])
-                     if r[0] == "label").lower()
-check("the_transform_panel_states_the_bake_consequence",
-      "bake" in _tf_words and "normal" in _tf_words,
-      f"the block says nothing about what moving the map costs: {_tf_words!r}")
+
+
+# --- the light rig moved out of Preview -------------------------------------
+# *"The light stuff in there should just go in the light panel -- those can be
+# authored now, right?  they shouldn't be in a preview panel."*  Right: a rig
+# Override is EDITABLE and `rig_is_dirty` makes `build` write 45 bytes to the
+# disc (decision 27), so those sliders author and the panel said Preview.
+#
+# Graded as a MOVE with both ends, because "Preview no longer draws the rig"
+# passes just as well if the rig was deleted, and "the light panel draws it"
+# passes just as well if Preview draws it too.
+_prev_sink, _prev_err = _SinkLayout(), None
+try:
+    mod.MAP_PT_preview.draw(_panel_shim(mod.MAP_PT_preview, _prev_sink),
+                            bpy.context)
+except Exception as e:
+    _prev_err = f"{type(e).__name__}: {e}"
+_bake_sink, _bake_err = _SinkLayout(), None
+try:
+    mod_bake.MAP_PT_lighting_bake.draw(
+        _panel_shim(mod_bake.MAP_PT_lighting_bake, _bake_sink), bpy.context)
+except Exception as e:
+    _bake_err = f"{type(e).__name__}: {e}"
+check("both_panels_drew_after_the_rig_move", _prev_err is None and _bake_err is None,
+      f"preview: {_prev_err}, lighting bake: {_bake_err}")
+_LIGHT_PROPS = {"exmateria_map_light_debug", "exmateria_map_light_boost"}
+_prev_props = {r[2] for r in _prev_sink.drawn if r[0] == "prop"}
+_bake_props = {r[2] for r in _bake_sink.drawn if r[0] == "prop"}
+check("the_preview_panel_draws_no_light_control",
+      not (_prev_props & _LIGHT_PROPS),
+      f"Preview still draws {sorted(_prev_props & _LIGHT_PROPS)} -- the light "
+      f"controls moved to the panel that owns light")
+check("the_light_panel_draws_the_light_controls",
+      _LIGHT_PROPS <= _bake_props,
+      f"Lighting Bake draws {sorted(_bake_props)}; the move must ARRIVE, not "
+      f"just depart -- missing {sorted(_LIGHT_PROPS - _bake_props)}")
+# The rig TABLE itself, which is the half that authors bytes. `_rig_box` draws
+# the Override's own properties, so its arrival is visible as a prop on a
+# `MAP_PG_rig_override` rather than on the Object.
+_bake_owners = {type(r[1]).__name__ for r in _bake_sink.drawn if r[0] == "prop"}
+_prev_owners = {type(r[1]).__name__ for r in _prev_sink.drawn if r[0] == "prop"}
+check("the_rig_table_arrived_in_the_light_panel",
+      "MAP_PG_rig_override" in _bake_owners,
+      f"no rig Override property is drawn in Lighting Bake ({sorted(_bake_owners)}) "
+      f"-- the sliders that write 45 bytes have to be SOMEWHERE")
+check("the_rig_table_left_the_preview_panel",
+      "MAP_PG_rig_override" not in _prev_owners,
+      f"Preview still draws rig Override properties ({sorted(_prev_owners)}) -- "
+      f"a move that leaves a copy behind is a duplication")
+# What Preview KEPT, or the move took the panel with it.
+check("the_preview_panel_still_chooses_the_state_and_the_source",
+      "exmateria_map_preview_source" in _prev_props
+      and any(r[0] == "menu" for r in _prev_sink.drawn),
+      f"Preview drew {sorted(_prev_props)} and "
+      f"{[r[0] for r in _prev_sink.drawn]} -- the state menu and the "
+      f"painting/compiled switch are what makes it a Preview panel")
+
+# --- `Pin Standard view transform`: RETIRED, and the effect asserted --------
+# *"I don't understand this pin standard view thing -- do we really need it?"*
+# The effect yes, the button no. #427: Blender reports only the CURRENT item of
+# `view_transform`, so `Standard` looks absent while AgX regrades every pixel --
+# under which the sixteen swatches are not the sixteen colours on the disc.
+# `bpy.types` ONLY. `bpy.ops.<module>.<anything>` resolves lazily and answers
+# `hasattr` with a stub for operators that do not exist, so an arm asking
+# `bpy.ops` that question is always red and says nothing.
+check("the_pin_view_transform_button_is_retired",
+      "MAP_OT_pin_view_transform" not in dir(bpy.types),
+      "exmateria_map.pin_view_transform is still a registered operator")
+# The button set ONE of the four things every harness in this package pins.
+# That is the reason it was not merely redundant, and it is the reason this
+# arm names the whole set rather than the transform alone.
+check("view_parity_names_all_four_settings",
+      mod.VIEW_PARITY == {"view_transform": "Standard", "look": "None",
+                          "exposure": 0.0, "gamma": 1.0},
+      f"{mod.VIEW_PARITY} -- the harnesses pin four; the deleted button pinned "
+      f"one, which is why pressing it was not enough")
+# It WORKS. Measured while writing these arms, and both facts shape them:
+#
+#   - `look`'s enum is DYNAMIC. `bl_rna.properties["look"].enum_items` reports
+#     `['NONE']` while `'AgX - Punchy'` assigns fine -- the same trap as #427,
+#     one layer along: introspection under-reports and a hardcoded guess is a
+#     TypeError. The AgX looks exist only while `view_transform` is AgX.
+#   - Blender RESETS `look` when `view_transform` changes. So `look` cannot be
+#     staged wrong on its own once the transform is right, and `pin_view_parity`
+#     correctly reports only what IT changed -- the reset is Blender's.
+#
+# Hence: the transform and its look are staged together, exposure and gamma on
+# their own, and every arm ends by asserting the SETTING, never only the report.
+_vs = bpy.context.scene.view_settings
+mod.pin_view_parity(bpy.context.scene)
+try:
+    _vs.view_transform = "AgX"
+    _vs.look = "AgX - Punchy"
+    _staged = (_vs.view_transform, _vs.look)
+except (TypeError, ValueError) as e:
+    _staged = None
+check("a_wrong_transform_and_look_could_be_staged",
+      _staged == ("AgX", "AgX - Punchy"), str(_staged))
+_moved = mod.pin_view_parity(bpy.context.scene)
+check("pinning_fixes_a_wrong_transform_and_look",
+      _vs.view_transform == "Standard" and _vs.look == "None"
+      and any(m.startswith("view_transform:") for m in _moved),
+      f"transform={_vs.view_transform!r} look={_vs.look!r} reported={_moved} — "
+      f"under AgX the sixteen swatches are not the sixteen colours on the disc")
+for _k, _bad in (("exposure", 1.5), ("gamma", 2.2)):
+    mod.pin_view_parity(bpy.context.scene)
+    setattr(_vs, _k, _bad)
+    _moved = mod.pin_view_parity(bpy.context.scene)
+    check(f"pinning_fixes_a_wrong_{_k}",
+          getattr(_vs, _k) == mod.VIEW_PARITY[_k]
+          and any(m.startswith(f"{_k}:") for m in _moved),
+          f"{_k} left at {getattr(_vs, _k)!r}, reported {_moved} -- it must be "
+          f"put back AND named, since the import announces only what it moved")
+# ORDER is load-bearing and invisible: `look` is only assignable to `None` once
+# the transform is already Standard, so `VIEW_PARITY` has to name the transform
+# FIRST and `pin_view_parity` has to walk it in order. A dict literal reordered
+# by a tidy-up would break colour parity with every arm above still green,
+# because they stage the transform first themselves.
+check("view_parity_pins_the_transform_before_the_look",
+      list(mod.VIEW_PARITY).index("view_transform")
+      < list(mod.VIEW_PARITY).index("look"),
+      f"{list(mod.VIEW_PARITY)} -- `look`'s valid values depend on the "
+      f"transform, so the transform is set first or the look assignment is a "
+      f"TypeError that `pin_view_parity` swallows")
+# ...and it is IDEMPOTENT: a second call moves nothing, which is what lets the
+# import report real changes instead of claiming to have altered a scene that
+# was already right.
+mod.pin_view_parity(bpy.context.scene)
+check("pinning_an_already_pinned_scene_reports_nothing",
+      mod.pin_view_parity(bpy.context.scene) == [],
+      "a no-op pin still reports changes -- the import would then announce it "
+      "moved settings it did not touch")
+check("the_scene_is_left_under_view_parity",
+      all(getattr(_vs, k) == v for k, v in mod.VIEW_PARITY.items()),
+      f"{ {k: getattr(_vs, k) for k in mod.VIEW_PARITY} }")
+
+# The import is what asserts it, since nothing else does and the button is gone.
+try:
+    _iexec = _tree_func("import_document.py", "execute",
+                        "IMPORT_OT_interchange_document")
+    check("the_import_pins_the_view_parity",
+          bool(_calls_named(_iexec, "pin_view_parity")),
+          "the import does not call pin_view_parity -- with the button retired "
+          "there is then NO route to correct colour, and #427's failure is "
+          "that AgX looks fine while regrading every pixel")
+except Exception as e:
+    check("the_import_pins_the_view_parity", False, repr(e))
+
+
+def _misplaced(cls, want_space):
+    """Every way a panel can fail to live where the rule says it does."""
+    bad = []
+    if getattr(cls, "bl_space_type", None) != want_space:
+        bad.append(f"bl_space_type={getattr(cls, 'bl_space_type', None)!r}")
+    if getattr(cls, "bl_region_type", None) != "UI":
+        bad.append(f"bl_region_type={getattr(cls, 'bl_region_type', None)!r}")
+    if getattr(cls, "bl_category", None) != mod_ws.TAB:
+        bad.append(f"bl_category={getattr(cls, 'bl_category', None)!r}")
+    # `bl_context` is the Properties editor's own field.  Left behind on a
+    # sidebar panel it is inert, and inert is how the next reader learns the
+    # wrong rule.
+    if getattr(cls, "bl_context", "") != "":
+        bad.append(f"bl_context={getattr(cls, 'bl_context', None)!r}")
+    return bad
+
+
+_wrong = {n: _misplaced(getattr(bpy.types, n), _HOMES[n][0])
+          for n in _roster if n in _HOMES}
+_wrong = {n: v for n, v in _wrong.items() if v}
+check("every_panel_lives_where_the_rule_says", not _wrong, str(_wrong))
+# Stated separately from the table, because THIS is the sentence the artist
+# said and the one a future reader will look for.
+check("no_panel_of_ours_is_registered_for_properties",
+      not [n for n in _roster
+           if getattr(bpy.types, n).bl_space_type == "PROPERTIES"],
+      str([n for n in _roster
+           if getattr(bpy.types, n).bl_space_type == "PROPERTIES"]))
+# The ratchet's second arm: the predicate itself, against a panel shaped
+# exactly like the six this landing moved.  Without it, `_misplaced` returning
+# `[]` unconditionally would read as nine panels in the right place.
+class _WasInProperties:
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "object"
+    bl_category = "Map"
+
+
+class _IsInTheSidebar:
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Map"
+
+
+check("the_placement_rule_still_catches_a_properties_panel",
+      len(_misplaced(_WasInProperties, "VIEW_3D")) == 3,
+      f"the yesterday-shaped panel scored {_misplaced(_WasInProperties, 'VIEW_3D')} "
+      f"-- it must be caught on space, region AND the leftover bl_context")
+check("the_placement_rule_passes_a_panel_that_obeys_it",
+      _misplaced(_IsInTheSidebar, "VIEW_3D") == [],
+      str(_misplaced(_IsInTheSidebar, "VIEW_3D")))
+# Order is per EDITOR now, so the old global 0-5 cannot survive: two panels in
+# different editors may share a number and two in the same one may not.
+# Asserted as a PERMUTATION rather than against the literals above, which would
+# only restate the table.
+for _sp in sorted({s for s, _ in _HOMES.values()}):
+    _there = {n: o for n, (s, o) in _HOMES.items() if s == _sp}
+    _live = {n: getattr(bpy.types, n, None) for n in _there}
+    check(f"bl_order_is_a_permutation_in_{_sp.lower()}",
+          all(c is not None and getattr(c, "bl_order", None) == _there[n]
+              for n, c in _live.items())
+          and sorted(_there.values()) == list(range(len(_there))),
+          f"{ {n: getattr(c, 'bl_order', None) for n, c in _live.items()} } "
+          f"vs {_there}")
+# NOTHING is DEFAULT_CLOSED now. The only closed panel was `What a push
+# carries`, and closing it was the compromise this pass replaced with a
+# deletion: reference material does not get a collapsed corner of the column,
+# it goes to the console. The artist's words were "move and UNCOLLAPSE the
+# controls", and the tab is now controls all the way down.
+_closed = [n for n in _roster
+           if "DEFAULT_CLOSED" in getattr(getattr(bpy.types, n),
+                                          "bl_options", set())]
+check("no_panel_opens_closed",
+      _closed == [],
+      f"{_closed} opens DEFAULT_CLOSED -- every panel in the tab is controls "
+      f"now, and a collapsed one hides a control rather than tidying prose")
+# Decision 8 -- "prefix where there is no tab, bare name where there is" --
+# under the new rule resolves to BARE EVERYWHERE, because every panel now sits
+# under a tab that already says `Map`.
+_prefixed = [(n, getattr(bpy.types, n).bl_label) for n in _roster
+             if getattr(bpy.types, n).bl_label.startswith("ExMateria Map")]
+check("no_panel_repeats_the_addon_name_under_the_Map_tab",
+      not _prefixed, str(_prefixed))
+
+# --- the map marker's own Transform: WITHDRAWN ------------------------------
+# Amendment 4 put Location / Rotation / Scale at the top of the tab, reading
+# them off `marker_in_scene` so they survived a lamp being selected.  The
+# artist has since withdrawn it -- *"we honestly don't really need it.  We can
+# just use the regular transform section where you need to select the object
+# to move it.  that's fine."* -- so the four arms that drove the block are
+# gone with it, and the two claims that OUTLIVE it are asserted where the
+# deletion is, beside `_HOMES`: the panel is not registered, and the bake
+# consequence it used to state now lives in `MAP_PT_lighting_bake`'s docstring.
 bpy.data.objects.remove(_lamp2, do_unlink=True)
 bpy.context.view_layer.objects.active = _prev_active2
 
-# --- Amendment 4: Paint is present exactly ONCE, always ---------------------
-# Registered only for `IMAGE_EDITOR`, Paint does not draw AT ALL in a layout
-# without one -- which is every factory workspace except `UV Editing` /
-# `Texture Paint` / `Shading` / `Compositing`.  So it is registered for
-# `VIEW_3D` too, and that copy polls itself away whenever `context.screen`
-# already holds an Image Editor.
+# --- Amendment 5: Paint draws in BOTH panes -------------------------------
+# Amendment 4 registered the viewport copy as a FALLBACK -- its reason to exist
+# was `says_where_the_sheet_went`, "you have no Image Editor, here is where the
+# sheet went" -- and against that reason it polled itself away wherever
+# `context.screen` already held an Image Editor.  Two arms here used to assert
+# that poll in both directions.
 #
-# The poll MUST NOT use `image_editor_spaces()`.  That helper deliberately
-# walks `bpy.data.screens` -- every screen in every workspace -- which is the
-# right answer to "can the sheet be loaded into an editor somewhere" and the
-# WRONG answer to "is one visible right now".  Pointed at the second question
-# it finds `UV Editing`'s Image Editor on a screen the artist is not looking at
-# and suppresses the viewport copy everywhere, re-introducing the exact defect
-# its own docstring says it was written to fix.
+# ADR-0186 Amendment 6 inverts the premise: after a conversion the sheet is not
+# an unwrap at all, and the MODEL is the paint surface.  The Map workspace has
+# an Image Editor by construction, so the poll put the brush controls in the
+# other pane from the thing being painted.  ADR-0185 Amendment 5 decision 9
+# deletes it, and the two arms are replaced rather than dropped.
 #
-# That is what the second arm below actually discriminates, which is why the
-# precondition is asserted first: with Image Editors reachable through
-# `bpy.data.screens`, a poll built on the helper answers False for a screen
-# that has none, and this arm goes red.
+# What made deleting it SAFE is that the poll conflated two questions, and the
+# second -- "should this copy explain where the sheet went" -- already has its
+# own guard inside `draw`: `if self.says_where_the_sheet_went and not free`.
+# So the control below asserts the guard's INPUT (there are free Image Editor
+# spaces for it to see); `tests/blender_convert.py` drives the guard itself and
+# asserts the hint really does stay silent.
 def _screen_ctx(screen):
     return type("_C", (), {"screen": screen})()
 
 
-check("the_paint_poll_arms_can_tell_the_two_questions_apart",
-      len(pnt.image_editor_spaces()) >= 4,
-      f"only {len(pnt.image_editor_spaces())} Image Editor(s) reachable "
-      f"through bpy.data.screens -- the arm below cannot distinguish a poll "
-      f"that walks them from one that reads context.screen")
+check("the_hint_guard_has_free_image_editor_spaces_to_see",
+      any(not protected for _, protected in pnt.image_editor_spaces()),
+      f"{len(pnt.image_editor_spaces())} Image Editor space(s) reachable "
+      f"through bpy.data.screens and none of them free -- with the poll gone "
+      f"the `not free` guard is the only thing withholding NO_EDITOR_HINT, "
+      f"and an arm that cannot see a free space cannot grade it")
 _scr_hit = _FakeScreen(False, ["VIEW_3D", "IMAGE_EDITOR", "OUTLINER"])
 _scr_miss = _FakeScreen(False, ["VIEW_3D", "OUTLINER"])
-try:
-    _p_hit = bool(pnt.MAP_PT_paint_view.poll(_screen_ctx(_scr_hit)))
-    _p_miss = bool(pnt.MAP_PT_paint_view.poll(_screen_ctx(_scr_miss)))
-except Exception as e:
-    _p_hit, _p_miss = repr(e), repr(e)
-check("the_viewport_paint_copy_stands_down_beside_an_image_editor",
-      _p_hit is False,
-      f"poll={_p_hit!r} on a screen that already shows the sheet -- Paint "
-      f"would be drawn twice in the Map workspace")
-check("the_viewport_paint_copy_draws_where_there_is_no_image_editor",
-      _p_miss is True,
-      f"poll={_p_miss!r} on a screen with no Image Editor -- Paint is "
-      f"unreachable from every factory workspace but four")
+check("the_viewport_paint_copy_no_longer_polls_itself_away",
+      "poll" not in vars(pnt.MAP_PT_paint_view),
+      f"MAP_PT_paint_view defines {sorted(k for k in vars(pnt.MAP_PT_paint_view) if not k.startswith('__'))!r} "
+      f"-- a poll here suppresses the panel in the very pane the model is "
+      f"painted in (Amendment 5 decision 9)")
+check("and_nothing_it_inherits_suppresses_it_either",
+      "poll" not in vars(pnt._PaintPanel),
+      "a poll on the shared body would take BOTH copies down with it")
 # The Image Editor copy has nothing to stand down FOR.
 check("the_image_editor_paint_copy_never_stands_itself_down",
       not hasattr(pnt.MAP_PT_paint, "poll")
@@ -3572,38 +3835,39 @@ check("the_hint_itself_is_not_deleted",
       isinstance(pnt.NO_EDITOR_HINT, str) and pnt.NO_EDITOR_HINT,
       "decision 3 would have deleted it; Amendment 4 keeps it")
 
-# --- Amendment 4: the interchange export is offered ONCE --------------------
+# --- the interchange export is offered ONCE ---------------------------------
 # "We already have the interchange format in the export drop down under file --
-# we don't need it twice."  The panel keeps the REPORT, which the File menu
-# cannot show; it loses the button, which the File menu already is.
-try:
-    _ex_draw = _tree_func("import_document.py", "draw", "MAP_PT_export")
-    _dupe = [n.lineno for n in _ast.walk(_ex_draw)
+# we don't need it twice."  `MAP_PT_export` used to hold this arm, drawing no
+# button and keeping the report; the artist has since deleted the panel too, so
+# the claim is now graded against EVERY panel we register rather than that one.
+# That is strictly stronger: the old arm passed the moment its subject was
+# deleted, and this one cannot.
+_ex_dupes = {}
+for _pn, (_pfile, _ptxt) in _PANEL_SOURCES.items():
+    try:
+        _pd = _tree_func(_pfile, "draw", _ptxt)
+    except Exception:
+        continue
+    _hits = [n.lineno for n in _ast.walk(_pd)
              if isinstance(n, _ast.Call)
              and getattr(n.func, "attr", None) == "operator"
              and n.args and isinstance(n.args[0], _ast.Constant)
              and n.args[0].value == "export_map.document"]
-    check("the_export_panel_does_not_repeat_the_File_menu_entry", not _dupe,
-          f"`export_map.document` still drawn at line(s) {_dupe} of "
-          f"MAP_PT_export.draw")
-except Exception as e:
-    check("the_export_panel_does_not_repeat_the_File_menu_entry", False, repr(e))
-# ...and the door it defers to has to actually be there, or the deletion leaves
-# no way to export at all.  `_draw_funcs` hangs off the DISPATCHER, not the
-# class (addon CLAUDE.md, "Menu wiring").
-check("the_File_Export_entry_the_panel_defers_to_exists",
+    if _hits:
+        _ex_dupes[_pn] = _hits
+check("no_panel_repeats_the_File_menu_export_entry", not _ex_dupes,
+      f"`export_map.document` is drawn in {_ex_dupes} -- the File menu already "
+      f"is that door, and a signpost is not a second one")
+# ...and the door everything defers to has to actually be there.  This was
+# already the only export button; with `MAP_PT_export` gone it is also the only
+# mention of export anywhere in the tab, so the arm carries more than it did.
+# `_draw_funcs` hangs off the DISPATCHER, not the class (addon CLAUDE.md,
+# "Menu wiring").
+check("the_File_Export_entry_everything_defers_to_exists",
       exp.menu_func in getattr(bpy.types.TOPBAR_MT_file_export.draw,
                                "_draw_funcs", []),
       str([getattr(f, "__name__", "?") for f in
            getattr(bpy.types.TOPBAR_MT_file_export.draw, "_draw_funcs", [])]))
-# The report is what the panel is FOR now, so it must still be drawn.
-try:
-    _rep_calls = _calls_named(_ex_draw, "_stored_report")
-    check("the_export_panel_still_shows_the_last_export", bool(_rep_calls),
-          "deleting the button took the report with it -- the toast is gone by "
-          "the time the artist looks up, which is why the store exists")
-except Exception as e:
-    check("the_export_panel_still_shows_the_last_export", False, repr(e))
 
 # --- Amendment 4: the workspace is write-once, and this is revision 2 -------
 # `ensure_on_import` looked a workspace up BY NAME and, finding one, switched
@@ -3675,21 +3939,33 @@ else:
 # **Refusals stay in-panel in full** -- that rule is untouched, and "in full"
 # means every refusal LINE, none dropped and none cut short.  A refusal is the
 # whole reason the report exists, so it is never behind a disclosure triangle.
+# Driven through the LIGHTING BAKE panel. `_stored_report` is shared and has
+# lost two of its three callers to the salience pass -- `MAP_PT_export` was
+# deleted outright, and `MAP_PT_live_push` dropped its call when the artist
+# ruled that a run's output is console output, not panel content. `_bake_report`
+# is the last caller, so the contract is graded there rather than retired with
+# the subjects that happened to be named first. Every arm below is about
+# `_stored_report`'s behaviour, which is unchanged.
+#
+# NOTE for whoever removes the bake's report next: this whole block, plus
+# `_stored_report` and `MAP_OT_copy_report`, goes with it. The claim would then
+# be the Log's alone, and needs an arm saying refusals reach it in full.
 _mk = exp.markers(bpy.context.scene)[0]
-_saved_rep = _mk.get("exmateria_map/last_export")
+_REP_KEY = "exmateria_map/last_bake"
+_saved_rep = _mk.get(_REP_KEY)
 _long_refusal = "REFUSE: " + "the reason lives at the end of the line, " * 5
 _planted = ([f"informational line {i}" for i in range(20)]
             + [f"REFUSE: reason {i}" for i in range(6)]
             + [_long_refusal])
-_mk["exmateria_map/last_export"] = json.dumps(_planted)
+_mk[_REP_KEY] = json.dumps(_planted)
 _rep_sink = _SinkLayout()
 try:
-    mod.MAP_PT_export.draw(_panel_shim(mod.MAP_PT_export, _rep_sink),
-                           bpy.context)
+    mod_bake.MAP_PT_lighting_bake.draw(
+        _panel_shim(mod_bake.MAP_PT_lighting_bake, _rep_sink), bpy.context)
     _rep_err = None
 except Exception as e:
     _rep_err = f"{type(e).__name__}: {e}"
-check("the_export_panel_drew_its_report", _rep_err is None, str(_rep_err))
+check("the_panel_drew_its_stored_report", _rep_err is None, str(_rep_err))
 _rep_labels = [r[1] for r in _rep_sink.drawn if r[0] == "label"]
 _want_ref = [ln for ln in _planted if ln.startswith("REFUSE")]
 check("every_refusal_is_drawn_in_the_panel_whole_and_in_order",
@@ -3722,9 +3998,9 @@ check("the_panel_draws_no_disclosure_prop",
            if r[0] == "prop" and r[2] == "exmateria_map_report_expanded"],
       str([r for r in _rep_sink.drawn if r[0] == "prop"]))
 if _saved_rep is None:
-    del _mk["exmateria_map/last_export"]
+    del _mk[_REP_KEY]
 else:
-    _mk["exmateria_map/last_export"] = _saved_rep
+    _mk[_REP_KEY] = _saved_rep
 
 # --- decision 6: the rig draws as a TABLE, not a list -----------------------
 # `Light 1 | Light 2 | Light 3` side by side -- ~24 rows to ~9, measured at the
@@ -3800,14 +4076,17 @@ class _TreeLayout:
         return [it for n in self.walk() for it in n.items]
 
 
+# The LIGHTING BAKE panel, which owns the rig since 2026-08-27. These arms are
+# about decision 6's three-column table and are unchanged by the move; only the
+# panel driven changed, which is what a move should cost a test.
 _rig_tree = _TreeLayout()
 try:
-    mod.MAP_PT_preview.draw(_panel_shim(mod.MAP_PT_preview, _rig_tree),
-                            bpy.context)
+    mod_bake.MAP_PT_lighting_bake.draw(
+        _panel_shim(mod_bake.MAP_PT_lighting_bake, _rig_tree), bpy.context)
     _rig_err = None
 except Exception as e:
     _rig_err = f"{type(e).__name__}: {e}"
-check("the_preview_panel_drew_for_the_rig_shape_arms", _rig_err is None,
+check("the_light_panel_drew_for_the_rig_shape_arms", _rig_err is None,
       str(_rig_err))
 # A row whose children are three columns, one light's controls in each.
 _tables = [[[p for k, p in c.items if k == "prop"]
@@ -4352,6 +4631,21 @@ def ensure_addon():
 
 
 def main():
+    # PREFLIGHT, before anything is built: no suite here may start a Blender
+    # without isolating it. This is the guard for the defect that had a test
+    # run overwrite the artist's installed addon -- see `blender_env`. It runs
+    # first because a green suite that installed over their Blender is worse
+    # than a red one.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from blender_env import audit_launchers
+    _offenders = audit_launchers()
+    if _offenders:
+        print("FAIL: a suite starts Blender without isolating it --")
+        for _o in _offenders:
+            print("   ", _o)
+        print("Add `env=isolated_env()` to the subprocess.run call "
+              "(tests/blender_env.py).")
+        sys.exit(1)
     TMP.mkdir(exist_ok=True)
     if REPORT.exists():
         REPORT.unlink()  # never grade on a stale report
@@ -4380,9 +4674,16 @@ def main():
                       .replace("@JSON@", str(staged))
                       .replace("@OUT@", str(REPORT))
                       .replace("@SAMPLES@", json.dumps(samples)))
+    # Isolate this Blender from the artist's OWN install. Without it the
+    # `addon_install` in the script above overwrites the addon they are
+    # clicking, and `addon_enable` then grades that copy rather than this
+    # tree. `--factory-startup` does NOT do this -- see `blender_env`.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from blender_env import isolated_env
     proc = subprocess.run([sys.argv[1] if len(sys.argv) > 1 else "blender",
                            "--background", "--factory-startup", "--python", str(script)],
-                          capture_output=True, text=True)
+                          capture_output=True, text=True,
+                          env=isolated_env())
     sys.stdout.write(proc.stdout)
     if proc.stderr:
         sys.stdout.write("\n[stderr]\n" + proc.stderr[-4000:])

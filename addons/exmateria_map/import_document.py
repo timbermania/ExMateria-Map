@@ -67,6 +67,8 @@ from bpy.types import (AddonPreferences, Menu, Operator, Panel,
 from . import png_indexed
 from .live_link import DEFAULT_HOST as LIVE_DEFAULT_HOST
 from .live_link import DEFAULT_PORT as LIVE_DEFAULT_PORT
+from .live_link import launch_command as live_launch_command
+from . import live_link
 
 FORMAT = "exmateria-map/interchange"
 #: What an ordinary export stamps. `version` is the OLDEST addon/`build` that
@@ -1687,20 +1689,39 @@ class MAP_AddonPreferences(AddonPreferences):
         description="Port of PCSX-Redux's Lua web server "
                     "(-webserver -webserver-port N)",
         default=LIVE_DEFAULT_PORT, min=1, max=65535)
-    # #606 part 1.  Two transports reach main RAM and they are NOT a speed
-    # choice: measured on a real geometry plan (2,682 runs, 12,460 bytes) the
-    # HTTP path is 0.182 s against Lua's 0.148 s, because the whole 2 MB comes
-    # back on every GET.  What HTTP buys is reach -- both endpoints are
-    # upstream pcsx-redux, so only the light rig's GTE half still needs our
-    # fork -- and a write longer than 65,535 bytes, which the Lua record format
-    # refuses outright.  Lua stays the default because the rig needs a Lua
-    # client anyway and it is the faster of the two for a push.
-    live_ram_over_http: BoolProperty(
-        name="Main RAM over HTTP",
-        description="Push geometry through /api/v1/cpu/ram/raw instead of the "
-                    "Lua bridge. Slightly slower, but works on a stock "
-                    "PCSX-Redux; the light rig's GTE half still needs the fork",
-        default=False)
+    # ONE answer, serving both routes. It used to be two -- a binary for the
+    # launch button and a working directory for the shim -- and that read as
+    # two things to configure when it is one folder wearing two hats. The
+    # binary is FOUND in it by name (`live_link.find_binary`), and the launch
+    # spawns with `cwd` set to it, which is what makes the two hats fit: the
+    # folder the emulator lives in is MADE to be the folder it runs in, so the
+    # `pcsx.lua` the shim writes there is the one its Lua editor reads.
+    #
+    # A folder with no emulator in it is still useful and is not refused: the
+    # shim only needs somewhere to write, so *Set up auto-load* works for
+    # someone whose PCSX-Redux runs from a folder it is not installed in. Only
+    # the launch button needs the executable, and it says so by name.
+    live_pcsx_dir: StringProperty(
+        name="PCSX-Redux folder",
+        description="The folder PCSX-Redux lives and runs in. Blender starts "
+                    "the emulator from here, and its Lua editor loads "
+                    "`pcsx.lua` from here at startup -- which is how the live "
+                    "link's handlers load with no launch flags at all",
+        subtype="DIR_PATH", default="")
+    # There is deliberately NO transport preference here.  `live_ram_over_http`
+    # stood in this spot from #606 part 1, when the HTTP path was the new thing
+    # and the packed-Lua walk was the default; part 2 flipped the default, and
+    # part 3 removed the switch, because "which transport" was never an
+    # artist's decision to make.  Its OFF position needed our pcsx-redux fork
+    # -- the Lua walk POSTs its program as a request body, which only the fork
+    # exposes to a handler -- so an artist on a stock emulator who unticked it
+    # got `lua/exec 404: URL Not found.`, a message with nothing in it pointing
+    # back at the box they had just clicked.  It bought them 34 ms.
+    #
+    # The Lua walk itself is not deleted: `apply` still runs it for any client
+    # with no `write`, which is what `tools/live_geometry.py` and
+    # `tools/live_map.py` construct on purpose.  They never read this
+    # preference, so removing it costs them nothing.
 
     def draw(self, context):
         # ADR-0185 decision 4.  Here and nowhere else: this is the one surface
@@ -1715,7 +1736,31 @@ class MAP_AddonPreferences(AddonPreferences):
         row = self.layout.row(align=True)
         row.prop(self, "live_host")
         row.prop(self, "live_port")
-        self.layout.prop(self, "live_ram_over_http")
+        # PCSX-Redux will not load the live link's Lua handlers by itself, and
+        # three routes get them in. Laid out worst-effort-last on purpose: the
+        # artist should take the first one that fits and never read the rest.
+        box = self.layout.box()
+        box.label(text="PCSX-Redux needs the live link's Lua handlers",
+                  icon="CONSOLE")
+
+        # One field, then the two things it enables -- laid out as ONE setup
+        # with two buttons rather than two setups, because that is what it is.
+        box.prop(self, "live_pcsx_dir")
+        row = box.row(align=True)
+        # 1. Blender launches it: nothing to remember, and the flags cannot be
+        #    got wrong. 2. Or make the artist's own double-click work, which
+        #    costs nothing per session and is why it is worth its config edit.
+        row.operator(MAP_OT_launch_pcsx.bl_idname, icon="PLAY")
+        row.operator(MAP_OT_setup_pcsx.bl_idname, icon="FILE_REFRESH")
+        if not self.live_pcsx_dir:
+            box.label(text="Set the folder above to use either button",
+                      icon="INFO")
+
+        # 3. Or the launch line, for anyone who starts it their own way.
+        col = box.column(align=True)
+        col.label(text="...or start PCSX-Redux yourself with:")
+        col.label(text=live_launch_command(self.live_port))
+        col.operator(MAP_OT_copy_launch_command.bl_idname, icon="COPYDOWN")
 
 
 def _prefs(context):
@@ -1827,6 +1872,16 @@ class IMPORT_OT_interchange_document(Operator):
         # 315/315.  The invariant is now graded directly, on the SWITCH, by that
         # harness's `import_lands_authority_off`.
         remember_dir(context, self.filepath)
+        # The scene has to be under `VIEW_PARITY` or the preview is a lie --
+        # see that constant. SAID, never silent: this changes a setting the
+        # artist did not touch, so an import that moves it names what it moved.
+        moved = pin_view_parity(context.scene)
+        if moved:
+            self.report({"INFO"},
+                        "colour management pinned for palette parity — "
+                        + "; ".join(moved))
+            for line in moved:
+                print(f"EXMATERIA-MAP: colour management {line}")
         from .workspace import ensure_on_import
         ensure_on_import(context)
         return {"FINISHED"}
@@ -1977,15 +2032,62 @@ def _preview_source_update(self, context):
     apply_preview_source(self)
 
 
-class MAP_OT_pin_view_transform(Operator):
-    """Pin the Standard view transform + sRGB display so the preview's
-    palette colours are unmodified (the ADR's rig trap; #427)."""
-    bl_idname = "exmateria_map.pin_view_transform"
-    bl_label = "Pin Standard view transform (preview parity)"
+#: The scene colour management an FFT map has to be looked at under, and the
+#: whole of it.
+#:
+#: `MAP_OT_pin_view_transform` used to be a BUTTON in the Preview panel that set
+#: the first of these four and nothing else. Reported from use: *"I don't
+#: understand this pin standard view thing -- do we really need it?"*  The
+#: effect yes, the button no, and the button was wrong anyway:
+#:
+#: - **The effect is not optional.** #427 measured that Blender reports only the
+#:   *current* item of `view_transform`, so `Standard` looks absent while AgX
+#:   quietly regrades every pixel -- and a neutral grey renders identically
+#:   under both, so eyeballing certifies nothing. Under AgX the sixteen swatches
+#:   in the Paint panel are not the sixteen colours the disc holds.
+#: - **The button set one of four.** Every harness in this package pins all
+#:   four (`blender_preview_source.py`, `blender_light_debug.py`,
+#:   `blender_lighting_calibration.py`); the operator set `view_transform`
+#:   alone, so an artist who pressed it still had a `look`, an exposure or a
+#:   gamma between them and the palette. The parity the suite proves existed
+#:   only inside the suite.
+#: - **Nothing else asserted it.** Not import, not the workspace build. The one
+#:   route to correct colour was a button whose label explains none of this.
+#:
+#: So it is asserted on IMPORT, where the addon already decides the artist's
+#: workspace, and it is the whole set. Presumptuous only if a `Map` document is
+#: something you would want to look at through a film emulation.
+VIEW_PARITY = {"view_transform": "Standard", "look": "None",
+               "exposure": 0.0, "gamma": 1.0}
 
-    def execute(self, context):
-        context.scene.view_settings.view_transform = "Standard"
-        return {"FINISHED"}
+
+def pin_view_parity(scene):
+    """Put `scene` under `VIEW_PARITY`, and report what it changed.
+
+    Returns the list of `name: was -> now` strings for the settings that were
+    NOT already right, so the import can say so rather than changing the
+    artist's scene silently. An empty list means the scene was already correct.
+
+    Never raises: a Blender version that drops one of these names must not take
+    the import down with it.
+    """
+    vs = getattr(scene, "view_settings", None)
+    if vs is None:
+        return []
+    changed = []
+    for name, want in VIEW_PARITY.items():
+        try:
+            was = getattr(vs, name)
+        except AttributeError:
+            continue
+        if was == want:
+            continue
+        try:
+            setattr(vs, name, want)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        changed.append(f"{name}: {was} -> {want}")
+    return changed
 
 
 class MAP_OT_clear_rig_override(Operator):
@@ -2140,12 +2242,32 @@ def unregister_badge():
 
 
 class MAP_PT_preview(Panel):
-    """`Map` sidebar, 3D viewport: the previewed state and its CLUT
-    provenance (§4)."""
+    """`Map` sidebar, 3D viewport: which state is on screen, and from what.
+
+    **The light half moved out** (2026-08-27).  Reported from use: *"the light
+    stuff in there should just go in the light panel -- those can be authored
+    now, right?  they shouldn't be in a preview panel."*  Right on both counts.
+    The rig is not a view of the document, it is a part of it that this addon
+    lets you WRITE: every state carries a `MAP_PG_rig_override`, the sliders are
+    editable, `rig_is_dirty` decides it, and a dirty rig makes `build` write 45
+    bytes to the disc (decision 27).  A control that authors bytes sitting in a
+    panel called *Preview* mislabels the most consequential thing in the tab.
+
+    So the provenance label, the rig table, the Reset button and the light-debug
+    pair are all in `MAP_PT_lighting_bake` now -- the panel that already owned
+    lamps, the bake and `Lamp authority`, which makes it the single place light
+    is discussed instead of the second of two.
+
+    What is left is genuinely preview, and all of it is: the state on screen,
+    where its CLUT came from, and whether you are looking at the painting or at
+    the compiled map.  None of it reaches the disc.
+    """
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "Map"
     bl_label = "Preview"
+    # Renumbered again when `What a push carries` was deleted; the
+    # remaining five keep their relative order.
     bl_order = 1
 
     def draw(self, context):
@@ -2171,37 +2293,9 @@ class MAP_PT_preview(Panel):
         else:
             layout.label(text="no CLUT in this state "
                               "(sidecar PLTE, untrusted-colour)", icon="ERROR")
-        ov = find_override(ob, i)
-        src = ob.get("exmateria_map/light_source") or ""
-        rig = state_own_rig(st)
-        # DIRTY, not present.  Every state carries an Override now, so keying
-        # this on existence told the artist their untouched map was not the
-        # ROM's -- and made the four honest branches below unreachable.
-        if ov is not None and rig_is_dirty(ov):
-            layout.label(text="light: EDITED — this is NOT the ROM's rig; "
-                              "export WRITES it (decision 27)",
-                         icon="GREASEPENCIL")
-        elif not src:
-            layout.label(text="light: flat 1.0 — no light rig in this "
-                              "arrangement (albedo only)", icon="ERROR")
-        elif st.get(AUTHORED_RIG):
-            layout.label(text=f"light: AUTHORED rig — this document already "
-                              f"carries one for {src}, and `build` writes it",
-                         icon="GREASEPENCIL")
-        elif rig:
-            layout.label(text=f"light: 45-byte rig from {src}", icon="LIGHT_SUN")
-        else:
-            layout.label(text=f"light: rig BORROWED from {src} "
-                              f"(same night/weather)", icon="INFO")
-        _draw_rig(layout, ob, i, ov, rig, src)
+        # The painting, or the map the game will show.  The last thing in this
+        # panel that is about VIEW and nothing else.
         layout.prop(ob, "exmateria_map_preview_source", expand=True)
-        layout.prop(ob, "exmateria_map_light_debug")
-        row = layout.row()
-        # Godot's boost exaggerates modes 2/3/4 only, and so does the graph
-        row.enabled = ob.exmateria_map_light_debug in ("2", "3", "4")
-        row.prop(ob, "exmateria_map_light_boost")
-        layout.separator()
-        layout.operator(MAP_OT_pin_view_transform.bl_idname)
 
 
 def marker_in_scene(context):
@@ -2259,99 +2353,36 @@ def state_menu_label(states, i):
     return f"State {i}: {st.get('resource')} ({st.get('kind')})"
 
 
-class MAP_PT_map_transform(Panel):
-    """`Map` sidebar, 3D viewport, FIRST: the map marker's own transform.
-
-    ADR-0185 Amendment 4. *"I want to be able to see translate and other key
-    parameters at the same time."* This is not a request for something new: in
-    Properties ▸ Object, `Location` / `Rotation` / `Scale` and our five panels
-    were **already co-visible**, and vacating Properties would have taken that
-    away. A sidebar cannot show two tabs at once, so Blender's `Item` tab is not
-    an answer -- and `Item` follows the SELECTION, which is the annoyance this
-    amendment exists to remove.
-
-    **It carries a stated consequence, which is why it is a decision and not a
-    convenience.** The transform is invisible to export -- `export_document`
-    never reads it, and every `.location` in the two document modules is
-    shader-node placement -- but it **is** an input to the lighting bake:
-    `lighting_bake` bakes `ob.matrix_world @ v.co` and reads `lamp.matrix_world`
-    for direction. Rotating or scaling the map relative to its lamps changes the
-    baked normals, and those reach the disc. A control that looks cosmetic and
-    silently writes bytes is exactly what this package says out loud.
-
-    **Lamp transforms are not drawn here.** That is the parked *"rig directions
-    as viewport gizmos"* work -- blocked on `lamp_authority` meaning
-    normals-only and on the measured `(-x, y, -z)` non-identity in
-    `spherical_to_cartesian . vector_to_sphere` -- arriving unannounced.
-    """
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "Map"
-    bl_label = "Transform"
-    bl_order = 0
-
-    @classmethod
-    def poll(cls, context):
-        return marker_in_scene(context) is not None
-
-    def draw(self, context):
-        ob = marker_in_scene(context)
-        if ob is None:
-            return
-        layout = self.layout
-        layout.label(text=ob.name, icon="OBJECT_DATA")
-        col = layout.column()
-        col.prop(ob, "location")
-        col.prop(ob, "rotation_euler")
-        col.prop(ob, "scale")
-        # WRAPPED at 44, the width `paint.NO_EDITOR_HINT` already uses: a
-        # Blender label does not wrap and the sidebar is 280 px whatever the
-        # pane, so one long line renders as `the export ignore...se reach the
-        # disc`. Measured in the headful probe's own frame -- a consequence the
-        # artist cannot read is not stated.
-        for k, chunk in enumerate(textwrap.wrap(
-                "the export ignores this; the lighting BAKE does not \u2014 "
-                "moving the map relative to its lamps changes the baked "
-                "NORMALS, and those reach the disc", 44)):
-            layout.label(text=chunk, icon="INFO" if k == 0 else "BLANK1")
-
-
-class MAP_PT_export(Panel):
-    """`Map` sidebar, 3D viewport: the last export's report.
-
-    Its own panel rather than a tail on the preview's, which is what made the
-    preview panel three unrelated jobs in one column. It carries no BUTTON:
-    `File ▸ Export ▸ ExMateria Map Interchange` is the same operator, and
-    reported from use, *"we already have the interchange format in the export
-    drop down under file -- we don't need it twice."* What the File menu
-    cannot show is the report, which is what this panel is for.
-    """
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "Map"
-    bl_label = "Export"
-    bl_order = 5
-
-    @classmethod
-    def poll(cls, context):
-        return marker_in_scene(context) is not None
-
-    def draw(self, context):
-        layout = self.layout
-        ob = marker_in_scene(context)
-        if ob is None:
-            return
-        # NO button.  Reported from use: "we already have the interchange
-        # format in the export drop down under file -- we don't need it twice."
-        # `File > Export > ExMateria Map Interchange` is the same operator, and
-        # a signpost is not a second door.
-        layout.label(text="File \u25b8 Export \u25b8 ExMateria Map Interchange",
-                     icon="EXPORT")
-        # Export-v1 §5: the operator reports refusals, warnings and the
-        # divergence list to the N-panel as well as to the operator report,
-        # because an operator report is gone by the time the artist looks.
-        # THIS is what the panel is for; the File menu cannot show it.
-        _stored_report(layout, ob, "exmateria_map/last_export", "Last export:")
+# --- Transform and Export: DELETED from the tab (2026-08-27) ----------------
+#
+# Both were Amendment 4 decisions and both were withdrawn by the artist who
+# asked for them, in the salience pass that put `Push to PCSX-Redux` first.
+#
+# `MAP_PT_map_transform` -- *"we honestly don't really need it.  We can just
+# use the regular transform section where you need to select the object to
+# move it.  that's fine."*  Amendment 4's case for it was co-visibility with
+# our panels, which the artist has now priced against the column space and
+# decided against.  Blender's own `Item` tab and Properties > Object still
+# hold Location / Rotation / Scale; nothing is unreachable, it is one tab
+# away and follows the selection, which the artist has accepted.
+#
+# **The stated consequence survives the panel.**  The map's transform is
+# invisible to export but IS an input to the lighting bake -- `lighting_bake`
+# bakes `ob.matrix_world @ v.co` -- so moving or scaling the map relative to
+# its lamps still changes the baked NORMALS, and those still reach the disc.
+# Deleting the panel deletes the warning label, not the effect; the sentence
+# moved to `lighting_bake`'s own docstring, which is the panel that owns the
+# bake and the one place it is now said.
+#
+# `MAP_PT_export` -- *"for export we can just do file->export so just get rid
+# of that."*  It had no button already; what it carried was the last export's
+# report.  That is NOT lost: `export_document` records every Outcome to the
+# **Log** (`report_log.record`, ADR-0185 decision 5), a Text datablock the
+# `Map` workspace already opens in its own pane -- selectable, in sequence,
+# and holding refusals in full, which a panel label never could.  The panel
+# was the second, worse copy of it.  If the Log pane is ever removed, this
+# deletion has to be reconsidered with it: `report_log` is now the only
+# surface an export refusal reaches after the toast expires.
 
 
 #: The Text datablock the reports are written to. A Blender label cannot be
@@ -2360,6 +2391,136 @@ class MAP_PT_export(Panel):
 #: editor. `map.copy_report` keeps this one current and puts the same text on
 #: the clipboard, which is the one-click answer.
 REPORT_TEXT_NAME = "exmateria-map report"
+
+
+class MAP_OT_launch_pcsx(Operator):
+    """Start PCSX-Redux with the live link's handlers already loaded.
+
+    The route with nothing for the artist to remember: the flags are built
+    from the preferences and the handler path is the addon's own, so the two
+    things that go wrong -- a forgotten `-dofile`, and a port that disagrees
+    with the one the push will dial -- cannot.
+    """
+
+    bl_idname = "exmateria_map.launch_pcsx"
+    bl_label = "Launch PCSX-Redux"
+    bl_description = ("Start PCSX-Redux with -webserver and the live link's "
+                      "Lua handlers loaded")
+    bl_options = {"REGISTER", "INTERNAL"}
+
+    def execute(self, context):
+        import subprocess
+        prefs = getattr(context.preferences.addons.get(__package__),
+                        "preferences", None)
+        port = int(getattr(prefs, "live_port", LIVE_DEFAULT_PORT))
+        host = getattr(prefs, "live_host", "") or live_link.DEFAULT_HOST
+        # Already up is not a failure, but a second emulator on one port is:
+        # the newcomer loses the bind and the artist gets a window the push
+        # cannot reach, with nothing on screen saying why.
+        if live_link.LuaClient(host=host, port=port).ping():
+            self.report({"INFO"},
+                        f"PCSX-Redux is already answering on {host}:{port}")
+            return {"FINISHED"}
+        directory = bpy.path.abspath(getattr(prefs, "live_pcsx_dir", "") or "")
+        try:
+            argv = live_link.launch_argv(directory, port)
+        except live_link.LiveLinkError as e:
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
+        try:
+            # Detached, and with `cwd` set to that same folder. This is the
+            # line that makes ONE preference serve both routes: the emulator's
+            # working directory is not something we discover, it is something
+            # we decide -- so a `pcsx.lua` written there is one it will read.
+            subprocess.Popen(argv, cwd=directory, start_new_session=True)
+        except OSError as e:
+            self.report({"ERROR"}, f"could not start {argv[0]}: {e}")
+            return {"CANCELLED"}
+        self.report({"INFO"}, " ".join(argv))
+        return {"FINISHED"}
+
+
+class MAP_OT_setup_pcsx(Operator):
+    """Make a plain double-click of PCSX-Redux load the handlers.
+
+    Two halves, and one without the other does nothing. `pcsx.lua` in the
+    emulator's working directory is read by its Lua editor at startup and run
+    on that pane's first draw -- but only when the pane is *shown*, which is a
+    setting in the emulator's own `pcsx.json`. Measured both ways: with the
+    pane hidden the emulator is up and answering `cpu/ram` while `lua/ping` is
+    a 404.
+
+    The shim is two lines that load the addon's real handler file, so
+    reinstalling the addon updates the handlers without anyone re-running this.
+    """
+
+    bl_idname = "exmateria_map.setup_pcsx"
+    bl_label = "Set up auto-load"
+    bl_description = ("Write pcsx.lua into PCSX-Redux's working directory and "
+                      "tick its 'Show Lua editor', so a normal launch loads "
+                      "the live link's handlers with no flags")
+    bl_options = {"REGISTER", "INTERNAL"}
+
+    def execute(self, context):
+        prefs = getattr(context.preferences.addons.get(__package__),
+                        "preferences", None)
+        port = int(getattr(prefs, "live_port", LIVE_DEFAULT_PORT))
+        host = getattr(prefs, "live_host", "") or live_link.DEFAULT_HOST
+        # PCSX-Redux writes `pcsx.json` when it exits, so a running one would
+        # throw the setting away on close and this would look like it silently
+        # failed. Refuse while it is up rather than be undone by it.
+        if live_link.LuaClient(host=host, port=port).ping():
+            self.report({"ERROR"},
+                        "close PCSX-Redux first -- it rewrites its settings "
+                        "when it exits and would discard this")
+            return {"CANCELLED"}
+        directory = bpy.path.abspath(getattr(prefs, "live_pcsx_dir", "") or "")
+        try:
+            path = live_link.install_shim(directory)
+            ticked = live_link.enable_lua_editor()
+        except (live_link.LiveLinkError, OSError, ValueError) as e:
+            self.report({"ERROR"}, str(e))
+            return {"CANCELLED"}
+        # Say what the artist is about to SEE, not just what was written. The
+        # Lua editor pane appearing on next launch looks like something went
+        # wrong, and it is the opposite: that pane's `draw` is what runs
+        # `pcsx.lua`, so closing it silently un-does this whole setup. Nobody
+        # would guess that from "wrote pcsx.lua".
+        self.report({"INFO"},
+                    f"wrote {path}"
+                    + ("; ticked 'Show Lua editor'" if ticked
+                       else "; 'Show Lua editor' was already on")
+                    + ". Start PCSX-Redux normally -- no flags needed. Its Lua "
+                      "editor pane will be open and must STAY open: that pane "
+                      "is what runs the handlers. (The Launch button does not "
+                      "need it -- it passes -dofile instead.)")
+        return {"FINISHED"}
+
+
+class MAP_OT_copy_launch_command(Operator):
+    """Put the pcsx-redux launch line on the clipboard.
+
+    `-dofile <handlers>` is the step that gets forgotten, because there is no
+    auto-load to forget it *into*: stock pcsx-redux persists no startup script
+    between runs, so the flag has to be typed every session. The addon knows
+    the port and it knows where its own `.lua` landed when the zip was
+    installed -- an artist should not have to reconstruct either.
+    """
+
+    bl_idname = "exmateria_map.copy_launch_command"
+    bl_label = "Copy launch command"
+    bl_description = ("Copy the pcsx-redux command line -- including "
+                      "-dofile pcsx_handlers.lua -- to the clipboard")
+    bl_options = {"REGISTER", "INTERNAL"}
+
+    def execute(self, context):
+        prefs = context.preferences.addons.get(__package__)
+        port = getattr(getattr(prefs, "preferences", None),
+                       "live_port", LIVE_DEFAULT_PORT)
+        line = live_launch_command(port)
+        context.window_manager.clipboard = line
+        self.report({"INFO"}, line)
+        return {"FINISHED"}
 
 
 class MAP_OT_copy_report(Operator):
@@ -2564,14 +2725,21 @@ def register():
         description="The light rig, per map state. Exposed on every state; "
                     "export writes only the ones the artist moved something on")
     bpy.utils.register_class(MAP_OT_copy_report)
+    # The three that get PCSX-Redux's Lua handlers loaded. They must be HERE:
+    # `classes` at the foot of this file registers nothing -- it is a list
+    # nothing iterates -- so adding an operator to it and not to this block
+    # produces a `layout.operator()` that silently draws NOTHING. That is
+    # exactly what happened to all three of these, and a recording-layout test
+    # cannot see it, because such a layout accepts any id string. The harness
+    # now resolves every id a panel emits against `bpy.ops`.
+    bpy.utils.register_class(MAP_OT_copy_launch_command)
+    bpy.utils.register_class(MAP_OT_launch_pcsx)
+    bpy.utils.register_class(MAP_OT_setup_pcsx)
     bpy.utils.register_class(IMPORT_OT_interchange_document)
     bpy.utils.register_class(MAP_OT_set_preview_state)
-    bpy.utils.register_class(MAP_OT_pin_view_transform)
     bpy.utils.register_class(MAP_OT_clear_rig_override)
     bpy.utils.register_class(MAP_MT_preview_state)
-    bpy.utils.register_class(MAP_PT_map_transform)
     bpy.utils.register_class(MAP_PT_preview)
-    bpy.utils.register_class(MAP_PT_export)
     register_badge()
     # Blender 5.x removed `bpy.utils.menu_registry`; built-in menus take
     # `.append()` directly.  The fallback covers the 4.x line the addon still
@@ -2590,14 +2758,14 @@ def unregister():
         from bpy.utils import menu_registry
         menu_registry.remove(bpy.types.TOPBAR_MT_file_import, menu_func)
     unregister_badge()
-    bpy.utils.unregister_class(MAP_PT_export)
     bpy.utils.unregister_class(MAP_PT_preview)
-    bpy.utils.unregister_class(MAP_PT_map_transform)
     bpy.utils.unregister_class(MAP_MT_preview_state)
     bpy.utils.unregister_class(MAP_OT_clear_rig_override)
-    bpy.utils.unregister_class(MAP_OT_pin_view_transform)
     bpy.utils.unregister_class(MAP_OT_set_preview_state)
     bpy.utils.unregister_class(IMPORT_OT_interchange_document)
+    bpy.utils.unregister_class(MAP_OT_setup_pcsx)
+    bpy.utils.unregister_class(MAP_OT_launch_pcsx)
+    bpy.utils.unregister_class(MAP_OT_copy_launch_command)
     bpy.utils.unregister_class(MAP_OT_copy_report)
     del bpy.types.Object.exmateria_map_rig_overrides
     bpy.utils.unregister_class(MAP_PG_rig_override)
@@ -2610,12 +2778,21 @@ def viewport_draw_overlays(self, context):
     pass
 
 
+#: Every class this module registers -- and a LIE by omission until #606 part 3,
+#: because nothing iterates it. `register()` above hand-writes its calls, so
+#: this tuple looks like the registration list and is not one; three operators
+#: were added here, not there, and drew nothing at all in the real panel.
+#:
+#: Kept, not deleted, because `blender_live_push.py` now holds it against
+#: `register()` -- a class in one and not the other is the defect, and the arm
+#: names which direction. Add to BOTH.
 classes = (MAP_AddonPreferences, MAP_PG_rig_override,
-           MAP_OT_copy_report,
+           MAP_OT_copy_report, MAP_OT_copy_launch_command,
+           MAP_OT_launch_pcsx, MAP_OT_setup_pcsx,
            IMPORT_OT_interchange_document, MAP_OT_set_preview_state,
-           MAP_OT_pin_view_transform, MAP_OT_clear_rig_override,
+           MAP_OT_clear_rig_override,
            MAP_MT_preview_state,
-           MAP_PT_map_transform, MAP_PT_preview, MAP_PT_export)
+           MAP_PT_preview)
 
 if __name__ == "__main__":
     register()

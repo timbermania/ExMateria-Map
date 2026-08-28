@@ -313,14 +313,20 @@ def test_adding_geometry_repacks_without_disturbing_what_was_painted():
 @needs_corpus
 def test_repeated_repacks_do_not_ratchet_the_sheet_upward():
     """Decision 10 re-packs on EVERY geometry edit, so the drift a re-pack
-    leaves behind compounds over a map's editing life.
+    leaves behind compounds over a map's editing life.  A map that creeps
+    upward eventually meets decision 11's refusal for no reason except
+    having been edited.
 
-    A chart's islands land adjacent after packing and merge on the next
-    pass.  While the merged hull is exactly tiled that is free, and MAP053
-    is flat from the first pass -- but it is not free everywhere, and a map
-    that creeps upward will eventually meet decision 11's refusal for no
-    reason except having been edited.  Measured over 8 re-packs: MAP053 0.0%,
-    MAP022 +1.4%, MAP001 +3.0%.  This is the ceiling, not a target.
+    Under Amendment 1 there WAS drift, and this arm bounded it at 5%: a
+    chart's islands landed adjacent after packing and merged on the next
+    pass, and a merged hull is only free while it is exactly tiled --
+    measured MAP053 0.0%, MAP022 +1.4%, MAP001 +3.0% over 8 re-packs.
+
+    Decision 22 removes the mechanism rather than bounding it.  An island is
+    one polygon, so `islands()` re-derives the SAME rectangles from the
+    re-packed UVs however they landed, and there is nothing left to merge.
+    Measured 0.0% on all three, so the assertion is exact -- a bound would
+    now pass on drift that cannot happen.
     """
     for num in (1, 22, 53):
         doc, sheets = dump(MAP_DIR, num, 0)
@@ -332,9 +338,37 @@ def test_repeated_repacks_do_not_ratchet_the_sheet_upward():
             polys, art, sheet = V.repack(polys, art, sheet)
         last = sum(w * h for w, h in (i["size"] for i in V.islands(polys)))
 
-        assert last <= first * 1.05, (
+        assert last == first, (
             f"MAP{num:03d}.a0 grew {100 * (last / first - 1):.1f}% over 8 "
             f"re-packs: {first:,} -> {last:,} texels")
+
+
+def polygons_reading(ps):
+    """(page, x, y) -> the set of polygon indices that read that texel."""
+    owners = {}
+    for i, p in enumerate(ps):
+        if "uv" not in p:
+            continue
+        us = [c[0] for c in p["uv"]]
+        vs = [c[1] for c in p["uv"]]
+        for x in range(min(us), max(us) + 1):
+            for y in range(min(vs), max(vs) + 1):
+                owners.setdefault((p["texture_page"], x, y), set()).add(i)
+    return owners
+
+
+def polygons_reading(ps):
+    """(page, x, y) -> the set of polygon indices that read that texel."""
+    owners = {}
+    for i, p in enumerate(ps):
+        if "uv" not in p:
+            continue
+        us = [c[0] for c in p["uv"]]
+        vs = [c[1] for c in p["uv"]]
+        for x in range(min(us), max(us) + 1):
+            for y in range(min(vs), max(vs) + 1):
+                owners.setdefault((p["texture_page"], x, y), set()).add(i)
+    return owners
 
 
 @needs_corpus
@@ -389,6 +423,42 @@ def test_conversion_removes_every_shared_texel_between_charts():
             assert after == 0, (
                 f"MAP{num:03d}.a{a}: {after:,} texels still read by two "
                 f"charts after conversion")
+
+
+@needs_corpus
+def test_conversion_removes_every_shared_texel_between_polygons():
+    """ADR-0186 Amendment 6 decision 22, corpus-wide.
+
+    The strictly stronger form of the chart oracle above: after a conversion
+    **no texel is read by two POLYGONS**, not merely by two charts.  A chart
+    that folds reads one rectangle from several of its own faces, and the
+    chart oracle cannot see that -- 8.5% of charts do it, and a stroke on one
+    of those faces repaints a distant one, mirrored.
+
+    Polygon identity needs no carrying, unlike chart identity: a polygon is
+    its own index before and after, so the partition cannot go finer under
+    the reader's feet.
+    """
+    for num in (1, 4, 22, 53):
+        for a in dumpable_arrangements(MAP_DIR, num):
+            doc, sheets = dump(MAP_DIR, num, a)
+            polys = doc.get("polygons") or []
+            if not any("uv" in p for p in polys) or not sheets:
+                continue
+
+            plane, palettes = a_state_with_both(doc, sheets)
+            if plane is None:
+                continue
+            before = sum(1 for s in polygons_reading(polys).values()
+                         if len(s) > 1)
+            converted, _, _ = V.convert(polys, plane, palettes)
+            after = sum(1 for s in polygons_reading(converted).values()
+                        if len(s) > 1)
+
+            assert before > 0, f"MAP{num:03d}.a{a} shares nothing: no control"
+            assert after == 0, (
+                f"MAP{num:03d}.a{a}: {after:,} texels still read by two "
+                f"polygons after conversion")
 
 
 # ---------------------------------------------------------------------------

@@ -781,18 +781,274 @@ class TransportError(LiveLinkError):
     """The emulator did not answer, or answered with a Lua error."""
 
 
-class LuaClient:
-    """`PCSX.getMemPtr()` is a writable pointer into main RAM; this reaches it.
+class NoHandlerError(TransportError):
+    """The emulator answered, and has no such Lua handler -- a `404`.
 
-    The fork exposes its Lua VM at `/api/v1/lua/exec` when launched with
-    `-webserver -webserver-port <N> -dofile <handlers.lua>`.
+    Its own class because it is the failure with the most useful diagnosis and
+    the least obvious one: the emulator is up, every upstream endpoint works,
+    and the artist simply left `-dofile pcsx_handlers.lua` off the launch
+    line. Folded into a generic transport failure it reads as "no emulator",
+    which sends them to look at the wrong thing entirely.
+    """
+
+
+import json                                              # noqa: E402
+import os                                                # noqa: E402
+import os.path                                           # noqa: E402
+
+#: The Lua handlers this module needs, as installed. Shipped inside the addon
+#: package, so a zip install carries it and this path resolves for the artist
+#: exactly as it does here.
+HANDLERS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "pcsx_handlers.lua")
+
+
+def launch_command(port: int = DEFAULT_PORT, handlers: str = "",
+                   binary: str = "pcsx-redux") -> str:
+    """The command that brings up an emulator this module can talk to."""
+    return (f"{binary} -webserver -webserver-port {port} "
+            f"-dofile {handlers or HANDLERS}")
+
+
+#: What the emulator is called, in the order worth trying.
+#:
+#: Both routes need the SAME folder and neither needs a second answer from the
+#: artist -- so the binary is found in it by name rather than asked for. That
+#: works because when Blender launches the emulator it also SETS the working
+#: directory, so "where pcsx-redux lives" and "where pcsx-redux runs" are made
+#: to be one folder instead of being two questions.
+BINARY_NAMES = ("pcsx-redux", "pcsx-redux.exe", "PCSX-Redux.exe",
+                "pcsx-redux.AppImage",
+                os.path.join("PCSX-Redux.app", "Contents", "MacOS",
+                             "PCSX-Redux"))
+
+
+def find_binary(directory: str) -> str:
+    """The emulator inside `directory`, or `""`.
+
+    Executable-checked, not just present: a `pcsx-redux` that is a README or a
+    half-finished download is not the thing to hand to `Popen`, and the failure
+    it produces there names a permission error rather than the folder.
+    """
+    if not directory:
+        return ""
+    for name in BINARY_NAMES:
+        path = os.path.join(directory, name)
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return ""
+
+
+def launch_argv(directory: str, port: int = DEFAULT_PORT,
+                handlers: str = "") -> list[str]:
+    """`launch_command` as an argv, for spawning it rather than printing it.
+
+    Takes the FOLDER, not the binary: one answer from the artist serves both
+    routes, because the caller runs this with `cwd=directory` and thereby makes
+    that folder the emulator's working directory -- the same folder the
+    `pcsx.lua` shim goes in.
+
+    A list, not a string through a shell: both paths in it are real filesystem
+    paths and routinely contain spaces. Quoting them for a shell is a bug
+    waiting for the first artist with `Program Files` in the way; not having a
+    shell at all is not.
+    """
+    if not directory:
+        raise LiveLinkError(
+            "set the PCSX-Redux folder first -- the folder the emulator lives "
+            "and runs in")
+    binary = find_binary(directory)
+    if not binary:
+        raise LiveLinkError(
+            f"no PCSX-Redux executable in {directory} (looked for "
+            + ", ".join(BINARY_NAMES[:3]) + "). Point the preference at the "
+            "folder the emulator is in")
+    return [binary, "-webserver", "-webserver-port", str(port),
+            "-dofile", handlers or HANDLERS]
+
+
+# --- getting the handlers loaded without a terminal --------------------------
+# `-dofile` on the launch line is the reliable route and the one `launch_argv`
+# takes. It is not the only one, and the other costs the artist nothing per
+# session, which is why it is here.
+#
+# The emulator's GUI **Lua editor** reads a file called `pcsx.lua` from its
+# working directory when the GUI is constructed, and runs it on the pane's first
+# draw (`Auto run` defaults on). Measured 2026-08-27 on a plain double-click
+# launch with no flags at all: `lua/ping` answered `pong` and `lua/gte` wrote
+# two registers.
+#
+# **The pane has to be visible.** `draw()` is what runs the buffer, and it is
+# called only when *Show Lua editor* is ticked -- a setting that persists in the
+# emulator's `pcsx.json`. Measured with it off, same file, same directory: the
+# emulator was up (`cpu/ram` answered 200) and `lua/ping` was `404 URL Not
+# found`. So the setup here writes both halves, and half of it silently
+# accomplishes nothing.
+
+#: The name the Lua editor looks for. Not ours to choose.
+SHIM_NAME = "pcsx.lua"
+
+#: How a shim we wrote is told from a file the artist owns.
+#:
+#: Load-bearing, because the Lua editor's `Auto save` also defaults ON: that
+#: file is a document the emulator writes back, so it may be the artist's own
+#: work. Overwriting it would destroy something they cannot get back, and the
+#: only thing standing between us and that is recognising our own handwriting.
+SHIM_MARKER = "-- exmateria-map live link"
+
+
+def shim_text(handlers: str = "") -> str:
+    """A `pcsx.lua` that loads the addon's real handler file.
+
+    A two-line shim rather than a copy of the handlers, so the file the
+    emulator runs is the file the addon ships: reinstall the addon and the
+    handlers change under this without anyone having to remember to re-copy
+    them. It also keeps the emulator's `Auto save` away from anything but two
+    lines we can rewrite at will.
+    """
+    return (f"{SHIM_MARKER} -- rewritten by the addon; edit the addon's\n"
+            "-- pcsx_handlers.lua instead, which is what this loads.\n"
+            f'Support.extra.dofile("{handlers or HANDLERS}")\n')
+
+
+def install_shim(directory: str, handlers: str = "") -> str:
+    """Write the shim into `directory`; return the path. Refuses to clobber.
+
+    A `pcsx.lua` without our marker is the artist's own Lua, kept there by the
+    editor's `Auto save` -- and it is the one file in this whole flow that
+    holds something the addon cannot regenerate.
+    """
+    if not directory:
+        raise LiveLinkError(
+            "set the PCSX-Redux folder first -- it is the folder the emulator "
+            "runs from, which is where its Lua editor looks for `pcsx.lua`")
+    path = os.path.join(directory, SHIM_NAME)
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            existing = f.read()
+        if SHIM_MARKER not in existing:
+            raise LiveLinkError(
+                f"{path} already exists and is not ours. PCSX-Redux's Lua "
+                "editor saves that file, so it is probably your own script -- "
+                "move it aside, or add this line to it yourself:\n"
+                f'    Support.extra.dofile("{handlers or HANDLERS}")')
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(shim_text(handlers))
+    return path
+
+
+def settings_path() -> str:
+    """The emulator's `pcsx.json`, where *Show Lua editor* persists."""
+    if os.name == "nt":
+        base = os.environ.get("APPDATA", "")
+        return os.path.join(base, "pcsx-redux", "pcsx.json") if base else ""
+    home = os.path.expanduser("~")
+    return os.path.join(home, ".config", "pcsx-redux", "pcsx.json")
+
+
+def enable_lua_editor(settings: str = "") -> bool:
+    """Tick *Show Lua editor* in the emulator's settings. `True` if it changed.
+
+    Editing another application's config file, which is worth being uneasy
+    about -- but the shim without this accomplishes exactly nothing, and an
+    artist who has to be told "now find this checkbox" has not been spared the
+    thing we were sparing them.
+
+    It rewrites one key and leaves the file otherwise as found. The emulator
+    saves `pcsx.json` on exit, so a running emulator would discard this; the
+    operator that calls it checks for one first.
+    """
+    path = settings or settings_path()
+    if not path or not os.path.exists(path):
+        raise LiveLinkError(
+            f"no PCSX-Redux settings at {path or '(unknown)'} -- start it "
+            "once so it writes them, then press this again")
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    gui = data.setdefault("gui", {})
+    if gui.get("ShowLuaEditor") is True:
+        return False
+    gui["ShowLuaEditor"] = True
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    return True
+
+
+#: The longest URL a **stock** pcsx-redux web server will route, in bytes.
+#:
+#: `BUFFER_SIZE = 256` in `src/core/web-server.cc`, and `onUrl` parses each read
+#: chunk as a whole URI instead of accumulating -- so when the request line runs
+#: past the first read, the server resolves a truncated path and answers
+#: `404 URL Not found`. **The failure mode is a silent 404, not an error**,
+#: which is why this is a named refusal here rather than something to discover.
+#:
+#: Bisected on a live emulator 2026-08-27: a 251-byte URL runs the handler and a
+#: 252-byte one 404s. The bound is on the whole request line, not the URL --
+#: `POST` (one byte longer than `GET`) moves the cliff to 250, measured -- so the
+#: rule is `len(method) + 1 + len(url) <= 255`. 251 is therefore the ceiling for
+#: the GETs this module makes, and only for those.
+URL_LIMIT = 251
+
+
+class LuaClient:
+    """The emulator's Lua VM over HTTP: `/api/v1/lua/<handler>`.
+
+    Upstream pcsx-redux, not our fork -- `LuaExecutor` and the `/api/v1/lua/`
+    prefix are both stock. What the handlers themselves do is ours, and they
+    ship with the addon as `pcsx_handlers.lua`:
+
+        pcsx-redux -webserver -webserver-port <N> -dofile pcsx_handlers.lua
+
+    **A handler can only be reached through the URL.** On stock a POST body is
+    not exposed to Lua at all, an urlencoded POST arrives with `req.form` empty,
+    and a multipart POST hands over the part *headers* with the values
+    concatenated. So `call` is a GET and `URL_LIMIT` is the whole payload
+    budget; `exec` below, which POSTs a body, works only on the fork.
     """
 
     def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
         self.host, self.port = host, port
         self.base = f"http://{host}:{port}/api/v1/lua"
 
+    def call(self, handler: str, query: str = "",
+             timeout: float = 30.0) -> str:
+        """`GET /api/v1/lua/<handler>?<query>`, the body as text.
+
+        The length check is the point: over `URL_LIMIT` the server does not
+        fail, it routes somewhere else and 404s, and a caller that built the
+        query from a plan would read that as "the handler is missing".
+        """
+        url = f"{self.base}/{handler}" + (f"?{query}" if query else "")
+        path = url[len(f"http://{self.host}:{self.port}"):]
+        if len(path) > URL_LIMIT:
+            raise LiveLinkError(
+                f"a {len(path)}-byte URL for lua/{handler} is past the "
+                f"{URL_LIMIT}-byte ceiling a stock pcsx-redux routes; it would "
+                "come back as a silent 404. Split the request")
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as r:
+                return r.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            body = (e.read() or b"")[:400].decode("utf-8", "replace")
+            if e.code == 404:
+                raise NoHandlerError(
+                    f"pcsx-redux is running on {self.host}:{self.port} but has "
+                    f"no `{handler}` Lua handler -- relaunch it with\n    "
+                    + launch_command(self.port)) from e
+            raise TransportError(f"lua/{handler} {e.code}: {body}") from e
+        except (urllib.error.URLError, OSError) as e:
+            raise TransportError(
+                f"no emulator answering on {self.host}:{self.port} ({e}). "
+                "Launch pcsx-redux with -webserver and load a battle.") from e
+
     def exec(self, code: str, timeout: float = 180.0) -> str:
+        """Run arbitrary Lua. **Fork-only** -- stock does not expose the body.
+
+        Kept because `tools/live_*.py` push multi-KB Lua programs that could
+        never fit in a URL, and those tools run against the fork on purpose.
+        Nothing on the addon's own path calls this: `apply` prefers
+        `client.write` and `apply_gte` goes through `call`.
+        """
         req = urllib.request.Request(
             self.base + "/exec", data=code.encode("utf-8"), method="POST",
             headers={"Content-Type": "application/octet-stream"})
@@ -807,15 +1063,43 @@ class LuaClient:
                 f"no emulator answering on {self.host}:{self.port} ({e}). "
                 "Launch pcsx-redux with -webserver and load a battle.") from e
 
-    def ping(self) -> bool:
+    def check(self) -> str:
+        """`""` when a push can start, otherwise **why not**, for an artist.
+
+        Three states, not two, and the middle one is the point. `-dofile` is
+        the step artists forget, and an emulator running without it answers
+        every upstream endpoint perfectly and 404s ours -- so a gate that only
+        knew "reachable / not reachable" would report "no emulator answering"
+        about an emulator that is plainly on their screen, and send them to
+        check a port that was never the problem.
+
+        Answered by `ping` rather than by the connection alone for the same
+        reason: proving the web server is listening does not prove the light
+        rig has a route, and the difference would otherwise surface halfway
+        through a push.
+        """
         try:
-            with urllib.request.urlopen(self.base + "/ping", timeout=2.0) as r:
-                return "pong" in r.read().decode("utf-8", "replace")
-        except (urllib.error.URLError, OSError):
-            return False
+            if "pong" in self.call("ping", timeout=2.0):
+                return ""
+            return (f"{self.host}:{self.port} answered the live link's ping "
+                    "with something else -- is that a pcsx-redux?")
+        except NoHandlerError as e:
+            return str(e)
+        except LiveLinkError:
+            return (f"no emulator answering on {self.host}:{self.port} -- "
+                    "launch it and load a battle:\n    "
+                    + launch_command(self.port))
+
+    def ping(self) -> bool:
+        """`check()` as a bool, for callers that only gate on it."""
+        return not self.check()
 
     def read(self, address: int, length: int) -> bytes:
-        """`length` bytes of main RAM from `address`."""
+        """`length` bytes of main RAM from `address`. **Fork-only** (`exec`).
+
+        `RamClient.read` is the stock answer and the addon's default; this one
+        survives for `tools/live_*.py`.
+        """
         o = address - RAM_BASE
         if o < 0 or o + length > RAM_BYTES:
             raise LiveLinkError(
@@ -839,10 +1123,12 @@ class RamClient:
     bytes to a bounds-checked `memcpy` and gets the whole 2 MB back in one GET.
 
     **Both endpoints are upstream pcsx-redux**, not our fork's -- which is the
-    point of the port: only the light rig's GTE half (`apply_gte`, control
-    registers `cnt13-15` / `cnt16-20`) genuinely needs the fork, because those
-    are not `m_wram` and no HTTP endpoint reaches them. So a session runs this
-    for RAM and keeps a `LuaClient` for the rig.
+    point of the port, and why this is the addon's default transport. The light
+    rig's GTE half (`apply_gte`, control registers `cnt13-15` / `cnt16-20`) is
+    still a `LuaClient`, because those are not `m_wram` and no HTTP endpoint
+    reaches them -- but since #606 part 2 it is a GET against a handler that
+    ships with the addon, so a session running this for RAM and a `LuaClient`
+    for the rig is a session on a **stock** emulator.
 
     Measured [LIVE] 2026-08-27 on a Gariland battle: A/B/A through this client
     round-trips exactly, and the Lua window sees the same bytes.
@@ -1014,8 +1300,17 @@ def apply(client, writes: list[tuple[int, bytes]]) -> int:
     Transport-agnostic since #606 part 1: it delegates to `client.write` when
     the client has one (`RamClient`), and otherwise runs the packed-Lua walk
     below. Every caller -- geometry, metadata, packets, counts, palettes -- is
-    untouched by the swap. `apply_gte` is the one leg that cannot move: the GTE
-    control registers are not `m_wram` and no HTTP endpoint reaches them.
+    untouched by the swap. `apply_gte` is the one leg that cannot move onto
+    `/api/v1/cpu/ram/raw`: the GTE control registers are not `m_wram` and no
+    HTTP endpoint reaches them, so it goes through a Lua handler instead.
+
+    The packed-Lua walk below is the **fork** path -- it POSTs its program as a
+    request body, which stock does not expose to Lua. It is kept, not
+    deprecated: `tools/live_geometry.py`, `tools/live_map.py` and the audits in
+    `tests/` construct a `LuaClient` on purpose, and it is the faster of the
+    two. Nothing the addon's button does reaches it -- the operator builds a
+    `RamClient` unconditionally -- so there is no longer a preference that can
+    send an artist down a path their emulator cannot serve.
 
     Zero is the answer when the caller pushes bytes that are already there,
     and that is the whole point: `selfcheck()` pushes the engine's own bytes
@@ -1166,6 +1461,76 @@ def diagnose_selfcheck(results: dict) -> tuple[bool, list[str]]:
         "map, or something else pushed to this emulator (reload the "
         "savestate), or this rig's address arithmetic is wrong. Nothing was "
         "written."]
+
+
+#: Which of a bucket's arrays each planned field is written into. `metadata`
+#: is not a third array -- it is bytes 6-7 of the POSITION array's vertices --
+#: so it shares `positions`' extent, and a table that gave it one of its own
+#: would be inventing an array the engine does not have.
+PLAN_ARRAY = {"positions": "positions", "metadata": "positions",
+              "normals": "normals"}
+
+
+def array_extent(bucket: str, field: str) -> tuple[int, int]:
+    """`[base, end)` in main RAM of the array `(bucket, field)` is written to.
+
+    `end` is the array's own end, from ADR-0004 decision 28's capacities --
+    not the loaded map's slice. A slice is what a descriptor declares and it
+    moves per map; the array is the engine's, fixed, and is the thing a write
+    must not leave.
+    """
+    base = getattr(SINKS[bucket], PLAN_ARRAY[field])
+    if base is None:
+        raise LiveLinkError(
+            f"{bucket} has no {field} array -- it is unlit by construction.")
+    return base, base + ENGINE_CAPACITY[bucket] * POLYGON_STRIDE[bucket]
+
+
+def check_plan_bounds(plans: dict[tuple[str, str], list]) -> list[str]:
+    """Prove every planned address lands inside the array it names.
+
+    The self-check for the mode where RAM does NOT hold the document's bytes.
+    `selfcheck` proves the addresses by their CONTENT, which is the strongest
+    thing this build can say and is unavailable the moment the point is to
+    replace what is loaded. This is what is left: the addresses are still
+    checked, against the one fact about them that does not depend on which map
+    is loaded -- the engine's arrays are fixed-capacity and engine-global
+    (ADR-0004 decision 28), so a write outside one is corruption whatever is
+    in RAM.
+
+    Say plainly what it does not do. A wrong stride, a wrong vertex offset or
+    a wrong field mask that happens to stay inside the array passes this and
+    would have failed `selfcheck`. It is a bound, not a proof of correctness.
+    """
+    proved = []
+    for (bucket, field), writes in sorted(plans.items()):
+        if not writes:
+            continue
+        base, end = array_extent(bucket, field)
+        lo = min(a for a, _ in writes)
+        hi = max(a + len(d) for a, d in writes)
+        proved.append((bucket, field, lo, hi,
+                       sum(len(d) for _, d in writes)))
+        if lo < base or hi > end:
+            raise LiveLinkError(
+                f"bounds proof FAILED: the {bucket} {field} plan writes "
+                f"[0x{lo:08X}, 0x{hi:08X}) and that array is "
+                f"[0x{base:08X}, 0x{end:08X}) -- "
+                f"{ENGINE_CAPACITY[bucket]} slots of "
+                f"{POLYGON_STRIDE[bucket]} bytes. Writing outside it is not a "
+                "wrong picture, it is memory corruption. Nothing was written.")
+    if not proved:
+        return ["bounds proof: NOTHING was planned, so nothing was bounded"]
+    return ["bounds proof: "
+            + "; ".join(f"{b} {f} {n:,} byte(s) into "
+                        f"[0x{lo:08X}, 0x{hi:08X})"
+                        for b, f, lo, hi, n in proved),
+            "  this is WEAKER than the content self-check it replaced, and "
+            "the difference is not cosmetic: it proves only that the writes "
+            "land inside the engine's arrays. A wrong stride, a wrong vertex "
+            "offset or a wrong field mask that stays inside one passes here "
+            "and would have been caught there. Nothing checked WHICH map is "
+            "loaded -- replacing it is what you asked for"]
 
 
 def read_descriptor_block(client: LuaClient) -> bytes:
@@ -1366,22 +1731,64 @@ def plan_rig_gte(rig: dict) -> list[tuple[int, int]]:
     return out
 
 
+def gte_queries(writes: list[tuple[int, int]],
+                budget: int = URL_LIMIT - len("/api/v1/lua/gte?")
+                ) -> list[str]:
+    """A write list as the fewest `index=value` query strings that fit.
+
+    Split by **measured length**, not by a pair count: a pair is 3 to 13 bytes
+    wide depending on the value, so any fixed count is either wasteful or --
+    the direction that matters -- occasionally over the ceiling, where the
+    answer is a silent 404. Today's rig is eight registers in one request; this
+    is what keeps a rig that grows to fifty a slower push rather than a mystery.
+    """
+    out: list[str] = []
+    for index, value in writes:
+        pair = f"{index}={value}"
+        if out and len(out[-1]) + 1 + len(pair) <= budget:
+            out[-1] += "&" + pair
+        else:
+            out.append(pair)
+    return out
+
+
 def apply_gte(client: LuaClient, writes: list[tuple[int, int]]) -> int:
     """Write GTE control registers. A different transport from `apply`.
 
-    `apply` walks `PCSX.getMemPtr()`; these are cop2 control registers, which
-    live in `PCSX.getRegisters().CP2C`. Keeping them apart is the honest shape:
-    a RAM write survives in the map's data and a register write does not, so
-    the two have different lifetimes and a caller should know which it made.
+    `apply` walks main RAM; these are cop2 control registers, which live in
+    `PCSX.getRegisters().CP2C`. Keeping them apart is the honest shape: a RAM
+    write survives in the map's data and a register write does not, so the two
+    have different lifetimes and a caller should know which it made.
+
+    `GET /api/v1/lua/gte?<index>=<u32>&...`, against the `gte` handler in the
+    addon's own `pcsx_handlers.lua`. It used to POST Lua source, which is the
+    one thing a stock pcsx-redux cannot receive; the guards below are older
+    than the transport and are what make the query string safe to build.
+
+    The handler's reply is the count it wrote, and it is checked. A value it
+    cannot parse -- a negative, anything not `%d+` -- is skipped there in
+    silence, so an unchecked count is the difference between a rig that failed
+    and a rig that half-applied and looked fine.
     """
     for index, value in writes:
         if not 0 <= index <= 31:
             raise LiveLinkError(f"cop2 control register {index} does not exist")
         if not 0 <= value <= 0xFFFFFFFF:
             raise LiveLinkError(f"0x{value:X} is not a 32-bit value")
-    body = " ".join(f"r.CP2C.r[{i}] = {v}" for i, v in writes)
-    client.exec(f"local r = PCSX.getRegisters() {body} return \"{len(writes)}\"")
-    return len(writes)
+    if not writes:
+        return 0
+    written = 0
+    for query in gte_queries(writes):
+        reply = client.call("gte", query).strip()
+        try:
+            written += int(reply)
+        except ValueError:
+            raise TransportError(
+                f"lua/gte answered {reply[:80]!r}, not a count") from None
+    if written != len(writes):
+        raise TransportError(
+            f"lua/gte wrote {written} of {len(writes)} register(s)")
+    return written
 
 
 def packet_witnesses(client, descriptor: Descriptor,
@@ -1491,19 +1898,29 @@ CLUT_BLOCK_INERT_TWIN = CLUT_BLOCK_BASE_COPY
 CLUT_ANIMATED_MEASURED = (13, 14, 15)
 
 
-def plan_palettes(palettes) -> list[tuple[int, bytes]]:
-    """Writes for `map_states[].palettes`, one per declared CLUT row.
+def clut_rows(palettes) -> list[tuple[int, bytes]]:
+    """`map_states[].palettes` as `(row index, BGR555 bytes)`, one per declared
+    row -- the packing, with no address in it.
 
     Decision 10: **push only what the document declares.** `None` plans
     nothing -- 38.5% of corpus states carry no palettes of their own and render
     with a keyed partner's, so a null is a normal document, and refusing the
     whole press for one would strand a state whose SHEET is perfectly pushable.
-    A short row writes only the entries it has, for the same reason: what it
+    A short row yields only the entries it has, for the same reason: what it
     does not declare is not ours to zero (#496 -- zero is the worst fill).
 
-    A row at a time rather than one 512-byte write because a row is the unit
+    A row at a time rather than one 512-byte blob because a row is the unit
     everything else here happens to: a refusal names one, the readback reports
     one, and the engine's animation overwrites one.
+
+    **This is separate from `plan_palettes` because the palettes have two
+    sinks, not one.** `plan_palettes` aims these rows at `CLUT_BLOCK` in main
+    RAM and `live_vram.plan_clut` aims the SAME rows at VRAM's CLUT column;
+    both are needed and which one reaches the screen depends on the map (see
+    `plan_palettes`). Packing them twice would be two chances to write
+    different colours for one document field, and the divergence would surface
+    as *"the palettes are wrong on some maps"* -- the hardest possible symptom
+    to trace back to a planner.
     """
     if not palettes:
         return []
@@ -1521,9 +1938,30 @@ def plan_palettes(palettes) -> list[tuple[int, bytes]]:
             raise LiveLinkError(
                 f"CLUT row {i} declares {len(row)} entries and a row holds "
                 f"{CLUT_ENTRIES}")
-        out.append((CLUT_BLOCK + i * CLUT_ROW_BYTES,
-                    b"".join(int(w).to_bytes(2, "little") for w in row)))
+        out.append((i, b"".join(int(w).to_bytes(2, "little") for w in row)))
     return out
+
+
+def plan_palettes(palettes) -> list[tuple[int, bytes]]:
+    """The RAM half of the palette push: `clut_rows` aimed at `CLUT_BLOCK`.
+
+    **This sink is correct on 42 resources of 169 and inert on the other 127**,
+    and that is the whole shape of this leg. `CLUT_BLOCK` reaches VRAM because
+    the palette ANIMATION re-uploads it, entry by entry, every frame -- so on a
+    map whose `0x70` chunk carries an animation a write here is durable and
+    wins over anything written to VRAM directly. On a map without one, nothing
+    re-uploads the block after map load and a write here is byte-perfect and
+    invisible. Measured [LIVE] 2026-08-27 on Orbonne (`MAP062.8`, no
+    animation): this block matched the document 0 of 512 bytes off while all
+    16 VRAM CLUT rows still held Orbonne's, and nothing ever moved them.
+
+    So the caller pushes **both** sinks (`live_vram.plan_clut` is the other),
+    and neither is a fallback for the other: on the 42 this one wins the next
+    frame, on the 127 the VRAM one is the only thing the artist can see. See
+    `docs/live-link-v1.md` §2.3.
+    """
+    return [(CLUT_BLOCK + i * CLUT_ROW_BYTES, data)
+            for i, data in clut_rows(palettes)]
 
 
 def _clut_words(row, index: int) -> list[int]:

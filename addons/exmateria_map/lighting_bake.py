@@ -956,11 +956,24 @@ def _bake_report(layout, ob):
 
 class MAP_PT_lighting_bake(bpy.types.Panel):
     """`Map` sidebar, 3D viewport: seed the lamps, bake them back into the
-    map."""
+    map.
+
+    **The map's own transform is an input to this bake**, and this docstring is
+    where that now lives.  `bake_normals` works in world space -- it reads
+    `ob.matrix_world @ v.co` for the geometry and `lamp.matrix_world` for the
+    direction -- so moving, rotating or scaling the map RELATIVE to its lamps
+    changes the baked normals, and those reach the disc.  `MAP_PT_map_transform`
+    used to say so beside an editable transform block, in a panel the artist has
+    since removed from the tab; the block is gone, the consequence is not.  An
+    artist who moves the map with Blender's own `Item` tab while `Lamp
+    authority` is on is authoring bytes, and this is the panel that owns them.
+    """
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "Map"
     bl_label = "Lighting Bake"
+    # Renumbered again when `What a push carries` was deleted; the
+    # remaining five keep their relative order.
     bl_order = 4
 
     @classmethod
@@ -990,7 +1003,69 @@ class MAP_PT_lighting_bake(bpy.types.Panel):
         else:
             layout.label(text=f"{n} lamp(s) in this map's collection, "
                               f"not in charge", icon="INFO")
+        _draw_rig_block(layout, ob)
         _bake_report(layout, ob)
+
+
+def _draw_rig_block(layout, ob):
+    """The 45-byte rig: where this state's came from, and the table that edits
+    it.  MOVED here from `MAP_PT_preview` (2026-08-27).
+
+    *"The light stuff in there should just go in the light panel -- those can be
+    authored now, right?  they shouldn't be in a preview panel."*  They can, and
+    that is exactly why: `rig_is_dirty` on an Override makes `build` write 45
+    bytes (ADR-0185 decision 27), so these sliders AUTHOR and the panel they sat
+    in said *Preview*.
+
+    The body is unchanged -- the same four provenance branches, the same
+    `_draw_rig`, the same light-debug pair.  ADR-0185's landing 2 (decision 7,
+    the label-choice-out-of-`draw` refactor) rewrites these same lines and asks
+    for *"a diff in which the only thing that changed is where the panel
+    lives"*.  This is that diff; landing 2 is still parked and still separate.
+
+    Keyed on the PREVIEWED state, because the rig is per state and that is the
+    state on screen.  Reads the marker the same way this panel's `poll` does.
+    """
+    from .import_document import (AUTHORED_RIG, _draw_rig, find_override,
+                                  rig_is_dirty, state_own_rig)
+    if "exmateria_map/preview_state" not in ob:
+        return
+    try:
+        states = json.loads(ob["exmateria_map/map_states"])
+    except (KeyError, ValueError, TypeError):
+        return
+    if not states:
+        return
+    i = int(ob["exmateria_map/preview_state"])
+    st = states[i] if i < len(states) else {}
+    ov = find_override(ob, i)
+    src = ob.get("exmateria_map/light_source") or ""
+    rig = state_own_rig(st)
+    # DIRTY, not present.  Every state carries an Override now, so keying this
+    # on existence told the artist their untouched map was not the ROM's -- and
+    # made the four honest branches below unreachable.
+    if ov is not None and rig_is_dirty(ov):
+        layout.label(text="light: EDITED — this is NOT the ROM's rig; "
+                          "export WRITES it (decision 27)",
+                     icon="GREASEPENCIL")
+    elif not src:
+        layout.label(text="light: flat 1.0 — no light rig in this "
+                          "arrangement (albedo only)", icon="ERROR")
+    elif st.get(AUTHORED_RIG):
+        layout.label(text=f"light: AUTHORED rig — this document already "
+                          f"carries one for {src}, and `build` writes it",
+                     icon="GREASEPENCIL")
+    elif rig:
+        layout.label(text=f"light: 45-byte rig from {src}", icon="LIGHT_SUN")
+    else:
+        layout.label(text=f"light: rig BORROWED from {src} "
+                          f"(same night/weather)", icon="INFO")
+    _draw_rig(layout, ob, i, ov, rig, src)
+    layout.prop(ob, "exmateria_map_light_debug")
+    row = layout.row()
+    # Godot's boost exaggerates modes 2/3/4 only, and so does the graph
+    row.enabled = ob.exmateria_map_light_debug in ("2", "3", "4")
+    row.prop(ob, "exmateria_map_light_boost")
 
 
 classes = (MAP_OT_seed_rig_lamps, MAP_OT_restore_imported_normals,

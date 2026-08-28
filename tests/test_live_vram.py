@@ -30,6 +30,7 @@ for p in (str(ROOT), str(ROOT / "addons" / "exmateria_map")):
     if p not in sys.path:
         sys.path.insert(0, p)
 
+import live_link as L                      # noqa: E402  -- the RAM half
 import live_vram as VR                      # noqa: E402
 
 #: The addresses measured on the live Gariland battle, as `derive_addresses`
@@ -170,12 +171,82 @@ def test_the_clut_block_is_read_from_the_derived_address():
     assert got[:32] == b"\x00" * 32 and got[13 * 32:14 * 32] == b"\x0d" * 32
 
 
-def test_this_module_offers_no_way_to_write_a_palette():
-    """A guard on the correction itself. `plan_palettes` used to live here, and
-    a caller that still finds it would push into a sink that reverts before the
-    next frame -- which reads as "the palettes leg does not work" rather than
-    as "it is aimed at the wrong memory"."""
-    assert not hasattr(VR, "plan_palettes")
+# --- ...and WRITTEN, because on 127 maps of 169 nothing else does ----------
+# This block replaces `test_this_module_offers_no_way_to_write_a_palette`,
+# which asserted `not hasattr(VR, "plan_palettes")`. That guard held a real
+# decision -- a VRAM CLUT write is reverted within 50 ms -- and the decision
+# was measured on Gariland, which is one of the **42** corpus resources whose
+# `0x70` chunk carries a palette ANIMATION. The per-frame re-upload IS that
+# animation running; on the other **127** nothing re-uploads the block at all,
+# a VRAM CLUT write sticks indefinitely, and a RAM-only palette push never
+# reaches the screen. Measured [LIVE] on Orbonne (MAP062.8, no animation):
+# the RAM block matched the document 0 of 512 bytes off and all 16 VRAM rows
+# still held Orbonne's.
+#
+# So the module writes both sinks, and the guard is converted rather than
+# deleted (the shape `92a587bcd` used): what it protects now is that the two
+# planners cannot DIVERGE, which is the failure two sinks actually have.
+
+
+def test_a_clut_row_is_planned_at_the_derived_address():
+    """One rectangle per declared row, 16 entries wide, at the derived block.
+
+    A row rather than one 512-byte rectangle for the same reason the RAM sink
+    is a row at a time: a row is the unit a refusal names, the readback
+    reports, and the engine's animation overwrites.
+    """
+    rows = [(0, b"\xAA" * 32), (13, b"\xBB" * 32)]
+    rects = VR.plan_clut(rows, MEASURED)
+    assert [(r.x, r.y, r.width, r.height) for r in rects] == [
+        (0, 480, 16, 1), (13 * 16, 480, 16, 1)]
+    assert [r.label for r in rects] == ["CLUT row 0", "CLUT row 13"]
+    assert rects[1].data == b"\xBB" * 32
+
+
+def test_a_clut_plan_follows_the_derivation_and_not_the_constant():
+    """Decision 5 at the CLUT rows, the same as at the sheet. `CLUT_Y` is what
+    the derivation is CHECKED against, never what the push runs on -- a map
+    that loaded its block somewhere else must be written where IT says."""
+    at = MEASURED._replace(clut_x=64, clut_y=496)
+    rc, = VR.plan_clut([(2, b"\x01" * 32)], at)
+    assert (rc.x, rc.y) == (64 + 2 * 16, 496)
+
+
+def test_a_short_row_writes_only_the_entries_it_declares():
+    """#496: what the document does not declare is not ours to zero. The
+    rectangle narrows instead, which is also what keeps `check_rect` honest --
+    a 16-word body in a 4-word rectangle is a 400 from the real fork."""
+    rc, = VR.plan_clut([(1, b"\x01\x02" * 4)], MEASURED)
+    assert (rc.width, rc.height) == (4, 1)
+    VR.check_rect(rc)
+
+
+def test_the_two_sinks_carry_the_SAME_bytes_for_a_row():
+    """The guard this file now keeps. Two sinks for one field is two chances
+    to write different colours, and the artist would see the RAM block on the
+    42 animating maps and the VRAM rows on the other 127 -- so a divergence
+    would look like "the palettes are wrong on some maps", the single hardest
+    symptom to trace back to a planner.
+
+    `live_link.plan_palettes` is the RAM half; both are driven off the one
+    `clut_rows` packing, and this is what says so.
+    """
+    palettes = _clut()
+    ram = L.plan_palettes(palettes)
+    vram = VR.plan_clut(L.clut_rows(palettes), MEASURED)
+    assert len(ram) == len(vram) == 16
+    for (address, ram_bytes), rc in zip(ram, vram):
+        row = (address - L.CLUT_BLOCK) // L.CLUT_ROW_BYTES
+        assert rc.label == f"CLUT row {row}"
+        assert rc.data == ram_bytes
+
+
+def test_a_clut_rectangle_is_refused_before_it_is_posted():
+    """A row index past the block would paint into whatever VRAM holds to the
+    right of the CLUT column. `plan_clut` is where that is caught, because the
+    caller downstream of it is `apply`, which POSTs."""
+    with pytest.raises(VR.VramError):
+        VR.plan_clut([(16, b"\x00" * 32)], MEASURED)
 
 
 # --- the readback (decisions 3 and 8) ---------------------------------------
@@ -289,28 +360,91 @@ def test_a_clut_block_that_is_not_at_x_zero_is_derived_as_such():
     assert at.clut_x == 80                              # 5 * 16 px
 
 
-def test_one_witness_disagreeing_about_the_SHEET_is_a_refusal():
-    """The sheet's arm of the same guard. The CLUT arm below fires on a CLUT
-    dissenter and would pass just as well with the sheet's comparison deleted
-    -- two fields, two refusals, and one test cannot stand for both."""
+def test_a_SMALL_minority_no_longer_costs_the_whole_sheet():
+    """Decision 5's refusal, as amended 2026-08-27 (#646).
+
+    Measured through the button on a live Orbonne Monastery (MAP062): after the
+    push, **380** of MAP022 a0's 385 witnesses put the sheet at (768, 0) and
+    **five** put it at (768, 256). One dissenter was a refusal, so the artist
+    got the whole sheet-and-palette leg withheld over five polygons of 385 --
+    the geometry swapped and the picture kept the map it replaced.
+
+    The corpus says the majority is never in doubt: `texture_byte6_high_nibble`
+    over all 169 textured resources finds **23** carrying more than one, always
+    a tiny minority, worst case **18 of 539** on `MAP039.9`, and **never a
+    near-split**. So "the packets are not describing the layout this module
+    believes in" -- the premise the blanket refusal rested on -- is false for
+    this shape.
+    """
+    w = _witnesses()
+    for i in (55, 60, 61, 100, 101):
+        w[i] = (w[i][0], w[i][1] | 0x10, w[i][2], w[i][3])
+    at = VR.derive_addresses(w)
+    assert (at.sheet_x, at.sheet_y) == (768, 0)
+    assert at.sheet_dissent == 5
+    assert at.witnesses == 385
+
+
+def test_the_SHEET_arm_counts_a_lone_dissenter_and_refuses_a_real_split():
+    """The sheet's arm of the guard, both sides of the new boundary.
+
+    The CLUT arm below fires on a CLUT dissenter and would pass just as well
+    with the sheet's comparison deleted -- two fields, two answers, and one
+    test cannot stand for both.
+
+    Below `DISSENT_LIMIT` the majority address is returned and the dissenter is
+    COUNTED, because that is a map with a second texture-page band and refusing
+    costs the artist the whole leg. Above it nothing has changed: no shipped
+    map reaches a tenth (worst case 3.3%), so a plan built on the winner would
+    be a plan built on a layout the packets do not describe.
+    """
     w = _witnesses()
     w[100] = (w[100][0], (w[100][1] + 1) & 0xFFFF, w[100][2], w[100][3])
+    at = VR.derive_addresses(w)
+    assert (at.sheet_x, at.sheet_y) == (768, 0) and at.sheet_dissent == 1
+    assert at.clut_dissent == 0, "a sheet dissenter must not count as a CLUT one"
+
+    for i in range(60):                      # 60 of 385 is 16%, over the limit
+        w[i] = (w[i][0], (w[i][1] + 1) & 0xFFFF, w[i][2], w[i][3])
     with pytest.raises(VR.VramError) as exc:
         VR.derive_addresses(w)
-    assert "texture sheet" in str(exc.value) and "polygon 100" in str(exc.value)
+    assert "texture sheet" in str(exc.value) and "16%" in str(exc.value)
 
 
-def test_one_disagreeing_witness_is_a_refusal_that_names_it():
-    """385 witnesses agreeing is what makes the address knowledge rather than a
-    guess, so a single dissenter is not a majority to be outvoted -- it means
-    the packets are not describing the layout this module believes in, and
-    writing a megabyte on the strength of the other 384 is how a rig corrupts
-    VRAM confidently."""
+def test_the_CLUT_arm_does_the_same_and_names_a_dissenter():
+    """Independently of the sheet, and it names one -- an artist looking at a
+    map that will not push needs a polygon to go and look at."""
     w = _witnesses()
     w[200] = (0x7800 + w[200][2] + 0x40, w[200][1], w[200][2], w[200][3])
+    at = VR.derive_addresses(w)
+    assert (at.clut_x, at.clut_y) == (0, 480) and at.clut_dissent == 1
+    assert at.sheet_dissent == 0, "a CLUT dissenter must not count as a sheet one"
+
+    for i in range(200, 260):
+        w[i] = (0x7800 + w[i][2] + 0x40, w[i][1], w[i][2], w[i][3])
     with pytest.raises(VR.VramError) as exc:
         VR.derive_addresses(w)
-    assert "polygon 200" in str(exc.value)
+    assert "CLUT rows" in str(exc.value) and "polygon 200" in str(exc.value)
+
+
+def test_the_refusal_TALLIES_the_dissent_instead_of_stopping_at_the_first():
+    """Read the WHOLE tally before saying what a disagreement means.
+
+    It used to stop at the first dissenter, and *"polygon 0 says (768, 0) and
+    polygon 55 says (768, 256)"* cannot tell a two-band map from a corrupt
+    packet -- and those want opposite responses, which is exactly the
+    distinction `DISSENT_LIMIT` now draws. Six of 731 reads as a map; half of
+    731 reads as a rig. So the refusal that survives has to show its working.
+    """
+    w = _witnesses()
+    for i in range(100):                     # 100 of 385 -- a genuine split
+        w[i] = (w[i][0], w[i][1] | 0x10, w[i][2], w[i][3])
+    with pytest.raises(VR.VramError) as exc:
+        VR.derive_addresses(w)
+    said = str(exc.value)
+    assert "285" in said and "(768, 0)" in said, said
+    assert "100 " in said and "(768, 256)" in said, said
+    assert "of 385 witness(es)" in said, said
 
 
 def test_an_empty_witness_list_is_a_refusal_not_a_default():

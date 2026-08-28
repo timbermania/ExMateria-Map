@@ -16,3 +16,5 @@ tests/.blender_stress/
 tests/.blender_preview_source/
 tests/.blender_convert/
 .quantise_preview/
+tests/.blender_userres/
+dist/

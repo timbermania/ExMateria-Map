@@ -86,23 +86,82 @@ DOC = json.loads(open(JSON).read())
 # --- the fake emulator -----------------------------------------------------
 
 class FakeRam:
-    """Enough of `LuaClient` to be a machine, not a stub.
+    """Enough of an emulator to be a machine, not a stub -- **both transports**.
 
-    `exec` really parses the wire form `pack_writes` produced and really
-    applies it byte by byte, so the packer, the record header and the
-    changed-byte count are all under test rather than mocked away.
+    It stands in for three things the addon talks to, because they are one
+    machine: `POST /api/v1/cpu/ram/raw` (the default since #606), the packed-Lua
+    walk (`exec`, the fork path), and the `gte` Lua handler the light rig goes
+    through. Each is really parsed and really applied -- the packer, the record
+    header, the clustering and the changed-byte count are all under test rather
+    than mocked away.
     """
 
     def __init__(self):
         self.mem = bytearray(L.RAM_BYTES)
         self.cp2c = [0] * 32          # the GTE control registers
         self.up = True
+        self.handlers = True          # was the addon's `.lua` `-dofile`d?
         self.execs = 0
         self.gte_execs = 0
+        self.lua_walks = 0            # packed-Lua record walks -- the fork path
 
     # -- transport
     def ping(self):
-        return self.up
+        return not self.check()
+
+    def check(self):
+        """`LuaClient.check`'s three states, because the UI gates on all three.
+
+        `handlers` is the middle one -- an emulator up but launched without
+        `-dofile`. It is a separate flag from `up` here for the same reason it
+        is a separate message there: they are different mistakes.
+        """
+        if not self.up:
+            return "no emulator answering on localhost:8080"
+        if not self.handlers:
+            return "pcsx-redux is running ... but has no `ping` Lua handler"
+        return ""
+
+    def call(self, handler, query="", timeout=30.0):
+        """`GET /api/v1/lua/<handler>?<query>` -- the stock transport.
+
+        The length ceiling is enforced here as the server would, rather than
+        assumed away: over it a real pcsx-redux routes elsewhere and 404s, so a
+        fake that accepted any length would grade a push that cannot happen.
+        """
+        self.execs += 1
+        if not self.up:
+            raise L.TransportError("no emulator answering")
+        if not self.handlers:
+            raise L.NoHandlerError(f"no `{handler}` Lua handler")
+        path = f"/api/v1/lua/{handler}" + (f"?{query}" if query else "")
+        assert len(path) <= L.URL_LIMIT, f"{len(path)}-byte URL would 404"
+        if handler == "ping":
+            return "pong\n"
+        if handler == "gte":
+            self.gte_execs += 1
+            n = 0
+            for pair in query.split("&"):
+                index, _, value = pair.partition("=")
+                if index.isdigit() and value.isdigit() and int(index) <= 31:
+                    self.cp2c[int(index)] = int(value)
+                    n += 1
+            return f"{n}\n"
+        raise L.NoHandlerError(f"no `{handler}` Lua handler")
+
+    # -- `POST /api/v1/cpu/ram/raw`, driven through the real `RamClient`
+    def get(self):
+        if not self.up:
+            raise L.TransportError("no emulator answering")
+        self.execs += 1
+        return bytes(self.mem)
+
+    def post(self, offset, data):
+        if not self.up:
+            raise L.TransportError("no emulator answering")
+        self.execs += 1
+        assert 0 <= offset and offset + len(data) <= L.RAM_BYTES
+        self.mem[offset:offset + len(data)] = data
 
     def read(self, address, length):
         o = address - L.RAM_BASE
@@ -111,17 +170,18 @@ class FakeRam:
         return bytes(self.mem[o:o + length])
 
     def exec(self, code, timeout=180.0):
+        """The packed-Lua walk -- the **fork** path, kept and still graded.
+
+        Nothing the button does reaches it any more -- the operator builds a
+        `RamClient` unconditionally -- but `tools/live_geometry.py` drives it
+        on purpose, so the fake keeps a real parser for it and the arms below
+        assert that a push never trips it. The rig does not come through it
+        either: `apply_gte` is a URL now, which is what stock can receive.
+        """
         self.execs += 1
-        # The rig's second transport (§2.2). Parsed for real, like the RAM
-        # one: a stub that swallowed the call would let a mis-packed colour
-        # matrix through, and the packing is the half most likely to be wrong
-        # -- two shorts to a word, ninth alone, and the ambient shifted by 4.
-        regs = re.findall(r"r\.CP2C\.r\[(\d+)\] = (\d+)", code)
-        if regs:
-            self.gte_execs += 1
-            for index, value in regs:
-                self.cp2c[int(index)] = int(value)
-            return str(len(regs))
+        if not self.up:
+            raise L.TransportError("no emulator answering")
+        self.lua_walks += 1
         m = re.search(r'local p = "([0-9a-f]*)"', code)
         if m is None:
             raise AssertionError("unrecognised Lua: " + code[:120])
@@ -408,7 +468,24 @@ def vram_for(ram):
     return _VRAM["vram"]
 
 
+def _ram_client(host=None, port=None):
+    """A real `RamClient` wired to the fake endpoint.
+
+    Patched rather than duck-typed so the clustering, the bounds checks and
+    the changed-byte count are the shipped ones -- this transport is the
+    addon's default, and a fake that reimplemented `write` would grade the
+    fake.
+    """
+    c = _REAL_RAM_CLIENT()
+    c._get, c._post = RAM.get, RAM.post
+    return c
+
+
+#: Captured before the patch below, or `_ram_client` calls itself forever.
+_REAL_RAM_CLIENT = L.RamClient
+
 L.LuaClient = lambda host=None, port=None: RAM
+L.RamClient = _ram_client
 UI.VR.VramClient = lambda host=None, port=None: vram_for(RAM)
 
 
@@ -450,6 +527,20 @@ try:
           any("no emulator answering" in ln for ln in last_push()),
           str(last_push()))
     check("no emulator costs no round trip", RAM.execs == 0, RAM.execs)
+
+    # ---- refusal 1b: the emulator is up, `-dofile` was forgotten ----------
+    # The likeliest real failure on a stock install, and the one a two-state
+    # gate misdiagnoses: every upstream endpoint answers, only ours 404s, so
+    # "no emulator answering" would send the artist to check a port that was
+    # never the problem.
+    RAM = fresh_ram()
+    RAM.handlers = False
+    res, err = push()
+    check("missing handlers are refused", res == {"CANCELLED"}, str(res))
+    check("missing handlers are not reported as a missing emulator",
+          any("handler" in ln for ln in last_push())
+          and not any("no emulator answering" in ln for ln in last_push()),
+          str(last_push()))
 
     # ---- refusal 2: the gate ---------------------------------------------
     RAM = fresh_ram(counts=(0, 0, 0, 0))
@@ -630,6 +721,87 @@ try:
           f"{res} {err}; RAM holds {RAM.read(_at, 2).hex()}")
     ob.data.attributes["visible_angles"].data[0].value = _va_was
 
+    # ---- REPLACING the loaded map: a hot swap ----------------------------
+    # The self-check's premise is that RAM ALREADY HOLDS the document's own
+    # bytes. That premise is the identity claim decision 7 recovered as a side
+    # effect, and it is exactly what replacing the loaded map violates on
+    # purpose -- so the default mode has to go on refusing a foreign map, and
+    # the swap mode has to not.
+    #
+    # Seeded as a coherent FOREIGN MAP rather than as garbage. A savestate of
+    # another battle holds a different map's polygons at these very addresses,
+    # in the same shape, with the descriptor declaring its own counts; garbage
+    # would pass an arm that only looked for "RAM is not ours" and would not
+    # exercise the shrink the count leg has to do.
+    FOREIGN = json.loads(json.dumps(DOC))
+    for _p in FOREIGN["polygons"]:
+        _p["positions"] = [[x + 100, y, z] for x, y, z in _p["positions"]]
+    RAM = fresh_ram(doc=FOREIGN, counts=(0, 3, 0, 2))
+    UI._LAST_PUSH.clear()
+    _quad = L.SINKS["textured_quad"].positions + STARTS[1] * 32
+    _ours = struct.pack("<hhh", *DOC["polygons"][0]["positions"][0])
+    check("a foreign map is really in RAM, and it is not the document's",
+          RAM.read(_quad, 6) != _ours,
+          f"RAM {RAM.read(_quad, 6).hex()} vs document {_ours.hex()}")
+
+    res, err = push()
+    check("the default mode REFUSES a foreign map, as it always has",
+          res == {"CANCELLED"}
+          and any("self-check FAILED" in ln for ln in last_push()),
+          f"{res} {last_push()}")
+
+    res, err = push(replace_loaded_map=True)
+    check("replacing the loaded map finishes instead of refusing",
+          res == {"FINISHED"}, f"{res} {err}")
+    check("...and the document's own geometry is what RAM holds after",
+          RAM.read(_quad, 6) == _ours,
+          f"RAM holds {RAM.read(_quad, 6).hex()}, document says {_ours.hex()}")
+    # The counts are half of what "replaced" means: the foreign map declared
+    # three quads and two untextured quads, the document has one of each, and
+    # a swap that left the old counts standing would draw two slots of the map
+    # it replaced.
+    _counts = struct.unpack(
+        "<4H", RAM.read(L.DESCRIPTOR_BASE + L.DESCRIPTOR_COUNTS, 8))
+    check("...and the counts are the document's, not the replaced map's",
+          _counts == doc_counts(DOC), f"{_counts} vs {doc_counts(DOC)}")
+    # A weaker check reported in the same words as the strong one is worse
+    # than no check: the artist reads "self-check passed" and believes the
+    # thing that was not proved.
+    check("...and the report says the proof is WEAKER, not that it passed",
+          any("WEAKER" in ln for ln in last_push())
+          and not any("the planned addresses hold" in ln
+                      for ln in last_push()),
+          str(last_push()))
+    # The two legs a swap does not deliver, and it must not let the picture
+    # imply otherwise. Both are footnotes when the artist is editing the map
+    # the emulator has loaded and headlines when they have replaced it:
+    #
+    #   the terrain grid -- `UNPUSHED` names it on every push, but "the map
+    #   looks right and COLLIDES wrong" is a curiosity on your own map and is
+    #   the whole story on somebody else's: units walk the tiles of the map
+    #   that was replaced.
+    #
+    #   the sheet and the CLUT block -- their VRAM addresses are DERIVED from
+    #   the live packets (`derive_addresses`), and on a swap the packets they
+    #   are derived from belonged to the map being replaced.
+    _said = " ".join(last_push())
+    check("...and it says units will walk the REPLACED map's tiles",
+          "walk the map you replaced" in _said, _said[:400])
+    check("...and it says the VRAM addresses came from the replaced map",
+          "derived from the map you replaced" in _said, _said[:400])
+    # The same two lines must NOT appear on an ordinary push, or they are
+    # decoration rather than a warning -- an artist who reads them on every
+    # press stops reading them on the press that matters.
+    RAM = fresh_ram()
+    UI._LAST_PUSH.clear()
+    res, err = push()
+    _plain = " ".join(last_push())
+    check("...and an ordinary push carries neither line",
+          res == {"FINISHED"}
+          and "derived from the map you replaced" not in _plain
+          and "walk the map you replaced" not in _plain
+          and "WEAKER" not in _plain, f"{res} {_plain[:300]}")
+
     # ---- GROWTH: a slot the loaded map never had -------------------------
     # The document carries one textured_quad and the map loaded none, so this
     # is the direction that used to be refused outright. Fake RAM only: MAP022
@@ -806,6 +978,33 @@ try:
     res, err = push()
     check("a re-press of an unchanged edit says `already live`, not `nothing`",
           any("already live" in ln for ln in last_push()), str(last_push()))
+
+    # ---- the operator takes ONE transport, and it is the stock one ---------
+    # There used to be a `live_ram_over_http` preference here and an arm that
+    # drove the push both ways. The preference is gone: its off position needed
+    # our pcsx-redux fork, and the failure it produced named `lua/exec`, not the
+    # checkbox. So what is graded now is that the button CANNOT reach the fork
+    # path -- `apply` delegates to `client.write`, and a `RamClient` has one.
+    # The Lua walk itself is still graded, by `test_live_link.py`, where the
+    # tools that deliberately choose it live.
+    RAM = fresh_ram()
+    UI._LAST_PUSH.clear()
+    me.vertices[0].co.x += 1.0
+    _execs = RAM.execs
+    res, err = push()
+    check("a push goes through the stock RAM endpoint", res == {"FINISHED"},
+          f"{res} {err}")
+    # `execs` counts the GET/POST pairs AND any `exec`; `gte_execs` counts only
+    # the rig's URL. A push that touched the packed-Lua walk would show up as
+    # the fake's `exec` parsing a record, which is the assertion below.
+    check("no part of a push runs packed Lua", RAM.lua_walks == 0,
+          f"{RAM.lua_walks} packed-Lua walk(s)")
+    _live = export_document.assemble(ob)[0]
+    _want = fresh_ram(_live, rig=DOC["map_states"][0]["light_rig"], clut=True)
+    check("the push leaves RAM holding the edited document",
+          bytes(RAM.mem) == bytes(_want.mem),
+          sum(1 for a, b in zip(RAM.mem, _want.mem) if a != b))
+    me.vertices[0].co.x -= 1.0
 
     # ---- a map reload puts the disc's bytes back --------------------------
     RAM = fresh_ram()               # what a reload does
@@ -992,13 +1191,87 @@ try:
     check("the sheet blob is the disc's 131,072-byte layout",
           len(_blob) == VR.SHEET_BYTES, str(len(_blob)))
 
-    # The palettes went to RAM, not to VRAM's CLUT rows.
+    # ---- the dissenting minority must be NAMED (#646) --------------------
+    # Measured on a live Orbonne Monastery (MAP062): 380 of MAP022 a0's 385
+    # witnesses put the sheet at (768, 0) and five put it at (768, 256). The
+    # sheet now goes to the address the 380 agree on, which means those five
+    # polygons keep whatever was already in VRAM -- and an artist who is not
+    # told that reads five stale faces as a push that half worked.
+    #
+    # This fixture carries ONE textured polygon, so a minority cannot exist in
+    # it. `picture_plan` is pure and takes the derivation as an argument, so it
+    # is asked directly rather than through a document that cannot pose the
+    # question.
+    _cv = VR.clut_block(VRAM_NOW.read(), _atv)
+    _cr = RAM.read(L.CLUT_BLOCK, L.CLUT_BLOCK_BYTES)
+    _, _, _, _notes = UI.picture_plan(
+        _at, _atv._replace(sheet_dissent=5, clut_dissent=2), _rep.sheets,
+        _cr, _cv)
+    _said = " ".join(_notes)
+    check("a dissenting minority is NAMED, not silently dropped",
+          "5 polygon(s)" in _said and "2" in _said
+          and "keep the texture" in _said, _said[:300])
+    _, _, _, _clean = UI.picture_plan(_at, _atv, _rep.sheets, _cr, _cv)
+    check("...and a map whose packets all agree gets no such line",
+          not any("keep the texture" in n for n in _clean), str(_clean))
+
+    # ---- the palettes go to BOTH sinks ------------------------------------
+    # This block replaces `no CLUT rectangle was ever POSTed to VRAM`, which
+    # asserted the old decision: the engine re-uploads `CLUT_BLOCK` every
+    # frame, so RAM is the sink and a VRAM CLUT write is gone in 50 ms.
+    #
+    # That is true on 42 of the corpus's 169 textured resources and false on
+    # the other 127. The per-frame re-upload IS the palette ANIMATION, which
+    # only the 42 carry -- and `MAP022.9` (Gariland, where it was measured) is
+    # one of them. Measured [LIVE] 2026-08-27 on Orbonne (`MAP062.8`, no
+    # animation): the RAM push was byte-perfect, 0 of 512 off the document,
+    # and all 16 VRAM CLUT rows still held Orbonne's. Nothing re-uploaded it,
+    # so the palettes never reached the screen at all.
     check("the palettes reached the RAM block",
           RAM.read(L.CLUT_BLOCK, L.CLUT_BLOCK_BYTES) == clut_block_bytes(DOC),
           "the CLUT block in RAM is not the document's")
-    check("no CLUT rectangle was ever POSTed to VRAM",
+    check("a CLUT row already holding its bytes is not re-POSTed",
           not any("CLUT" in lbl for lbl in VRAM_NOW.posted),
-          str(VRAM_NOW.posted))
+          "decision 6 at the new sink: `seed_clut` put the document's own "
+          "palettes in both memories, so a correct push moves nothing -- "
+          f"{VRAM_NOW.posted}")
+
+    # ...and now the arm that would have caught it. The seeded fixture holds
+    # the DOCUMENT's palettes in both memories, which is the one state in
+    # which a push that reaches no sink at all still looks perfect. A swap is
+    # the opposite: the map on screen is not the one in Blender, so both
+    # memories hold somebody ELSE's colours.
+    RAM = fresh_ram()
+    VRAM_NOW = vram_for(RAM)
+    _foreign = bytes(((b * 7 + 3) & 0xFF) for b in range(L.CLUT_BLOCK_BYTES))
+    RAM.poke(L.CLUT_BLOCK, _foreign)
+    for _row in range(L.CLUT_ROWS):
+        _o = VR.CLUT_Y * VR.PITCH + _row * L.CLUT_ENTRIES * 2
+        VRAM_NOW.vram[_o:_o + 32] = _foreign[_row * 32:(_row + 1) * 32]
+    # Both memories agree, which is what `check_clut_block` demands and what
+    # MAP062 really looked like before the push -- and note that it PASSED
+    # there and the write still went nowhere. Agreement says `CLUT_BLOCK` is
+    # the block feeding the screen; it does not say a write to it arrives.
+    res, err = push()
+    check("a push over a FOREIGN CLUT block finishes", res == {"FINISHED"},
+          f"{res} {err}")
+    check("the palettes reached VRAM's CLUT rows too",
+          VR.clut_block(VRAM_NOW.read(), _atv) == clut_block_bytes(DOC),
+          "VRAM's CLUT rows are not the document's -- a RAM-only palette push "
+          "is inert on the 127 resources that carry no palette animation")
+    check("...as one rectangle per row, named so a readback can report one",
+          [lbl for lbl in VRAM_NOW.posted if "CLUT" in lbl]
+          == [f"CLUT row {r}" for r in range(L.CLUT_ROWS)],
+          str([lbl for lbl in VRAM_NOW.posted if "CLUT" in lbl]))
+    check("the RAM sink was written in the same press",
+          RAM.read(L.CLUT_BLOCK, L.CLUT_BLOCK_BYTES) == clut_block_bytes(DOC),
+          "the RAM block is not the document's -- the VRAM sink must not "
+          "REPLACE it: on the 42 animating resources RAM is the only durable "
+          "one, and it overwrites these rows on the next frame")
+    check("the report names both sinks",
+          any("VRAM byte(s) of palette" in ln for ln in last_push())
+          and any("RAM byte(s) of palette" in ln for ln in last_push()),
+          str(last_push()))
 
     # Decision 6: skip the write when the bytes already match, and say so.
     _posted_before = len(VRAM_NOW.posted)
@@ -1087,6 +1360,11 @@ try:
     class FakeLayout:
         def __init__(self, sink):
             self.sink = sink
+            #: `(idname, props)` per `operator()` call. `sink` records the id;
+            #: a button that presets a property is only half described by it,
+            #: and the preset half is where `skip_selfcheck` could reach the
+            #: panel without anything noticing.
+            self.ops = []
 
         def box(self):
             return self
@@ -1097,10 +1375,16 @@ try:
         def label(self, text="", icon=""):
             self.sink.append(("label", text, icon))
         def prop(self, *a, **kw):
-            self.sink.append(("prop", kw.get("icon", ""), ""))
+            # The NAME, not just the icon. `prop` on a property that does not
+            # exist draws nothing in a real Blender, exactly as `operator` on an
+            # unregistered id does -- so the name has to survive to where it can
+            # be resolved against the object.
+            self.sink.append(("prop", a[1] if len(a) > 1 else "", ""))
         def operator(self, idname, **kw):
             self.sink.append(("operator", idname, ""))
-            return type("Props", (), {"key": "", "title": ""})()
+            props = type("Props", (), {"key": "", "title": ""})()
+            self.ops.append((idname, props))
+            return props
 
     from exmateria_map import import_document as IMP
 
@@ -1174,45 +1458,176 @@ try:
               for r in rows_bake), str(rows_bake))
     del ob["exmateria_map/last_bake"]
 
-    check("the `what a push carries` box is a CLOSED sub-panel now",
-          "DEFAULT_CLOSED" in UI.MAP_PT_live_push_carries.bl_options
-          and UI.MAP_PT_live_push_carries.bl_parent_id == "MAP_PT_live_push",
-          str(UI.MAP_PT_live_push_carries.bl_options))
+    # ---- `What a push carries` is DELETED, and the limit is not ----------
+    # It was a DEFAULT_CLOSED sub-panel plus a `NOT_CARRIED` prose table.
+    # Reported from use: *"I don't care about the 'what a push carries'
+    # section. delete it. that belongs in a console or something ... you are
+    # putting console stuff in the ui area."*
+    check("the carries sub-panel is gone",
+          not hasattr(UI, "MAP_PT_live_push_carries")
+          and not hasattr(UI, "NOT_CARRIED"),
+          "MAP_PT_live_push_carries / NOT_CARRIED is still here -- the artist "
+          "deleted the panel, not the limit it documented")
 
-    # ADR-0186 Amendment 3's Consequences: *"the panel whose job is to say
-    # what a push carries is wrong about the leg this loop depends on."*  It
-    # said the sheet and the CLUT rows had no live sink and to use
-    # `tools/live_push.py` -- for as long as step 5c had been pushing both,
-    # and after that tool was deleted.  A panel that RESTATES `UNPUSHED` can
-    # disagree with it; these three arms hold it reading the table instead.
-    rows_carry = []
-    UI.MAP_PT_live_push_carries.draw(
-        type("P", (), {"layout": FakeLayout(rows_carry)})(), None)
-    said = " ".join(str(part) for row in rows_carry for part in row)
-    check("the carries panel names the sheet and the CLUT as CARRIED",
-          "TEXTURE SHEET" in said and "CLUT ROWS" in said, said[:300])
-    check("...and no longer sends the artist to a tool that is deleted",
+    # ADR-0186 Amendment 3's Consequences: *"the panel whose job is to say what
+    # a push carries is wrong about the leg this loop depends on."*  It said the
+    # sheet and the CLUT rows had no live sink and to use `tools/live_push.py`
+    # -- for as long as step 5c had been pushing both, and after that tool was
+    # deleted.  A panel that RESTATES `UNPUSHED` can disagree with it.  The
+    # deletion settles that permanently: there is now only the table, read once
+    # per push by `unpushed_lines`, and these arms hold it that way.
+    said = " ".join(UI.unpushed_lines(set()))
+    check("the limit no longer names a tool that is deleted",
           "live_push.py" not in said and "no live sink" not in said,
           said[:300])
-    check("...and every field it calls unpushed is one `UNPUSHED` names",
-          set(UI.NOT_CARRIED) <= set(L.UNPUSHED),
-          f"{sorted(UI.NOT_CARRIED)} vs {sorted(L.UNPUSHED)}")
+    check("...and every line it says is a field `UNPUSHED` names",
+          all(any(f in ln for f in L.UNPUSHED) for ln in
+              UI.unpushed_lines(set())),
+          f"{UI.unpushed_lines(set())} vs {sorted(L.UNPUSHED)}")
     # The other direction, and the one a restating panel got wrong: a field
     # that gains no sink must APPEAR, prose or no prose.  Seeded rather than
-    # asserted off today's two entries, which the panel happens to have lines
-    # for -- that arm would pass on a `draw` that ignored the table entirely.
+    # asserted off today's entries, which would pass on a function that ignored
+    # the table entirely.
     L.UNPUSHED["a field with no sink and no prose"] = "seeded"
     try:
-        rows_seeded = []
-        UI.MAP_PT_live_push_carries.draw(
-            type("P", (), {"layout": FakeLayout(rows_seeded)})(), None)
-        seeded_said = " ".join(str(part) for row in rows_seeded
-                               for part in row)
+        seeded_said = " ".join(UI.unpushed_lines(set()))
     finally:
         del L.UNPUSHED["a field with no sink and no prose"]
-    check("a new UNPUSHED field is named by the panel with no edit to it",
+    check("a new UNPUSHED field is said with no edit to the addon",
           "a field with no sink and no prose" in seeded_said,
           seeded_said[:300])
+    # ...and it reaches the artist, which is the whole of what the panel did.
+    # `finish` stores the lines, records them to the Log AND prints them; the
+    # push panel draws no text at all now, so if this call went the limit would
+    # be nowhere.
+    import ast as _a
+    import pathlib as _pl
+    _src = _a.parse(_pl.Path(UI.__file__).read_text())
+    _ex = next(n for n in _a.walk(_src)
+               if isinstance(n, _a.FunctionDef) and n.name == "execute"
+               and any("unpushed_lines" == getattr(c.func, "id", None)
+                       for c in _a.walk(n) if isinstance(c, _a.Call)))
+    check("the push operator is what says it now",
+          _ex is not None,
+          "no operator `execute` calls unpushed_lines -- the sub-panel was "
+          "deleted TO the console, so the console has to receive it")
+
+    # ---- the two panels an artist reaches PCSX-Redux through --------------
+    # The emulator does not load the live link's handlers by itself, so the
+    # addon has to offer a way in. Both surfaces are drawn here because a
+    # `draw` that raises renders everything BEFORE it and nothing after -- a
+    # wrong operator id would take out the rest of the panel and the harness
+    # would see a green push.
+    rows_push = []
+    _push_layout = FakeLayout(rows_push)
+    UI.MAP_PT_live_push.draw(
+        type("P", (), {"layout": _push_layout})(), bpy.context)
+    push_ops = [r[1] for r in rows_push if r[0] == "operator"]
+    check("the push panel offers the push", "map.live_push" in push_ops,
+          str(push_ops))
+    # Reported from use as confusion: the launch button was in the preferences
+    # only, and the moment an artist needs it is the moment a push has just
+    # come back "no emulator answering" -- in the viewport, not there.
+    check("...and launching the emulator, at the button that needs it",
+          "exmateria_map.launch_pcsx" in push_ops, str(push_ops))
+
+    # The swap is a BUTTON, not a hidden keyword. It is the artist's only way
+    # to say "the emulator holds a different map and replacing it is the
+    # point", and the operator cannot infer it -- no RAM address holding the
+    # current map id is known (decision 2), so the declaration has to come
+    # from the person who loaded the savestate.
+    _swap = [pr for i, pr in _push_layout.ops
+             if i == "map.live_push" and getattr(pr, "replace_loaded_map",
+                                                 False)]
+    check("the push panel offers replacing the loaded map as its own button",
+          len(_swap) == 1, f"{len(_swap)} of {_push_layout.ops}")
+    # `replace_loaded_map` presets a property, and `FakeLayout` accepts any
+    # attribute -- so a name the operator never registered would record
+    # perfectly here and raise in a real Blender. Blender's own answer is what
+    # settles it.
+    _rna = [pr.identifier
+            for pr in bpy.ops.map.live_push.get_rna_type().properties]
+    check("...and it is a property the operator really registered",
+          "replace_loaded_map" in _rna, str(_rna))
+    # The escape hatch stays out of reach. A swap has a proof it can pass, so
+    # an artist never needs the one that has none -- and a panel that offered
+    # it would turn "I could not get a push through" into a habit of pushing
+    # thousands of bytes to unproven addresses.
+    check("...and no button on this panel presets `skip_selfcheck`",
+          not any(getattr(pr, "skip_selfcheck", False)
+                  for _, pr in _push_layout.ops),
+          str([(i, vars(pr)) for i, pr in _push_layout.ops]))
+
+    rows_prefs = []
+    _prefs_obj = bpy.context.preferences.addons["exmateria_map"].preferences
+    _prefs_obj.layout = FakeLayout(rows_prefs)
+    IMP.MAP_AddonPreferences.draw(_prefs_obj, bpy.context)
+    prefs_ops = [r[1] for r in rows_prefs if r[0] == "operator"]
+    check("the preferences offer all three routes to the handlers",
+          {"exmateria_map.launch_pcsx", "exmateria_map.setup_pcsx",
+           "exmateria_map.copy_launch_command"} <= set(prefs_ops),
+          str(prefs_ops))
+    # The transport preference is GONE (#606 part 3). Its off position needed
+    # our fork and failed as `lua/exec 404`, which names nothing an artist
+    # could act on -- so it must not come back as a checkbox.
+    check("no transport checkbox is offered to an artist",
+          not hasattr(_prefs_obj, "live_ram_over_http"),
+          "live_ram_over_http is back in the preferences")
+
+    # The arm that would have caught the real defect, and did not exist.
+    # `FakeLayout.operator` records whatever string it is handed, so a panel
+    # naming an UNREGISTERED operator records perfectly and draws NOTHING in a
+    # real Blender -- no error, no red button, just a missing row. All three
+    # PCSX operators shipped that way: added to `import_document.classes`,
+    # which nothing iterates, and not to `register()`, which is hand-written.
+    # Resolving the id against `bpy.ops` is what tells the two apart.
+    # `dir()`, not `hasattr`. `bpy.ops` resolves lazily, so
+    # `hasattr(bpy.ops.anything, "anything")` is True for a group that does not
+    # exist and a name that was never registered -- measured. The first version
+    # of this arm used `hasattr` and could not fail; it passed on the very
+    # defect it was written for, and `dir()` is what tells the two apart.
+    def _resolves(idname):
+        group, _, name = idname.partition(".")
+        grp = getattr(bpy.ops, group, None)
+        return grp is not None and name in dir(grp)
+
+    _unresolved = sorted({i for i in push_ops + prefs_ops if not _resolves(i)})
+    check("every operator these panels name is actually REGISTERED",
+          not _unresolved, f"unregistered: {_unresolved}")
+
+    # The same failure one field over, and it shipped too: `col.prop(self,
+    # "live_pcsx_dir")` on a property that is not on the class draws NOTHING.
+    # Both `live_pcsx_*` were deleted by a line-span edit meant for the
+    # transport preference, the `prop` calls stayed, and the preferences panel
+    # rendered two invisible rows. `FakeLayout.prop` recording a name proves
+    # only that `draw` said it.
+    _prefs_fields = [r[1] for r in rows_prefs if r[0] == "prop"]
+    _missing_fields = sorted(f for f in _prefs_fields
+                             if f and not hasattr(_prefs_obj, f))
+    check("every preference these panels name actually EXISTS",
+          not _missing_fields, f"no such property: {_missing_fields}")
+    # ONE folder, not a folder and a binary. Both buttons take it, because the
+    # launch sets `cwd` to it -- so the emulator's working directory is decided
+    # rather than discovered, and the shim's folder and the launch's folder are
+    # the same by construction. Two fields read as two setups; there is one.
+    check("...including the ONE folder both PCSX buttons work from",
+          "live_pcsx_dir" in _prefs_fields
+          and hasattr(_prefs_obj, "live_pcsx_dir"), str(_prefs_fields))
+    check("...and nothing asks the artist for the binary separately",
+          "live_pcsx_binary" not in _prefs_fields
+          and not hasattr(_prefs_obj, "live_pcsx_binary"),
+          str(_prefs_fields))
+
+    # And the trap one step upstream: `classes` reads like the registration
+    # list and is not one. Held against `register()` so the next person to add
+    # a class to the plausible-looking tuple finds out here.
+    # `is_registered` is Blender's own answer, not a proxy for it: `bpy.types`
+    # does not gain an entry for every registered class, so a membership test
+    # there reports nine false positives on a healthy addon.
+    _missing = sorted(c.__name__ for c in IMP.classes
+                      if not getattr(c, "is_registered", False))
+    check("every class in `classes` is one `register()` actually registers",
+          not _missing, f"declared but never registered: {_missing}")
 
     # ---- the all-empty refusal -------------------------------------------
     # Zeroing all four counts would make `check_descriptors` read the block as
@@ -1278,10 +1693,17 @@ def main():
                       .replace("@ZIP@", str(zf_path))
                       .replace("@JSON@", str(staged))
                       .replace("@OUT@", str(REPORT)))
+    # Isolate this Blender from the artist's OWN install. Without it the
+    # `addon_install` in the script above overwrites the addon they are
+    # clicking, and `addon_enable` then grades that copy rather than this
+    # tree. `--factory-startup` does NOT do this -- see `blender_env`.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from blender_env import isolated_env
     proc = subprocess.run(
         [sys.argv[1] if len(sys.argv) > 1 else "blender",
          "--background", "--factory-startup", "--python", str(script)],
-        capture_output=True, text=True)
+        capture_output=True, text=True,
+                          env=isolated_env())
     sys.stdout.write(proc.stdout)
     if proc.stderr:
         sys.stdout.write("\n[stderr]\n" + proc.stderr[-4000:])

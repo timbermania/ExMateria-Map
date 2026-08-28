@@ -150,8 +150,15 @@ def run(blender, name, body, subs):
         body = body.replace(k, v)
     path = TMP / name
     path.write_text(body)
+    # Isolate this Blender from the artist's OWN install. Without it the
+    # `addon_install` in the script above overwrites the addon they are
+    # clicking, and `addon_enable` then grades that copy rather than this
+    # tree. `--factory-startup` does NOT do this -- see `blender_env`.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from blender_env import isolated_env
     p = subprocess.run([blender, "--background", "--factory-startup",
-                        "--python", str(path)], capture_output=True, text=True)
+                        "--python", str(path)], capture_output=True, text=True,
+                          env=isolated_env())
     for line in p.stdout.splitlines():
         if line.startswith(("PACKED", "REOPENED", "EXMATERIA-MAP")):
             print("  " + line)

@@ -16,6 +16,9 @@ Both are converted-path only. On the direct-paint path the Sheet is the
 authored half and `paint.resolve()` is what writes it; there is nothing here
 to compile from.
 """
+import hashlib
+import json
+
 import bpy
 from bpy.types import Operator
 
@@ -24,12 +27,101 @@ from .convert_op import (_face_ordered, clut_rows_of, source_art_name,
                          write_clut_rows_of)
 from .export_document import image_rgb, readable_mesh, set_image_indices
 from .import_document import marker_in_scene
-from .paint import active_palette, index_image, painting_of, sheet_of_state
+from .paint import (active_palette, index_image, painting_of, section,
+                    sheet_of_state)
 
 #: Charts named in the operator's own toast. The Log gets all of them
 #: (decision 9 says NAME every chart whose error rose); a toast that scrolled
 #: would name none of them legibly.
 TOASTED = 3
+
+
+#: Sheets whose Painting this PROCESS has hashed and found to match the
+#: stamp.  Process-lifetime and deliberately not persisted, for
+#: `live_link_ui._LAST_PUSH`'s reason: a claim about a comparison nobody in
+#: this session performed is a rubber stamp.  It exists so the panel can say
+#: **fresh** only where fresh was checked -- see `freshness`.
+_VERIFIED = {}
+
+#: Where the compile records which Painting it compiled.  A marker property
+#: and NOT a document member: it is a note about a cache, not map data, and
+#: `_assemble` builds the document from an explicit list of keys, so nothing
+#: here can reach a disc.
+STAMP = "compiled_from"
+
+
+def painting_stamp(ob):
+    return section(ob, STAMP, {}) or {}
+
+
+def stamp_compile(ob, sheet, painting, art):
+    """Record which Painting this compile read, and clear `is_dirty`.
+
+    Two signals, because neither is enough alone.  The digest is exact and
+    survives a save; `is_dirty` is free to read in a panel `draw` but is
+    cleared by the pack a `.blend` save performs, so on its own it would
+    report **fresh** on a map that was painted, saved and reopened without
+    compiling -- wrong in the direction that matters.
+    """
+    digest = hashlib.sha256(art).hexdigest()
+    stamps = dict(painting_stamp(ob))
+    stamps[sheet] = digest
+    ob[f"exmateria_map/{STAMP}"] = json.dumps(stamps)
+    _VERIFIED[painting.name] = digest
+    painting.pack()          # `is_dirty` False until the next brush stroke
+    painting.update()
+    return digest
+
+
+def compare_stamp(ob, digests):
+    """Digest per sheet vs. the stamp -- one warning line per disagreement.
+
+    Called from `_assemble`, so the export report and the push report both
+    carry it. It WARNS: decision 13 makes a stale Sheet a complete, legal map
+    that ships and renders, and Amendment 5 adds only that it must not do so
+    silently.
+    """
+    stamps = painting_stamp(ob)
+    notes = []
+    for sheet, digest in sorted(digests.items()):
+        was = stamps.get(sheet)
+        img = bpy.data.images.get(source_art_name(sheet))
+        if img is not None:
+            _VERIFIED[img.name] = digest if was == digest else None
+        if was is None:
+            notes.append(
+                f"{sheet}: this painting has never been compiled, so the "
+                f"sheet being shipped is the one Convert baked. Press "
+                f"Recalculate palettes to compile what you painted")
+        elif was != digest:
+            notes.append(
+                f"{sheet}: the sheet was compiled from an EARLIER painting "
+                f"and is being shipped as it stands -- a stale sheet is still "
+                f"a legal map. Press Recalculate palettes to catch it up")
+    return notes
+
+
+def freshness(ob, sheet, painting):
+    """`(state, text)` for the panel -- cheap enough for a `draw`.
+
+    Never reads a pixel: `Image.is_dirty` is Blender's own bit and flips on
+    any write. The four states are exhaustive and each is honest about what
+    was actually checked -- in particular there is no path that says FRESH
+    without this process having hashed the picture.
+    """
+    if painting is None:
+        return "none", ""
+    if sheet not in painting_stamp(ob):
+        return "never", "not compiled yet"
+    if painting.is_dirty:
+        return "stale", "painted since the last compile"
+    digest = painting_stamp(ob).get(sheet)
+    if _VERIFIED.get(painting.name) == digest:
+        return "fresh", "compiled from this painting"
+    # Packed-and-clean, but nothing in THIS process compared the pixels -- a
+    # reopened `.blend` looks exactly like this whether or not it was painted
+    # before it was saved. Saying `fresh` here is the one wrong answer.
+    return "unknown", "not verified since this file opened"
 
 
 def _subject(context):
@@ -146,6 +238,7 @@ each chart staying on the CLUT row it already reads"""
         compiled = compile_map.compile_sheet(polygons, art, atoms, rows)
         _land(ob, state, idx, compiled)
 
+        stamp_compile(ob, sheet, painting, art)
         rose = _report_regressions(
             ob, "Recalculate palettes", before, compiled.chart_error, compiled,
             extra=[f"state {state}, sheet {sheet}",
@@ -203,6 +296,7 @@ never make the map worse -- and can legitimately change nothing"""
             return {"CANCELLED"}
 
         _land(ob, state, idx, compiled)
+        stamp_compile(ob, sheet, painting, art)
         me.update()
 
         head = (f"state {state}, sheet {sheet}",

@@ -26,10 +26,56 @@ the gate and a small `urllib` Lua-over-HTTP client. Its assertions run under pla
 **The loop no longer leaves Blender.** `live_link_ui.py`'s *Push to PCSX* button assembles
 the document in memory and hands it to the core — no file, no CLI, ~0.9 s for the whole of
 MAP022 a0 (454 polygons, six bucket/field plans, self-check included). Decision 7 records
-what it compares against and why. Graded by `tests/blender_live_push.py` (**29/29**,
+what it compares against and why. Graded by `tests/blender_live_push.py` (**153/153**,
 headless, a fake emulator that really parses the wire form), and accepted the only way a
 rendering change can be: A/B/A on a live Gariland battle, through the button in both
 directions — 0 changed bytes untouched, 1,676 waved, 1,676 back.
+
+**The palettes reach the screen on 169 maps of 169, not 42** (2026-08-27). The palette leg
+pushed main RAM alone, on a measurement taken on Gariland that generalised to 42 maps and
+not to the other 127; on those the push was byte-perfect and invisible. It now writes both
+sinks off one packing. This is a defect in the shipped editing loop, not in the swap — it
+was inert on 127 maps before decision 10 existed. §2.3 carries the measurement and the
+amendment; the VRAM half is **[fake]** until a render says otherwise.
+
+**A whole map can be REPLACED, not only edited** (decision 10). *"I just want to be able to
+hot swap entire maps."* A second button, *Replace the loaded map*, pushes this document over
+whatever battle is loaded; the content self-check is exchanged for `live_link.check_plan_bounds`,
+which is weaker and says so. Graded on a seeded foreign map in `tests/blender_live_push.py`.
+Two legs it does not deliver and reports rather than hides: the terrain grid (units walk the
+map you replaced) and the derived VRAM addresses (§5.3). **[fake]** — the acceptance A/B/A
+against a real second savestate has not been run; §5.3 is what has been measured offline.
+
+**It runs on a stock pcsx-redux** (#606 part 2). Every endpoint the push uses is upstream —
+main RAM is `/api/v1/cpu/ram/raw`, VRAM is `/api/v1/gpu/vram/raw`, the Lua dispatch is
+`/api/v1/lua/<handler>` — and the two handlers no endpoint can supply (`ping`, and `gte` for
+the light rig's cop2 control registers) ship with the addon as `pcsx_handlers.lua`:
+
+    pcsx-redux -webserver -webserver-port 8080 -dofile addons/exmateria_map/pcsx_handlers.lua
+
+The emulator loads nothing by itself, so the preferences panel offers three routes and the
+artist takes the first that fits: **Launch PCSX-Redux** (Blender spawns it, flags already
+right), **Set up auto-load** (a `pcsx.lua` shim in the emulator's working directory plus
+*Show Lua editor* ticked in its `pcsx.json` — after which a plain double-click works, measured
+end to end), or **Copy launch command**. The shim's two halves are both load-bearing: with
+the Lua editor pane hidden the emulator is up and `cpu/ram` answers 200 while `lua/ping` is a
+404. It refuses to overwrite a `pcsx.lua` it did not write, because that editor's `Auto save`
+is on by default and an existing one is the artist's own script.
+
+The constraint that shaped it: on stock a Lua handler receives its payload **only through
+the URL** — a POST body is not exposed to Lua at all — and the request line is capped, where
+overflowing it is a **silent 404** rather than an error (bisected: 251 bytes runs, 252 does
+not; `POST` moves the cliff to 250, so the bound is `len(method) + 1 + len(url) <= 255`).
+`live_link.URL_LIMIT` refuses by name rather than let a caller read that 404 as a missing
+handler, and `gte_queries` splits a write list by measured length rather than a pair count.
+The eight-register rig is one request at under half the budget.
+
+The fork is still what `tools/live_*.py` drive, and the packed-Lua walk is kept for them: it
+is the faster of the two and it accepts a write longer than 65,535 bytes. There is **no
+transport preference** — `live_ram_over_http` stood in the panel from part 1 and was removed
+in part 3, because its off position needed the fork and failed as `lua/exec 404: URL Not
+found.`, which names nothing an artist could act on. `blender_live_push.py` now asserts the
+opposite property: that a push never trips the packed-Lua walk at all.
 
 | leg | state |
 |---|---|
@@ -41,6 +87,8 @@ directions — 0 changed bytes untouched, 1,676 waved, 1,676 back.
 | one copy (ADR-0005 dec. 3) | **done for the geometry leg** — see below |
 | UV / CLUT / TPAGE | **built** [LIVE] — §5.2, both packet buffers |
 | light rig | **built** [LIVE] — §2.2, A/B/A on a live battle |
+| palettes, RAM sink | **built** [LIVE] — §2.3, A/B/A. Correct on the 42 resources that animate their palettes, inert on the other 127 |
+| palettes, VRAM sink | **built**, **[fake]** — §2.3, `plan_clut`. The only sink that reaches the screen on those 127; a render has not confirmed it |
 | polygon COUNTS (shrink + growth) | **built** [LIVE] — decision 8, #598, A/B/A on a live battle. Both growth GATES are fake-RAM only |
 | bytes 6-7 (binding + VISIBLE_ANGLES) | **built** — 1,816/1,816 against a captured Gariland RAM |
 | terrain grid | not built — §5 |
@@ -75,8 +123,8 @@ in `UNPUSHED` any more.
 
 `tools/live_push.py` and `tools/vram_swap_sheet.py` are **deleted**. ADR-0005 wanted the VRAM
 leg *ported* into the addon; what actually happened is that the thing to port turned out not
-to be needed. The savestate round trip existed solely because two docstrings held that this
-fork cannot write VRAM, and **that was false** — `POST /api/v1/gpu/vram/raw` writes perfectly
+to be needed. The savestate round trip existed solely because two docstrings held that
+pcsx-redux cannot write VRAM, and **that was false** — `POST /api/v1/gpu/vram/raw` writes perfectly
 well, and a bare POST is a 400 only because the rectangle belongs in the query string.
 Measured [LIVE] by A/B/A on a Gariland battle, 2026-08-26. What survived the move is the
 geometry (`locate`, `identify`, `diff`, the page stride and row pitch), which was always
@@ -390,20 +438,68 @@ blob — the sheet is page-major and a rectangle's body is row-major at the same
 row, so no reshaping is involved. A single 256-wide rectangle would interleave the four pages
 a row at a time, which is why four POSTs are the cheap shape and one is the expensive one.
 
-**The palettes are NOT written to VRAM, and this is the finding.** Their address is right and
-it is not a sink. Measured by writing one CLUT row and reading it back at four delays, with a
-sheet write made in the same session as the control:
+**The palettes are written to BOTH memories, and the amendment is the finding.**
 
-    VRAM (x=80, y=480)      written, 0/32 differ immediately
-                            32/32 back to the ORIGINAL bytes at 50 ms, 0.2 s and 1 s
-    VRAM sheet row          written, 0/128 differ immediately AND after 1 s
-    RAM 0x800E4EA4 + 160    written, 0/32 differ after 1 s, and VRAM's row 5
-                            moved to match within 0.3 s
+> **Amended 2026-08-27.** What stood here was: *"the palettes are NOT written to VRAM, and
+> this is the finding — their address is right and it is not a sink."* It was measured by
+> writing one CLUT row on a live **Gariland** and reading it back at four delays, with a
+> sheet write made in the same session as the control:
+>
+>     VRAM (x=80, y=480)      written, 0/32 differ immediately
+>                             32/32 back to the ORIGINAL bytes at 50 ms, 0.2 s and 1 s
+>     VRAM sheet row          written, 0/128 differ immediately AND after 1 s
+>     RAM 0x800E4EA4 + 160    written, 0/32 differ after 1 s, and VRAM's row 5
+>                             moved to match within 0.3 s
+>
+> Every number is still true. The conclusion drawn from them — *"the engine re-uploads the
+> whole CLUT block from main RAM every frame"* — is true **on Gariland and on 41 other maps,
+> and false on 127.**
 
-The engine re-uploads the whole CLUT block from main RAM every frame and does **not**
-re-upload the sheet. So a palette push aimed at VRAM works for one frame — long enough to
-read back as a success, far too short for the artist to see. `0x800E4EA4` is the block that
-feeds it; it matched the live VRAM CLUT rows 0 of 512 bytes different.
+**The per-frame re-upload is the palette ANIMATION doing its work**, and only 42 of the
+corpus's 169 textured resources carry one. `mapfile.read_palette_animation` is present on
+`MAP022.9` — Gariland, where all four delays above were measured — and **absent on
+`MAP062.8`**, Orbonne. Surveyed over `project-assets/fft-extract/MAP/`, 2026-08-27:
+
+| textured resources | carry a `0x70` palette animation | do not |
+|---|---|---|
+| 169 | **42** | **127** |
+
+So on 127 maps nothing re-uploads the block after map load, and the two sinks swap roles:
+
+    MAP062, RAM push          0 of 512 bytes off the document -- byte-perfect
+    ...and VRAM's CLUT rows   all 16 rows still ORBONNE's, and nothing ever moved them
+    MAP062, VRAM CLUT write   0 of 512 back at +0.0 s, +0.5 s and +2.0 s
+                              -- and it SURVIVED a full map load
+
+Measured [LIVE] on the artist's Orbonne, 2026-08-27. **A RAM-only palette push has always
+been inert on those 127 maps, swap or no swap.** It was only ever measured on Gariland, which
+is one of the 42, and the artist met it as *"right texture, wrong palettes"*.
+
+**The push therefore writes both, and neither is a fallback for the other:**
+
+- **RAM `0x800E4EA4`** — durable and winning on the 42 that animate, where the engine
+  re-uploads it over the VRAM rows every frame. Unchanged.
+- **VRAM's CLUT column** — the only sink the artist can see on the other 127. On the 42 it is
+  harmlessly overwritten on the next frame, which *is* the behaviour the four delays above
+  measured.
+
+One packing feeds both (`live_link.clut_rows`), aimed at RAM by `live_link.plan_palettes` and
+at VRAM by `live_vram.plan_clut`. Two sinks for one document field is two chances to write
+different colours, and the divergence would surface as *"the palettes are wrong on some
+maps"* — the hardest possible symptom to trace back to a planner — so the shared packing is
+the point and `test_the_two_sinks_carry_the_SAME_bytes_for_a_row` is what holds it.
+
+`live_vram` used to offer no palette writer at all, with
+`test_this_module_offers_no_way_to_write_a_palette` holding the absence. That guard was
+converted rather than deleted (the shape `92a587bcd` used for #646's three arms): what it
+protects now is the thing two sinks can actually get wrong.
+
+**`check_clut_block` guards less than it looks like it does.** It compares the RAM block
+against what VRAM is showing before writing, to tell `CLUT_BLOCK` from the second copy at
+`0x80099D76`. On MAP062 it **passed** pre-push — both sides held Orbonne's — and the write
+still went nowhere. Agreement establishes that the address is the one feeding the screen; it
+does **not** establish that a write to it arrives. What answers that is the VRAM readback,
+which the push now takes on both sinks.
 
 **A second copy of those 512 bytes sits at `0x80099D76`, and a push into it does not reach
 the screen** — writing row 5 there moved 0 of 32 VRAM bytes. A content scan finds both, so
@@ -448,7 +544,7 @@ and decoding again in the pusher would be two more chances to differ and no more
 | `polygons[].visible_angles` | vertex 1's 4th short | **located** [LIVE] |
 | `polygons[].terrain` (binding) | vertex 0's 4th short | **located** [LIVE] |
 | `map_states[].texture_sheet` | VRAM, four page rectangles at the derived column | **built** — the addon's button, `live_vram.py`, A/B/A screenshot [LIVE] |
-| `map_states[].palettes` | `0x800E4EA4` in **main RAM** — *not* the VRAM CLUT rows | **built** — the addon's button, `live_link.py`, A/B/A screenshot [LIVE] |
+| `map_states[].palettes` | `0x800E4EA4` in **main RAM** **and** VRAM's CLUT column — both, see §2.3 | **built**, the addon's button — RAM half A/B/A screenshot [LIVE]; **the VRAM half is [fake] pending a render** |
 | `map_states[].light_rig` | `0x800F5AF4` + `0x800F5B14` + `0x800F5B40`,
   **and** GTE `cnt13-15` / `cnt16-20` | **built** — §2.2, 20/20 fake-RAM, A/B/A [LIVE] |
 | `terrain` | terrain chunk in RAM | **not located** — decision 4 |
@@ -523,6 +619,13 @@ pushed a geometry edit, which is the thing this rig exists to do.
 >
 > `live_geometry.py`'s search is **not** retired by this. It answers a different question —
 > *is the declared map the loaded one* — and decision 1 still asks it.
+
+> **Second amendment, 2026-08-27 — and the identity claim comes back as a MODE.** The
+> write-path self-check above recovers, as a side effect, the very claim this amendment
+> stopped making: RAM holding the document's own bytes *is* an identification. Decision 10
+> names that, and makes it a choice rather than an accident — the artist says whether they are
+> editing the loaded map or replacing it, because no RAM address holding the current map id is
+> known and the declaration has to come from the person who loaded the savestate.
 
 ### Decision 3 — the loop pokes RAM; it does not patch the ISO
 
@@ -1115,6 +1218,68 @@ records what fix 3 opens — a cross-group aim now lands, and until leg 3 it lan
 
 ---
 
+### Decision 10 — *editing the loaded map* and *replacing it* are two acts, not one with a flag
+
+Reported as the whole of what the loop is for: *"I just want to be able to hot swap entire
+maps."* Load any battle, push any `MAP###.a#` document, see that map.
+
+Most of it was already built and this decision does not rebuild any of it. The engine's four
+polygon arrays are **fixed-capacity and engine-global** (ADR-0004 decision 28), not per-map
+allocations, so a different map's polygons go in the same slots — a swap is *"write different
+bytes into slots that already exist"*, which is exactly what the push does. Decision 8's count
+ordering already handles a size change in both directions. What stood in the way was one
+thing: **the self-check's premise.**
+
+`selfcheck` demands that RAM already hold the document's own bytes. That is decision 7's
+mechanism, and it is also — as decision 7's own text says — the identity claim decision 2's
+amendment stopped making, *recovered as a side effect*. A swap violates it on purpose. And it
+cannot simply be stood down: it is what catches an off-by-one in a stride, a vertex offset or
+a field mask, before thousands of bytes go to a guessed address.
+
+So the check is **exchanged, not dropped**, and the two acts are named:
+
+- **Push to PCSX** — edit the map the emulator has loaded. `selfcheck` as before.
+- **Replace the loaded map** — install this document over whatever is there.
+  `live_link.check_plan_bounds` in its place.
+
+The bounds proof is the one fact about these addresses that does not depend on which map is
+loaded: every planned address must land inside the array it names. It grades the **plan**, not
+the descriptor's counts — `check_capacity` already does the latter and cannot see a plan built
+at a wrong origin, which is precisely the class of bug the content check was standing in front
+of. The extents are cross-checked rather than restated: `SINKS`' six bases were measured one
+at a time against a live battle, `ENGINE_CAPACITY`'s four numbers are `slti` immediates, the
+strides are vertex counts, and each array's end has to land on the next thing measured — the
+textured-quad normal array's on `FUN_8012cc54`'s first byte, which is why that address is in
+the module at all.
+
+**It is weaker, and the report says so.** A wrong stride that stays inside the array passes
+here and would have failed there. A weaker check reported in the same words as the strong one
+is worse than no check: the artist reads *"self-check passed"* and believes the thing that was
+not proved.
+
+**Two buttons, not a checkbox.** A checkbox reads as a setting on one act, and would leave the
+artist to notice on their own that the check quietly became a different one. `skip_selfcheck`
+stays hidden and stays out of the panel — a swap now has a proof it can pass, so an artist
+never needs the escape hatch that has none.
+
+**Two legs a swap does not deliver, both said in the report rather than left to be found.**
+
+- *The terrain grid.* `UNPUSHED` has named it on every push. On the artist's own map it is a
+  curiosity about one field; on somebody else's it is the whole story — units walk the map
+  that was replaced while looking at this one. So the swap says it in its own words. **This is
+  a picture, not a playable map**; `build` is what ships one.
+- *The sheet and the CLUT rows.* Their VRAM addresses are **derived** from the live packets
+  (decision 5), and on a swap those packets belong to the map being replaced. The derivation
+  is self-consistent — the packet plan keeps the loaded map's base bits and replaces only the
+  two masked fields, so the polygons point at the column the sheet is written to — but it is
+  the *replaced* map's layout both halves agree on. §5.3 is what that measured out to.
+
+Graded against the fake emulator by seeding a coherent **foreign map**: the document's own
+polygons displaced, at the same addresses, with the descriptor declaring three quads where the
+document has one. Garbage would have passed an arm that only asked *"is RAM not ours"* and
+would not have exercised the shrink. The default mode refuses it, as it always has; the swap
+replaces the geometry **and** the counts.
+
 ## 5. What is not proven yet
 
 Everything marked [STATIC] above is read from the disassembly and has **not** been
@@ -1216,6 +1381,95 @@ And one from the geometry leg that will bite any new sink: FFT stores vertices *
 polygon**, welded to nothing, so a transform that is a function of anything other than the
 vertex's own coordinates tears every shared edge. Confetti is usually the input, not the
 write.
+
+### 5.3 The savestates, and the map whose sheet spans TWO bands
+
+**[LIVE], 2026-08-27, offline.** A savestate is a full RAM snapshot, so the emulator is not
+needed to ask it anything: gzip, protobuf, top-level field 3 (`Memory`), its sub-field 1 (8 MB
+of main RAM) at absolute offset **39**, and `check_descriptors` reads straight out of it. That
+route answered two questions the live link had left open.
+
+**Which map is in each savestate**, identified by *content* rather than by counts — the disc
+resource's positions planned at the descriptor's own start indices and compared byte for byte:
+
+| savestate | descriptor counts | resource | positions differing |
+|---|---|---|---|
+| `SCUS94221.sstate1` | — | — | no map loaded (the block does not pass the gate) |
+| `SCUS94221.sstate2` | 24 / 361 / 18 / 51 | `MAP022.9` | **0 of 10,644** |
+| `SCUS94221.sstate3` | 132 / 599 / 6 / 46 | `MAP062.8` | **0 of 17,964** |
+
+The counts are unique across the 186 geometry-carrying resources in the corpus, so the search
+returns one candidate; the byte comparison is what turns that into knowledge. `sstate3` is
+therefore the pair a swap wants — MAP062 loaded, a MAP022 document to push, a pure shrink in
+every bucket.
+
+**Where each map's sheet and CLUT block live** — `packet_witnesses` + `derive_addresses`, run
+against the same two snapshots:
+
+| map | witnesses | sheet | CLUT |
+|---|---|---|---|
+| MAP022 | 385 | (768, 0), all agreeing | (0, 480), all agreeing |
+| MAP062 | 731 | **725** at (768, 0), **6** at (768, 256) | 725 at (0, 480), 6 at (768, 480) |
+
+Two findings, and the second is the one nobody was looking for.
+
+1. **The two maps put their sheet and their CLUT block at the same address.** That is the
+   assumption decision 10's swap rests on — writing your sheet into the host map's rectangles
+   — and on this pair it holds. One pair is not the corpus; it is the pair the repo can reach.
+
+2. **MAP062's sheet spans two 256-pixel bands, and it is the DISC that says so.** The six
+   dissenting polygons carry `texture_byte6_high_nibble = 1`, which is bit 4 of the TPAGE word
+   — y in 256-pixel units. `plan_sheet` writes four page rectangles side by side in **one**
+   band (`PAGE_WIDTH` apart at `at.sheet_y`), so those six sample from VRAM no push writes.
+
+   The consequence is live today and has nothing to do with swapping: `derive_addresses`
+   refuses on a single dissenter — *"disagreement is a refusal, not a vote"*, decision 5 — so
+   **the whole sheet-and-palette leg is lost on MAP062 over six polygons of 731**. Whether a
+   majority address with a named minority is the better trade is decision 5's to reopen; it is
+   not decided here. What did change is that the refusal now reports the **tally** rather than
+   stopping at the first dissenter, because *"polygon 0 says (768, 0) and polygon 55 says
+   (768, 256)"* cannot tell a two-band map from a corrupt packet, and those want opposite
+   responses. Six of 731 reads as a map; half of 731 reads as a rig.
+
+   **The corpus survey is run** (#646): `texture_byte6_high_nibble` over all **169 textured
+   resources** says **23 of them (13.6%)** carry more than one nibble, always a tiny minority
+   of `1`, worst case **18 of 539** on `MAP039.9` — and **no resource is split anywhere near
+   the middle**. So the premise the refusal rests on, *"the packets are not describing the
+   layout this module believes in"*, is measurably false for this shape: the majority address
+   is never in doubt anywhere in the corpus, and today's policy costs the whole leg on one map
+   in seven. Reopening decision 5 to derive the majority and NAME the minority is the
+   recommendation on #646; it is not taken here, because weakening a refusal is the artist's
+   call and this session's own rule was that a check gets a MODE, not a lenient version.
+
+   *(Taken since, in `92a587bcd`: `derive_addresses` writes to the majority address and
+   `picture_plan` names the minority. `DISSENT_LIMIT` is 10%, which no shipped map comes
+   near — the worst is 3.3%.)*
+
+3. **Why the dissenters dissent — and it makes the majority fix COMPLETE, not a compromise.**
+   The obvious reading of "write to the majority address and name the minority" is that the
+   named polygons keep the old map's picture: 380 faces right, 5 faces stale. Measured over
+   the whole corpus, that reading is wrong, and the trade is better than it was sold as.
+
+   All **78** dissenting polygons, across all 23 resources, have **every UV corner at the same
+   point** — they sample a single texel:
+
+   | | polygons | all UV corners identical |
+   |---|---|---|
+   | dissenting (second band) | 78 | **78 — 100%** |
+   | every other textured polygon | 73,810 | 3,441 — **4.66%** |
+
+   A polygon that samples one texel has no texture mapping to get wrong, so **the texture page
+   is a don't-care on every one of them** — the stray second-band bit is junk riding along on a
+   UV that was already junk. On MAP062 the six land on texel index 0 → CLUT entry `0x0000` →
+   fully transparent, in a patch of that band which is otherwise empty. They draw nothing.
+   Every one of the 78 is `texture_page = 1` with `palette_id = 4` (or `0` on `MAP043` and
+   `MAP059`), which is the signature of a single degenerate construct repeated across the
+   corpus rather than 23 independent authoring accidents.
+
+   **Consequence:** the majority fix is not 380-of-385 — it is complete, and the note
+   `picture_plan` emits is a disclosure rather than a defect count. And #646's **option 3**,
+   *"teach `plan_sheet` two bands"*, buys nothing: it would spend a second set of rectangles
+   painting texels no polygon meaningfully samples. It should be closed off.
 
 ## 6. Getting to a battle
 

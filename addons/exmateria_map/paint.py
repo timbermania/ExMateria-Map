@@ -962,9 +962,10 @@ class _PaintPanel:
     subject* -- the sheet's pixels.  But registered ONLY for `IMAGE_EDITOR` it
     does not draw at all in a layout without one, which is every factory
     workspace except `UV Editing` / `Texture Paint` / `Shading` /
-    `Compositing`.  So it is registered twice and the viewport copy polls
-    itself away wherever the Image Editor copy can be seen: present exactly
-    once, always.
+    `Compositing`.  So it is registered twice, and **both copies draw**: the
+    viewport copy used to poll itself away wherever an Image Editor was
+    visible, which was right while it was a fallback and wrong once the model
+    became the paint surface.  See `MAP_PT_paint_view`.
 
     `NO_EDITOR_HINT` lives on the viewport copy alone.  Told "no Image Editor
     open" *inside an Image Editor* the artist would be reading a lie.
@@ -1042,7 +1043,18 @@ class _PaintPanel:
             # push ships the Sheet as it stands, so pressing one of these is
             # the only thing that ever moves it.
             from .compile_op import (MAP_OT_recalculate_palettes,
-                                     MAP_OT_reselect_clusters)
+                                     MAP_OT_reselect_clusters, freshness)
+            # ADR-0186 Amendment 5. Decision 13 makes a stale Sheet a legal
+            # map and forbids GATING on freshness; it does not forbid saying
+            # so. Without this the artist paints, pushes, sees nothing move,
+            # and has no way to tell "my stroke was lost" from "the cache has
+            # not been rebuilt" -- the two look identical and only one is a
+            # problem. Reported from use, and it cost a session.
+            state_of, said = freshness(ob, sheet, painting)
+            if said:
+                layout.label(text=said, icon={
+                    "stale": "FILE_REFRESH", "fresh": "CHECKMARK",
+                    "never": "INFO"}.get(state_of, "QUESTION"))
             col = layout.column(align=True)
             col.operator(MAP_OT_recalculate_palettes.bl_idname,
                          icon="COLORSET_10_VEC")
@@ -1152,27 +1164,40 @@ class MAP_PT_paint(_PaintPanel, Panel):
 
 
 class MAP_PT_paint_view(_PaintPanel, Panel):
-    """The same panel, for every layout that has no Image Editor in it."""
+    """The same panel, in the 3D viewport -- where the model is painted.
+
+    **There is no `poll`, and its absence is the decision.**  This copy used
+    to stand down wherever an Image Editor was visible, because it existed as
+    a FALLBACK: its whole reason to be was `says_where_the_sheet_went` --
+    *"you have no Image Editor, here is where the sheet went."*  ADR-0186
+    Amendment 6 inverts that premise.  After a conversion the sheet is not an
+    unwrap at all (islands are placed by area fit, so adjacency in the atlas
+    means nothing) and the MODEL is the paint surface.  The Map workspace has
+    an Image Editor by construction, so under the old poll the artist painted
+    on the model in one pane while brush size, falloff, strength and the
+    colour picker lived in the other.
+
+    Deleting it is the whole fix, because the poll conflated two questions --
+    *"should this panel draw here"* and *"should it explain where the sheet
+    went"* -- and the second **already has its own guard**, in
+    `_PaintPanel.draw`: `if self.says_where_the_sheet_went and not free`.  The
+    hint stays silent in the Map workspace on its own terms, because that
+    pane's Image Editor holds the sheet -- an ordinary `IMAGE`, not a render
+    -- so `image_editor_spaces()` counts it free.
+
+    Consequence, and it is intended: in a layout holding both editors the
+    panel draws in BOTH sidebars, in full.  Each pane's sidebar is
+    independent, which is ordinary Blender, and the duplication lands entirely
+    on the direct-paint branch -- the path where this copy has no job and the
+    artist collapses it once.  A trimmed viewport variant was considered and
+    rejected: `_PaintPanel` already carries one variation axis, and a second
+    would make a two-case panel a four-case one.
+    """
     bl_space_type = "VIEW_3D"
+    # Renumbered again when `What a push carries` was deleted; the
+    # remaining five keep their relative order.
     bl_order = 2
     says_where_the_sheet_went = True
-
-    @classmethod
-    def poll(cls, context):
-        """Stand down wherever the Image Editor copy can already be seen.
-
-        `context.screen.areas` and NOTHING else.  This deliberately does not
-        use `image_editor_spaces()`: that helper walks `bpy.data.screens` --
-        every screen in every workspace -- which is the right answer to *"can
-        the sheet be loaded into an editor somewhere"* and the WRONG answer to
-        *"is one visible right now."*  Pointed at the second question it finds
-        `UV Editing`'s Image Editor on a screen the artist is not looking at
-        and suppresses this copy everywhere, re-introducing the exact defect
-        the helper's own docstring says it was written to fix.
-        """
-        screen = getattr(context, "screen", None)
-        areas = getattr(screen, "areas", None) or ()
-        return not any(a.type == "IMAGE_EDITOR" for a in areas)
 
 
 CLASSES = (MAP_OT_apply_paint, MAP_OT_paint_sheet, MAP_OT_seed_brush,

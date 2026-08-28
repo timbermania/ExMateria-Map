@@ -11,7 +11,7 @@ the emulator-gated proof is not.
 
 ## VRAM is writable, and the rig used to believe it was not
 
-`tools/live_push.py` and `tools/live_geometry.py` both stated that this fork
+`tools/live_push.py` and `tools/live_geometry.py` both stated that pcsx-redux
 "exposes no VRAM write -- `POST /api/v1/gpu/vram/raw` is a 400", and built a
 savestate round trip around it: save the moment, patch the sheet's bytes inside
 the 19 MB state, load it back. The premise was **false**, and the reason it
@@ -262,16 +262,32 @@ CLUT_ENTRIES = 16
 CLUT_ROWS = 16
 CLUT_BLOCK_BYTES = CLUT_ROWS * CLUT_ENTRIES * 2
 
-#: **The palettes are NOT pushed here.** They are VRAM's CLUT rows and they are
-#: not VRAM's to keep: the engine re-uploads the whole block from main RAM every
-#: frame, so a write here is reverted within 50 ms (measured [LIVE], four
-#: delays, against a sheet write at the same moment that held for a full second).
-#: `live_link.plan_palettes` writes the RAM block that feeds this one.
+#: **The palettes are pushed here AND to main RAM, and that correction is what
+#: this block is about.** This module used to state flatly that a CLUT write
+#: here is "reverted within 50 ms" and offered no writer at all, with a test
+#: holding the absence. The measurement behind it was real and it was taken on
+#: **Gariland** -- and Gariland (`MAP022.9`) is one of the **42** textured
+#: resources of 169 whose `0x70` chunk carries a palette ANIMATION. The
+#: per-frame re-upload from `live_link.CLUT_BLOCK` *is* that animation running.
 #:
-#: What this module still does with these rows is READ them: they are the
+#: On the other **127** nothing re-uploads the block after map load, so:
+#:
+#:   - a VRAM CLUT write STICKS -- measured [LIVE] 2026-08-27 on Orbonne
+#:     (`MAP062.8`), 0 of 512 bytes back at +0.0 s, +0.5 s and +2.0 s, and it
+#:     survived a full map load;
+#:   - the RAM write is byte-perfect and INVISIBLE -- the same session pushed
+#:     `CLUT_BLOCK` to 0 of 512 off the document while all 16 VRAM rows still
+#:     held Orbonne's.
+#:
+#: So both sinks are written and neither is a fallback: on the 42 the RAM block
+#: overwrites these rows on the next frame, which is exactly the behaviour that
+#: was originally measured, and on the 127 this is the only sink the artist can
+#: see. `docs/live-link-v1.md` §2.3.
+#:
+#: What this module ALSO does with these rows is READ them: they are the
 #: independent witness that `live_link.CLUT_BLOCK` is the block actually on
 #: screen, which is the one thing a RAM-only check cannot establish about
-#: itself -- a second, inert copy of the same 512 bytes sits elsewhere in RAM.
+#: itself -- a second copy of the same 512 bytes sits elsewhere in RAM.
 
 
 def clut_block(vram, at: "Derived") -> bytes:
@@ -288,6 +304,43 @@ def clut_block(vram, at: "Derived") -> bytes:
 
 
 # --- reading and writing a rectangle ---------------------------------------
+
+def plan_clut(rows, at: "Derived") -> list[Rect]:
+    """One rectangle per declared CLUT row, at the DERIVED block address.
+
+    `rows` is `live_link.clut_rows`' output -- `(row index, BGR555 bytes)` --
+    so the bytes that reach VRAM and the bytes that reach main RAM come from
+    one packing. Two sinks for one document field is two chances to write
+    different colours, and the artist would meet the divergence as *"the
+    palettes are wrong on some maps"*, because which sink they can see depends
+    on whether the map animates its palettes.
+
+    A rectangle per row rather than one 256x1 covering the whole block: the 16
+    rows ARE contiguous in x, so one POST would work, but a row is the unit
+    decision 3 needs -- `verify` names what did not hold, and *"the rectangle
+    at (0, 480)"* is not something an artist can act on where *"CLUT row 13"*
+    is. On the 42 animating maps rows 13-15 routinely will not hold, and that
+    is a report, not a failure.
+
+    `at` rather than `CLUT_Y` for decision 5's reason, unchanged: the
+    constants are what the derivation is CHECKED against, never what the push
+    runs on.
+    """
+    out = []
+    for row, data in rows:
+        if not 0 <= row < CLUT_ROWS:
+            raise VramError(
+                f"CLUT row {row} is outside the block's {CLUT_ROWS} rows. "
+                f"Writing it would paint whatever VRAM holds beside the "
+                f"block at ({at.clut_x}, {at.clut_y})")
+        if len(data) % 2 or len(data) > CLUT_ENTRIES * 2:
+            raise VramError(
+                f"CLUT row {row} carries {len(data)} byte(s); a row is up to "
+                f"{CLUT_ENTRIES} BGR555 entries, so {CLUT_ENTRIES * 2} bytes")
+        out.append(Rect(at.clut_x + row * CLUT_ENTRIES, at.clut_y,
+                        len(data) // 2, 1, data, f"CLUT row {row}"))
+    return out
+
 
 def rect_bytes(vram, rc: Rect) -> bytes:
     """What VRAM currently holds inside `rc` -- the rectangle's own bytes, in
@@ -356,13 +409,23 @@ def verify(client, rects: list[Rect]) -> list[tuple[Rect, int]]:
 # --- decision 5: derive the address, then verify the identity ---------------
 
 class Derived(NamedTuple):
-    """Where this map's sheet and CLUTs actually sit, per the engine."""
+    """Where this map's sheet and CLUTs actually sit, per the engine.
+
+    `sheet_dissent` / `clut_dissent` are how many witnesses named a DIFFERENT
+    address than the one carried here. Zero on 146 of the corpus's 169 textured
+    resources; on the other 23 it is a handful, and those polygons keep
+    whatever texture was already in VRAM. A caller that does not report them is
+    telling the artist their sheet landed everywhere, which is the one thing
+    this field exists to prevent.
+    """
 
     sheet_x: int
     sheet_y: int
     clut_x: int
     clut_y: int
     witnesses: int
+    sheet_dissent: int = 0
+    clut_dissent: int = 0
 
 
 #: How a PSX CLUT attribute halfword packs its VRAM address, and how a TPAGE
@@ -372,6 +435,52 @@ class Derived(NamedTuple):
 CLUT_X_UNIT = 16
 TPAGE_X_UNIT = 64
 TPAGE_Y_UNIT = 256
+
+
+#: How much dissent is still a MAP rather than a broken rig. Measured over the
+#: corpus: 23 of 169 textured resources carry a second texture-page band, and
+#: the largest minority anywhere is 18 of 539 -- **3.3%** (`MAP039.9`). So a
+#: tenth is a bound no shipped map comes near, which is what makes it a
+#: separator rather than a tuning knob: below it the majority address is not in
+#: doubt and the minority is a handful of polygons to be NAMED; above it the
+#: packets really are not describing the layout this module believes in, and
+#: decision 5's refusal stands unchanged.
+DISSENT_LIMIT = 0.10
+
+
+def _majority(what: str, tally: dict, total: int,
+              remedy: str) -> tuple[tuple[int, int], int]:
+    """Raise naming the WHOLE tally when one field's witnesses disagree.
+
+    Refusal, not a vote -- decision 5, unchanged. What changed is what the
+    refusal says. It used to stop at the first dissenting polygon and report
+    two addresses, and *"polygon 0 says (768, 0) and polygon 55 says
+    (768, 256)"* cannot tell a two-band map from a corrupt packet, which is
+    the one thing the artist needs to know because the two want opposite
+    responses.
+
+    Measured 2026-08-27 on `SCUS94221.sstate3`, which holds **MAP062**
+    (resource `MAP062.8`, identified by content: 0 of 17,964 position bytes
+    differ from the disc). 725 of its 731 witnesses put the sheet at (768, 0)
+    and **six** put it at (768, 256) -- and the disc says the same, its
+    `texture_byte6_high_nibble` being 1 on exactly those six. So this is a map
+    whose sheet spans two 256-pixel bands, and today the whole sheet-and-CLUT
+    leg is lost on it over six polygons of 731. Whether a majority address
+    plus a named minority is the better trade is a decision for decision 5's
+    owner; a tally is what lets it be made at all.
+    """
+    ranked = sorted(tally.items(), key=lambda kv: -len(kv[1]))
+    if len(ranked) == 1:
+        return ranked[0][0], 0
+    dissent = total - len(ranked[0][1])
+    if dissent > total * DISSENT_LIMIT:
+        rows = "; ".join(f"{len(w):,} say {a}" for a, w in ranked)
+        raise VramError(
+            f"the live packets disagree about where the {what}: {rows}, of "
+            f"{total:,} witness(es). That is {dissent / total:.0%} dissenting, "
+            f"above the {DISSENT_LIMIT:.0%} no shipped map reaches -- the "
+            f"first is polygon {ranked[1][1][0]}. {remedy}")
+    return ranked[0][0], dissent
 
 
 def derive_addresses(witnesses) -> Derived:
@@ -404,34 +513,34 @@ def derive_addresses(witnesses) -> Derived:
             "defaulting to the addresses another map was measured at would be "
             "this module asserting the measurement it was asked to make")
 
-    sheet, clut = None, None
+    sheets: dict[tuple[int, int], list[int]] = {}
+    cluts: dict[tuple[int, int], list[int]] = {}
     for i, (live_clut, live_tpage, pid, page) in enumerate(witnesses):
         cx = ((live_clut & 0x3F) - pid) * CLUT_X_UNIT
         cy = live_clut >> 6
         sx = ((live_tpage & 0x0F) - page) * TPAGE_X_UNIT
         sy = ((live_tpage >> 4) & 1) * TPAGE_Y_UNIT
-        if sheet is None:
-            sheet, clut = (sx, sy), (cx, cy)
-            continue
-        if (sx, sy) != sheet:
-            raise VramError(
-                f"the live packets disagree about where the texture sheet is: "
-                f"polygon 0 says {sheet} and polygon {i} says {(sx, sy)}. "
-                "Refusing to write 131,072 bytes at an address the engine "
-                "does not agree on")
-        if (cx, cy) != clut:
-            raise VramError(
-                f"the live packets disagree about where the CLUT rows are: "
-                f"polygon 0 says {clut} and polygon {i} says {(cx, cy)}. "
-                "Refusing to write palettes at an address the engine does not "
-                "agree on")
-    return Derived(sheet[0], sheet[1], clut[0], clut[1], len(witnesses))
+        sheets.setdefault((sx, sy), []).append(i)
+        cluts.setdefault((cx, cy), []).append(i)
+
+    sheet, sheet_dissent = _majority(
+        "texture sheet is", sheets, len(witnesses),
+        "Refusing to write 131,072 bytes at an address the engine does "
+        "not agree on")
+    clut, clut_dissent = _majority(
+        "CLUT rows are", cluts, len(witnesses),
+        "Refusing to write palettes at an address the engine does not "
+        "agree on")
+    return Derived(sheet[0], sheet[1], clut[0], clut[1], len(witnesses),
+                   sheet_dissent, clut_dissent)
 
 
 # --- the transport ----------------------------------------------------------
-# The fork's GPU endpoint, and nothing more. Same shape as `live_link.LuaClient`
-# and for the same reasons (ADR-0005 decision 5): stdlib only, no dependency on
+# One GPU endpoint, and nothing more. Same shape as `live_link.RamClient` and
+# for the same reasons (ADR-0005 decision 5): stdlib only, no dependency on
 # `pcsx-agent`, because an addon an artist installs cannot pip-install anything.
+# `GET`/`POST /api/v1/gpu/vram/raw` is **upstream** pcsx-redux; nothing on this
+# leg has ever needed our fork.
 
 import urllib.error      # noqa: E402  -- kept beside the transport it serves
 import urllib.request    # noqa: E402
@@ -447,8 +556,8 @@ VRAM_BYTES = VRAM_WIDTH * VRAM_HEIGHT * 2
 def check_rect(rc: Rect) -> None:
     """Refuse a rectangle the endpoint would 400, while it can still be named.
 
-    Every guard here was measured on the live fork, and each one is a plain
-    400 with no body worth reading. That is the reason for checking twice: a
+    Every guard here was measured against a live emulator, and each one is a
+    plain 400 with no body worth reading. That is the reason for checking twice: a
     bare `400` tells the artist nothing about which of five rectangles was
     malformed or by how much, and on this leg the likely fault -- a mis-sliced
     page -- is exactly the one a length check identifies precisely.
@@ -471,12 +580,13 @@ def check_rect(rc: Rect) -> None:
 
 
 class VramClient:
-    """`GET`/`POST /api/v1/gpu/vram/raw` -- the fork's window onto GPU memory.
+    """`GET`/`POST /api/v1/gpu/vram/raw` -- the window onto GPU memory.
 
-    The GET returns the whole 1 MB image. The POST takes a rectangle **in the
-    query string** and that rectangle's pixels as the body; without the query
-    string it is a 400, which is the entire reason two docstrings in this repo
-    claimed the fork could not write VRAM at all.
+    **Upstream pcsx-redux, not our fork.** The GET returns the whole 1 MB
+    image. The POST takes a rectangle **in the query string** and that
+    rectangle's pixels as the body; without the query string it is a 400,
+    which is the entire reason two docstrings in this repo claimed pcsx-redux
+    could not write VRAM at all.
     """
 
     def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):

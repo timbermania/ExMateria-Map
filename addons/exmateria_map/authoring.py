@@ -420,7 +420,17 @@ class MAP_OT_check_drift(Operator):
             else markers(context.scene)[0]
         _SIGNATURE.pop(ob.name, None)
         n, fixed = sync_drift(ob)
-        self.report({"INFO"}, f"{n} drifted, {fixed} with a declared fix")
+        # Both counts, and the SHADOWED one the panel used to carry on its own
+        # row -- a tile that drifted but that the document already declares is
+        # not a problem, and an artist reading `3 drifted` without it goes
+        # looking for three.
+        shadowed = ob.get("exmateria_map/drift_shadowed") or 0
+        said = f"{n} drifted, {fixed} with a declared fix"
+        if shadowed:
+            said += (f"; {shadowed} more drifted, but the document already "
+                     f"declares those tiles")
+        print(f"EXMATERIA-MAP terrain: {said}")
+        self.report({"INFO"}, said)
         return {"FINISHED"}
 
 
@@ -494,6 +504,39 @@ def _footprint(g, sx, sz):
     me.name = f"grid {sx}x{sz}"
 
 
+def _print_growth_preview(grid):
+    """The four growth numbers §7.5 states, to stdout.
+
+    They were four label rows in `MAP_PT_terrain` and are the bulk of the text
+    the artist asked to have out of the column.  Printed rather than dropped:
+    *"tiles created that a file outside the map names"* is a REFUSAL waiting to
+    happen, and `externally_pinned` distinguishes `0` from `n/a -- pin table
+    missing`, which is exactly the distinction a silent panel loses.
+
+    Takes the GRID (`_extent_update`'s `self`) and finds its marker, because
+    `growth_preview` is written against the marker.  Never raises: this is a
+    print on a property update, and an exception here would abort the typed
+    edit that triggered it.
+    """
+    try:
+        marker = next((m for m in markers(bpy.context.scene)
+                       if grid_extent(m) is not None
+                       and grid_extent(m)[0] == grid), None)
+        if marker is None:
+            return
+        pv = growth_preview(marker)
+        if not pv:
+            return
+        pinned = ("n/a — pin table missing" if pv["externally_pinned"] is None
+                  else pv["externally_pinned"])
+        print(f"EXMATERIA-MAP terrain: {pv['created']} tile handle(s) to "
+              f"create, {pv['changed']} existing tile(s) changed, "
+              f"0 already carrying a record (not in the document), "
+              f"{pinned} named by a file outside the map")
+    except Exception as exc:                       # never break a typed edit
+        print(f"EXMATERIA-MAP terrain: growth preview unavailable ({exc})")
+
+
 def _extent_update(self, context):
     """The clamp, as the field is typed (§7.1).  `self` is the grid object."""
     if self.get("_extent_busy"):
@@ -512,6 +555,14 @@ def _extent_update(self, context):
     self["size_x"], self["size_z"] = x, z
     self["extent_message"] = msg
     _footprint(self, x, z)
+    # The panel is controls-only now, so the clamp and the growth preview say
+    # themselves HERE -- on the typed change, which is when they are true and
+    # is once per edit rather than once per redraw.  `extent_message` is still
+    # stored: it is what a refused SizeX is explained by, and a field that
+    # snaps back with nothing said anywhere is the defect this print prevents.
+    if msg:
+        print(f"EXMATERIA-MAP terrain: {msg}")
+    _print_growth_preview(self)
 
 
 def pin_table(ob):
@@ -609,8 +660,10 @@ class MAP_OT_apply_growth(Operator):
                         o[f] = 1 if f == "impassable" else 0
                 have[(x, z)] = o
                 made += 1
-        self.report({"INFO"}, f"{made} tile handle(s) created; the extent "
-                              f"itself grew when the field was set")
+        said = (f"{made} tile handle(s) created; the extent itself grew when "
+                f"the field was set")
+        print(f"EXMATERIA-MAP terrain: {said}")
+        self.report({"INFO"}, said)
         return {"FINISHED"}
 
 
@@ -625,6 +678,8 @@ class MAP_PT_terrain(Panel):
     bl_region_type = "UI"
     bl_category = "Map"
     bl_label = "Terrain"
+    # Renumbered again when `What a push carries` was deleted; the
+    # remaining five keep their relative order.
     bl_order = 3
 
     def draw(self, context):
@@ -642,36 +697,32 @@ class MAP_PT_terrain(Panel):
             layout.label(text="no terrain grid in this arrangement",
                          icon="INFO")
             return
-        g, sx, sz = ext
-        box = layout.box()
-        box.label(text=f"Grid {sx} x {sz}", icon="GRID")
-        box.prop(g, "exmateria_map_size_x", text="SizeX")
-        box.prop(g, "exmateria_map_size_z", text="SizeZ")
-        msg = g.get("extent_message") or ""
-        if msg:
-            box.label(text=msg, icon="ERROR")
-        pv = growth_preview(marker)
-        if pv:
-            box.label(text=f"tile handles to create: {pv['created']}")
-            box.label(text=f"existing tiles changed: {pv['changed']}")
-            box.label(text="tiles created that already carry a record: n/a "
-                           "(not in the document)")
-            box.label(text=("tiles created that a file outside the map names: "
-                            + ("n/a — pin table missing"
-                               if pv["externally_pinned"] is None
-                               else str(pv["externally_pinned"]))))
-        box.operator(MAP_OT_apply_growth.bl_idname, icon="ADD")
-        d = layout.box()
-        n = marker.get("exmateria_map/drift_count")
-        fixed = marker.get("exmateria_map/drift_fixed")
-        shadowed = marker.get("exmateria_map/drift_shadowed") or 0
-        d.label(text=(f"{n} drifted, {fixed} with a declared fix"
-                      if n is not None else "drift not checked yet"),
-                icon="ERROR" if n else "CHECKMARK")
-        if shadowed:
-            d.label(text=f"{shadowed} more drifted, but the document already "
-                         f"declares those tiles", icon="INFO")
-        d.operator(MAP_OT_check_drift.bl_idname, icon="FILE_REFRESH")
+        g, _sx, _sz = ext
+        # CONTROLS ONLY.  Reported from use: *"terrain is ok... it just has a
+        # bunch of text taking up too much space for no reason.  That text
+        # should just be sent to the terminal -- or something.  just the 3
+        # buttons size x, size z, and apply growth."*
+        #
+        # Eight label rows went: the `Grid sx x sz` header (the two fields
+        # below it already say it), the clamp message, the four growth-preview
+        # numbers and the two drift counts.  None of them are DELETED -- every
+        # one is printed, and the two that answer a question the artist asked
+        # by pressing something are on that operator's report as well.
+        #
+        # They print from the places that FIRE ON A CHANGE -- `_extent_update`
+        # when a field is typed, the two operators when they are pressed --
+        # and never from here.  `draw` runs on every redraw of the region, so
+        # a print in this method is a print per mouse-move; the terminal it was
+        # sent to would be unreadable, and `growth_preview` walks the tiles.
+        col = layout.column(align=True)
+        col.prop(g, "exmateria_map_size_x", text="SizeX")
+        col.prop(g, "exmateria_map_size_z", text="SizeZ")
+        col.operator(MAP_OT_apply_growth.bl_idname, icon="ADD")
+        # Kept, against the literal "just the 3 buttons": Check drift is a
+        # BUTTON and the report was the complaint.  Its counts print and land
+        # on the operator report; there is no other door to a drift resync, so
+        # deleting it would remove a feature rather than a paragraph.
+        layout.operator(MAP_OT_check_drift.bl_idname, icon="FILE_REFRESH")
 
     def _tile(self, layout, ob):
         kind = ob.get("exmateria_map/tile")

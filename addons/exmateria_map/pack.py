@@ -1,8 +1,9 @@
 """Placing islands into the sheet's four 256x256 texture pages.
 
-ADR-0186 decision 2 gives every chart an island; this is where the islands
-go.  The budget is the format's own sheet -- 131,072 bytes of 4bpp indices,
-four 256x256 pages -- and there is nothing else to spend.
+ADR-0186 Amendment 6 decision 22 gives every textured POLYGON an island --
+decision 2 said every chart, Amendment 1 every UV-connected piece of one --
+and this is where the islands go.  The budget is the format's own sheet:
+131,072 bytes of 4bpp indices, four 256x256 pages, and nothing else to spend.
 
 **Gutter 0.**  The PSX GPU point-samples: no filtering, no mipmaps, so a
 texel's neighbour never bleeds into it.  The shipped data relies on this --
