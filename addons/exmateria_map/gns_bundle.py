@@ -294,7 +294,13 @@ class EXPORT_OT_bundle(Operator):
             return {"CANCELLED"}
 
         with suspended():               # §6.1, as on the document export side
+            # Decision 25 -- the third way out, and it compiles like the other
+            # two, before `assemble` reads the mesh and not inside it.
+            from .compile_op import ensure_compiled
+            compiled_notes = ensure_compiled(ob)
             document, sidecars, rep = assemble(ob)
+        for note in compiled_notes:
+            self.report({"INFO"}, note)
         ob["exmateria_map/last_export"] = json.dumps(rep.lines())
         from .report_log import record
         summary = [describe_divergence(rep)] + list(rep.lines())

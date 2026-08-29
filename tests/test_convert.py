@@ -601,3 +601,111 @@ def test_a_state_sheet_and_its_painting_are_carried_by_one_unwrap():
             assert (rows_painted(painting, p_after)
                     == [bytes(b for i in line for b in row[i])
                         for line in indices_read(carried, p_after)])
+
+
+# ---------------------------------------------------------------------------
+# ADR-0186 Amendment 10 -- the Painting gains a SCALE.
+#
+# Decision 34 adds a spatial axis to this path: the Painting is N pixels per
+# texel, the Sheet stays one.  Decision 37 puts the shrink in FRONT of the
+# compile, so nothing under `compile_sheet` learns N existed -- which makes
+# these two claims the whole contract this module owes it.
+# ---------------------------------------------------------------------------
+
+import resample as R                                        # noqa: E402
+
+
+@pytest.mark.parametrize("n", [1, 2, 4])
+def test_criterion_2_a_conversion_at_N_bakes_what_1x_bakes(n):
+    """Amendment 10 grading criterion 2, at the seam that decides it.
+
+    Conversion REPLICATES a disc texel into an N x N block of identical
+    pixels, so the box average in front of the compile gives that byte back
+    and `compile_sheet` is handed the same 256x1024 buffer at every scale.
+    That is what keeps decision 7's "the first compile is a no-op" true on the
+    spatial axis, as an exact byte claim rather than an approximate one.
+
+    Three things move together or the claim is empty: the Painting scales, the
+    **Sheet does not** (it is the 4bpp resource the game reads), and the UVs
+    do not either -- they address the Sheet's texel space, and Blender samples
+    the Painting through normalised coordinates, so one unwrap serves both.
+    """
+    polygons = [
+        quad([(40, 40), (48, 40), (40, 48), (48, 48)],
+             [(0, 0, 0), (1, 0, 0), (0, 0, 1), (1, 0, 1)]),
+        quad([(200, 90), (208, 90), (200, 98), (208, 98)],
+             [(5, 0, 0), (6, 0, 0), (5, 0, 1), (6, 0, 1)],
+             texture_page=2, palette_id=3),
+    ]
+    sheet = a_sheet()
+    at_1x, art_1x, moved_1x = V.convert(polygons, sheet, FLAT_PALETTES)
+    at_n, art_n, moved_n = V.convert(polygons, sheet, FLAT_PALETTES, scale=n)
+
+    assert len(art_n) == 3 * (SHEET_W * n) * (SHEET_H * n)
+    assert R.shrink(art_n, SHEET_W * n, SHEET_H * n, n) == art_1x
+    assert moved_n == moved_1x, "the Sheet is 1x at every scale"
+    assert ([p["uv"] for p in at_n] == [p["uv"] for p in at_1x]
+            and [p["texture_page"] for p in at_n]
+            == [p["texture_page"] for p in at_1x]), \
+        "one unwrap serves both resolutions"
+
+
+def rows_painted_at(art, polygon, n):
+    """`rows_painted`, on an N-times Painting.
+
+    The UVs still address the Sheet's texel space, so the rectangle is scaled
+    here rather than in the polygon -- which is the claim as much as the
+    check: one unwrap, read at two resolutions.
+    """
+    us = [c[0] for c in polygon["uv"]]
+    vs = [c[1] for c in polygon["uv"]]
+    base = polygon["texture_page"] * 256 * n
+    w = SHEET_W * n
+    x0, x1 = min(us) * n, (max(us) + 1) * n
+    return [bytes(art[3 * ((base + y) * w + x0):3 * ((base + y) * w + x1)])
+            for y in range(min(vs) * n, (max(vs) + 1) * n)]
+
+
+@needs_corpus
+@pytest.mark.parametrize("n", [2, 4])
+def test_a_repack_carries_an_N_times_painting_unresampled(n):
+    """Decision 10's re-pack, on the spatial axis.
+
+    A re-pack moves the artist's own picture and never resamples it, so at N
+    the block that moves is N times as wide and N times as tall and every byte
+    of it survives.  The scale is DERIVED from the buffers rather than passed
+    (decision 43's shape): the Painting is N^2 times the Sheet's area, so the
+    two already say what N is and there is no stored copy to drift.
+
+    On the corpus rather than a synthetic pair, for the reason the 1x arm of
+    this is: a re-pack of two quads lands them where they already were, so the
+    control -- that an island MOVED -- cannot pass and the test would be
+    green over a `repack` that did nothing at all.
+    """
+    doc, sheets = dump(MAP_DIR, 22, 0)
+    plane, palettes = a_state_with_both(doc, sheets)
+    once, art, sheet = V.convert(doc["polygons"], plane, palettes, scale=n)
+    before = [rows_painted_at(art, p, n) for p in once if "uv" in p]
+
+    twice, moved_art, moved_sheet = V.repack(once, art, sheet)
+
+    assert len(moved_art) == len(art)
+    after = [rows_painted_at(moved_art, p, n) for p in twice if "uv" in p]
+    assert after == before
+    assert moved_sheet != sheet, "no island moved: the re-pack proves nothing"
+
+
+@needs_corpus
+def test_repack_refuses_a_painting_that_is_not_N_squared_the_sheet():
+    """The derivation is a REFUSAL, not a guess.
+
+    A Painting and a Sheet that do not stand in an `N^2` area relation are not
+    a pair, and blitting one against the other would carry the artist's
+    picture to addresses computed from the wrong stride -- silently, and in a
+    shape that reads as a corrupted painting rather than as a mismatched call.
+    """
+    doc, sheets = dump(MAP_DIR, 22, 0)
+    plane, palettes = a_state_with_both(doc, sheets)
+    once, art, sheet = V.convert(doc["polygons"], plane, palettes, scale=2)
+    with pytest.raises(ValueError, match="N"):
+        V.repack(once, art + b"\x00" * 3, sheet)

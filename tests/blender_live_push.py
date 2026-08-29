@@ -40,7 +40,7 @@ REPORT = TMP / "report.json"
 
 #: A run that stops early has caught nothing. `live_normals_audit.py` learned
 #: this the hard way — it printed PASS directly under "the audit itself broke".
-EXPECTED_CHECKS = 120
+EXPECTED_CHECKS = 258
 
 SCRIPT_TEMPLATE = r'''
 import json
@@ -51,10 +51,13 @@ import traceback
 
 import bmesh
 import bpy
+import inspect
 
 PKG = "@ADDONPKG@"
 ZIP = "@ZIP@"
 JSON = "@JSON@"
+DISC = "@DISC@"
+DISC2 = "@DISC2@"
 OUT = "@OUT@"
 
 checks, notes = {}, []
@@ -102,8 +105,10 @@ class FakeRam:
         self.up = True
         self.handlers = True          # was the addon's `.lua` `-dofile`d?
         self.execs = 0
+        self.gets = 0
         self.gte_execs = 0
         self.lua_walks = 0            # packed-Lua record walks -- the fork path
+        self.tick = 0                 # the animation's frame cursor
 
     # -- transport
     def ping(self):
@@ -149,11 +154,85 @@ class FakeRam:
             return f"{n}\n"
         raise L.NoHandlerError(f"no `{handler}` Lua handler")
 
+    def animate(self):
+        """Run the `0x6c` table this RAM holds, one step per fetch.
+
+        Not decoration. Decision 11's readback grades a row **moving**, and a
+        stub whose CLUT block never changed would pass every push -- including
+        one that erased nothing, which is the reported bug. So the fake does
+        what the engine does: walk the live table, and repaint each animated
+        CLUT row from the live `0x70` frames.
+
+        Inert while the table is zero, which is every arm above this one.
+        """
+        table = bytes(self.mem[L.ANIM_TABLE - L.RAM_BASE:
+                               L.ANIM_TABLE - L.RAM_BASE + L.ANIM_TABLE_BYTES])
+        records = L.read_animation_table(table) or ()
+        if not L.animation_rows(records):
+            return
+        self.tick += 1
+        o = L.ANIM_FRAMES - L.RAM_BASE
+        frames = bytes(self.mem[o:o + L.ANIM_FRAMES_BYTES])
+        for r in records:
+            if r.clut_row is None or not r.frame_count:
+                continue
+            # Byte 19 is the run flag, and the disc ships it CLEAR: the loader
+            # arms the records at map load. Measured [LIVE] 2026-08-28 -- a
+            # verbatim install of `MAP022.9`'s chunk sat at the right address,
+            # byte-perfect, and did not move a pixel until byte 19 was set. A
+            # fake that ran an unarmed record would have passed that install.
+            if r.raw[L.ANIM_RUN_FLAG_BYTE] != L.ANIM_RUN_FLAG:
+                continue
+            # Byte 14 is the frame count on the DISC and the engine's own
+            # cursor in a running table -- `MAP022.9` reads 4 there off the
+            # disc and 0x81 in a savestate -- so it is clamped to the 16 frames
+            # that exist. Unclamped it indexes past the `0x70` block, and a
+            # `bytearray` slice assignment with a short value RESIZES the
+            # array: two of them shifted every byte of RAM above the CLUT
+            # block down by 64 and made an untouched table read as corrupt.
+            f = self.tick % min(r.frame_count, 16)
+            d = L.CLUT_BLOCK - L.RAM_BASE + r.clut_row * L.CLUT_ROW_BYTES
+            row = frames[f * 32:f * 32 + 32]
+            assert len(row) == L.CLUT_ROW_BYTES, "a short row would RESIZE RAM"
+            self.mem[d:d + L.CLUT_ROW_BYTES] = row
+        assert len(self.mem) == L.RAM_BYTES, "the fake's RAM changed size"
+
+    def rebuild_camera(self, honest=True):
+        """What the engine does with `work_rotation` every frame.
+
+        `build_camera_view_matrix` recomposes `CAMERA_VIEW_MATRIX` from the
+        angles on each frame, which is the only reason reading it back says
+        anything: it is the ENGINE's arithmetic on the artist's write, not a
+        readback of the write itself.
+
+        The honest arm is admittedly circular -- the fake composes with the
+        same `L.camera_rotation` the button checks against -- and it is not
+        where the value is. `honest=False` is: it models a write that landed
+        somewhere the engine never rebuilds from, which is precisely the one
+        thing decision 12 leaves open, and it is what proves the button can
+        REPORT a pose that did not take instead of going green over an
+        unchanged picture.
+        """
+        if not honest:
+            return
+        angles = struct.unpack_from("<3h", self.mem,
+                                    L.WORK_ROTATION - L.RAM_BASE)
+        r = L.camera_rotation(*angles)
+        o = L.CAMERA_VIEW_MATRIX - L.RAM_BASE
+        self.mem[o:o + 18] = struct.pack(
+            "<9h", *[max(-32768, min(32767, round(r[i][j] * 4096)))
+                     for i in range(3) for j in range(3)])
+
     # -- `POST /api/v1/cpu/ram/raw`, driven through the real `RamClient`
     def get(self):
         if not self.up:
             raise L.TransportError("no emulator answering")
+        self.animate()
         self.execs += 1
+        # Counted apart from `execs` because ADR-0186 Amendment 7 decision 32
+        # is a claim about THIS number: stock's GET always returns the whole
+        # 2 MB, so every one of these is 2 MB moved.
+        self.gets += 1
         return bytes(self.mem)
 
     def post(self, offset, data):
@@ -802,6 +881,217 @@ try:
           and "walk the map you replaced" not in _plain
           and "WEAKER" not in _plain, f"{res} {_plain[:300]}")
 
+    # ---- decision 11: a swap ERASES the host map's animation table -------
+    # Reported by the artist, live: *"I just did a Replace the loaded map call
+    # and it looks almost right except for one chunk of map which got the wrong
+    # palette. It got the blue water palette and it's animated."* The push had
+    # LANDED -- what repaints a correct push 4.49 times a second is the
+    # replaced map's `0x6c` instruction table, still running in RAM.
+    #
+    # The fake runs that table (see `FakeRam.animate`), so these arms grade the
+    # readback the way it is graded live: by rows MOVING, not by bytes.
+    _ours = open(DISC + "/MAP001.9", "rb").read()
+    _host = open(DISC + "/MAP099.9", "rb").read()
+    _our_table, _our_frames = _ours[196:836], _ours[836:1348]
+    _host_frames = _host[836:1348]
+    # The table as a RUNNING engine holds it: bytes 14/16/18/19 of each palette
+    # record are the engine's frame cursor and tick counter, not the map's
+    # data. Seeded here so the guard's mask is exercised rather than assumed --
+    # an unmasked comparison would match nothing and refuse a healthy swap.
+    def running(table, slots):
+        b = bytearray(table)
+        for _i in slots:
+            for _b, _v in zip((14, 16, 18, 19), (0x81, 0x02, 0x09, 0x01)):
+                b[_i * 20 + _b] = _v
+        return bytes(b)
+
+    _running = running(_host[196:836], (0, 1))       # the HOST, mid-cycle
+    _running_ours = running(_our_table, (2,))        # this document's own map
+
+    ob["exmateria_map/gns_path"] = DISC + "/MAP001.GNS"
+    check("the scene's remembered GNS resolves to an extracted disc tree",
+          UI.base_map_dir(ob) is not None, str(UI.base_map_dir(ob)))
+
+    def seed_animation(ram, table=_running, frames=_host_frames):
+        ram.poke(L.ANIM_TABLE, table)
+        ram.poke(L.ANIM_FRAMES, frames)
+
+    # --- the EDIT path: never neutralise a map's own animation
+    RAM = fresh_ram()
+    UI._LAST_PUSH.clear()
+    seed_animation(RAM, _running_ours, _our_frames)
+    res, err = push()
+    _said = " ".join(last_push())
+    check("a push finishes with an animation running", res == {"FINISHED"},
+          f"{res} {err}")
+    check("...and it leaves the loaded map's OWN animation table ALONE",
+          RAM.read(L.ANIM_TABLE, L.ANIM_TABLE_BYTES) == _running_ours,
+          RAM.read(L.ANIM_TABLE, 20).hex())
+    # `build` carries `0x6c`/`0x70` to the disc verbatim, so freezing the
+    # animation here would preview a picture the shipped map cannot produce.
+    check("...and it NAMES the rows this map's own table animates",
+          "animates CLUT row(s) 13" in _said, _said[-500:])
+    check("...and says the battle repaints them rather than warning",
+          "repaints them" in _said and "animation NOT" not in _said,
+          _said[-400:])
+
+    # --- the REPLACE path: erase the host's table, install this map's
+    RAM = fresh_ram(doc=FOREIGN, counts=(0, 3, 0, 2))
+    UI._LAST_PUSH.clear()
+    seed_animation(RAM)
+    res, err = push(replace_loaded_map=True)
+    _said = " ".join(last_push())
+    _table = RAM.read(L.ANIM_TABLE, L.ANIM_TABLE_BYTES)
+    _records = L.read_animation_table(_table)
+    check("a swap over a running animation finishes", res == {"FINISHED"},
+          f"{res} {err}")
+    check("...and the host's CLUT rows are gone from the table",
+          L.animation_rows(_records) == [13],
+          str(L.animation_rows(_records)))
+    # The scope is the TABLE, not the palettes: 94 of the corpus's 110 tables
+    # drive TEXTURE regions, and the host's three point inside the pages this
+    # push has just uploaded a foreign sheet to.
+    check("...and so are its THREE texture records",
+          not [r for r in _records if any(r.raw) and not r.is_palette],
+          str([(r.x, r.y) for r in _records if any(r.raw) and not r.is_palette]))
+    check("...and the pushed map's own palette record is installed, in its "
+          "own slot",
+          _table[40:40 + L.ANIM_RUN_FLAG_BYTE]
+          == _our_table[40:40 + L.ANIM_RUN_FLAG_BYTE], _table[40:60].hex())
+    # The one byte an install does not carry verbatim, because the map does not
+    # own it. Without it the record is at the right address, byte-perfect, and
+    # dead -- which is what the live machine showed on 2026-08-28.
+    check("...and it is ARMED, which the disc's own bytes are not",
+          _table[40 + L.ANIM_RUN_FLAG_BYTE] == L.ANIM_RUN_FLAG
+          and _our_table[40 + L.ANIM_RUN_FLAG_BYTE] == 0,
+          f"{_table[59]} vs disc {_our_table[59]}")
+    check("...and its frames are in the loaded `0x70` block",
+          RAM.read(L.ANIM_FRAMES, L.ANIM_FRAMES_BYTES) == _our_frames)
+    check("...and the erase named the corpus resource it matched",
+          "MAP099.9" in _said, _said[-600:])
+    check("...and the readback reports the rows that MOVED",
+          "CLUT row(s) 13 move and no others do" in _said, _said[-600:])
+    # Decision 10's rule: a weaker check reported in the same words as the
+    # strong one is worse than no check.
+    check("...and the texture half says it is a BYTE confirmation",
+          "BYTE confirmation" in _said, _said[-600:])
+    check("...and the pushed map's own texture record is NOT installed",
+          "erased and NOT installed" in _said, _said[-600:])
+
+    # --- the seeded defect: an erase that does nothing must go RED
+    _real_erase = L.plan_erase_animation
+    L.plan_erase_animation = lambda: []
+    RAM = fresh_ram(doc=FOREIGN, counts=(0, 3, 0, 2))
+    UI._LAST_PUSH.clear()
+    seed_animation(RAM)
+    res, err = push(replace_loaded_map=True)
+    _said = " ".join(last_push())
+    L.plan_erase_animation = _real_erase
+    check("an erase that writes nothing is CAUGHT by the readback",
+          "NOT fully removed" in _said, _said[-600:])
+    check("...and the verdict names the host rows that kept moving",
+          "14, 15" in _said, _said[-600:])
+    check("...and the surviving texture records are named too",
+          "survived the erase" in _said, _said[-600:])
+
+    # --- degradation: a base the document does not pin costs the INSTALL only
+    ob["exmateria_map/gns_path"] = DISC2 + "/MAP001.GNS"
+    RAM = fresh_ram(doc=FOREIGN, counts=(0, 3, 0, 2))
+    UI._LAST_PUSH.clear()
+    seed_animation(RAM)
+    res, err = push(replace_loaded_map=True)
+    _said = " ".join(last_push())
+    _records = L.read_animation_table(RAM.read(L.ANIM_TABLE, L.ANIM_TABLE_BYTES))
+    check("a base resource that is not the pinned one refuses the INSTALL",
+          "animation NOT installed" in _said and "sha256" in _said,
+          _said[-600:])
+    check("...and the erase still happened, because it needs no disc read",
+          not [r for r in _records if any(r.raw)],
+          str([(r.x, r.y) for r in _records if any(r.raw)]))
+    check("...and the whole push is not refused over an animation chunk",
+          res == {"FINISHED"}, f"{res} {err}")
+
+    # --- no tree at all: the guard cannot confirm, so it does not erase
+    ob["exmateria_map/gns_path"] = ""
+    RAM = fresh_ram(doc=FOREIGN, counts=(0, 3, 0, 2))
+    UI._LAST_PUSH.clear()
+    seed_animation(RAM)
+    res, err = push(replace_loaded_map=True)
+    _said = " ".join(last_push())
+    check("with no disc tree the erase REFUSES rather than writing blind",
+          "animation NOT erased" in _said, _said[-600:])
+    check("...and the host's table is left exactly as it was",
+          RAM.read(L.ANIM_TABLE, L.ANIM_TABLE_BYTES) == _running,
+          RAM.read(L.ANIM_TABLE, 24).hex())
+    check("...and the push still finishes", res == {"FINISHED"}, f"{res} {err}")
+
+    # ---- ADR-0186 decision 49: the COMPILE reads the same rows -----------
+    # The search must not move a chart on or off an animated CLUT row, and the
+    # document says nothing about which rows those are -- schema §8 puts `0x6c`
+    # on the carried-from-base side. So `compile_op.animated_rows_of` reads it
+    # from the same place, through the same sha256-pinned reader, as the
+    # install above. Graded HERE and not in `test_compile.py` because the
+    # arithmetic is pytest's and what can silently go wrong is the ADDRESS: a
+    # marker that resolves no tree returns `None` and the search runs
+    # unbounded, which is the reported defect with nothing said.
+    ob["exmateria_map/gns_path"] = DISC + "/MAP001.GNS"
+    from exmateria_map.compile_op import (animated_rows_of, animation_note,
+                                          animation_note_once)
+    _state = int(ob.get("exmateria_map/preview_state") or 0)
+    _CO = sys.modules["exmateria_map.compile_op"]
+
+    _CO._ANIMATED.clear()
+    check("the compile reads the rows this map ANIMATES off the disc",
+          animated_rows_of(ob, _state) == (13,),
+          f"{animated_rows_of(ob, _state)!r}; the install above proved the "
+          f"same table names row 13")
+    check("...by the same address the animation INSTALL uses, so the two "
+          "cannot disagree about which rows are animated",
+          tuple(sorted(set(L.animation_rows(L.base_animation(
+              UI.base_map_dir(ob), {"base": json.loads(
+                  ob["exmateria_map/base"])},
+              json.loads(ob["exmateria_map/map_states"])[_state]["resource"]
+          )[0])))) == animated_rows_of(ob, _state))
+
+    _CO._ANIMATED.clear()
+    ob["exmateria_map/gns_path"] = ""
+    _unknown = animated_rows_of(ob, _state)
+    check("a scene that remembers no tree answers NONE, not 'nothing "
+          "animated'",
+          _unknown is None, repr(_unknown))
+    check("...and the compile SAYS the search was not bounded, rather than "
+          "silently behaving as it did before decision 49",
+          "not bounded" in (animation_note([], [], _unknown) or ""),
+          repr(animation_note([], [], _unknown)))
+    check("...while a map that really animates nothing says nothing at all",
+          animation_note([], [], ()) is None,
+          repr(animation_note([], [], ())))
+    _CO._ANIMATED.clear()
+    ob["exmateria_map/gns_path"] = DISC + "/MAP001.GNS"
+    check("the note names the rows and counts what is held there",
+          animation_note([{"palette_id": 13}, {"palette_id": 2}],
+                         [[0], [1]], animated_rows_of(ob, _state))
+          == ("CLUT row(s) 13 are ANIMATED on this map: 1 chart(s) are held "
+              "on them and no other chart may move onto them (decision 49)"),
+          repr(animation_note([{"palette_id": 13}, {"palette_id": 2}],
+                              [[0], [1]], animated_rows_of(ob, _state))))
+
+    # The UNBOUNDED half is a fact about the scene, not about this compile, so
+    # `ensure_compiled` -- which runs on every settle, export, push and bundle
+    # -- says it once. `tests/blender_convert.py` is where that surfaced: its
+    # exit-compile report grew a second line that repeated forever.
+    _CO._SAID_UNBOUNDED.clear()
+    check("the automatic path says 'not bounded' the FIRST time",
+          "not bounded" in (animation_note_once(("Ob", 0), [], [], None) or ""),
+          repr(animation_note_once(("Ob", 0), [], [], None)))
+    check("...and not again for the same subject, because nothing about the "
+          "scene changed and a settle runs this every time",
+          animation_note_once(("Ob", 0), [], [], None) is None,
+          repr(animation_note_once(("Ob", 0), [], [], None)))
+    check("...while the HELD half repeats, being an outcome of each compile",
+          all(animation_note_once(("Ob", 0), [{"palette_id": 13}], [[0]],
+                                  (13,)) is not None for _ in range(2)))
+
     # ---- GROWTH: a slot the loaded map never had -------------------------
     # The document carries one textured_quad and the map loaded none, so this
     # is the direction that used to be refused outright. Fake RAM only: MAP022
@@ -991,9 +1281,26 @@ try:
     UI._LAST_PUSH.clear()
     me.vertices[0].co.x += 1.0
     _execs = RAM.execs
+    _gets = RAM.gets
     res, err = push()
     check("a push goes through the stock RAM endpoint", res == {"FINISHED"},
           f"{res} {err}")
+    # ADR-0186 Amendment 7 decision 32, end to end.  Stock's GET always hands
+    # back the whole of `m_wram` -- the `offset`/`size` parameters are POST-only
+    # (`web-server.cc:118-122`) -- so this count IS megabytes moved.  Measured
+    # 29 before the push held an image, which is half again the ~20 the
+    # decision estimated off the code.
+    #
+    # It is not ONE, and the remainder is the decision's own doing: a write
+    # DROPS the held image rather than updating it, so every write phase pays
+    # a fresh before-image.  Buying those back would mean a write-through
+    # image, which would make the self-check compare the plan against the plan
+    # -- and decision 32 exists so that the self-check can stay.
+    _push_gets = RAM.gets - _gets
+    check("a push does not re-fetch main RAM once per read",
+          _push_gets <= 16,
+          f"{_push_gets} GET(s) = {_push_gets * L.RAM_BYTES / 1e6:.0f} MB "
+          f"(29 = 61 MB before the image was held)")
     # `execs` counts the GET/POST pairs AND any `exec`; `gte_execs` counts only
     # the rig's URL. A push that touched the packed-Lua walk would show up as
     # the fake's `exec` parsing a record, which is the assertion below.
@@ -1503,14 +1810,131 @@ try:
     import ast as _a
     import pathlib as _pl
     _src = _a.parse(_pl.Path(UI.__file__).read_text())
-    _ex = next(n for n in _a.walk(_src)
-               if isinstance(n, _a.FunctionDef) and n.name == "execute"
-               and any("unpushed_lines" == getattr(c.func, "id", None)
-                       for c in _a.walk(n) if isinstance(c, _a.Call)))
+    # The anchor is `_transport` as well as `execute` because the push's
+    # transport half moved OUT of the operator, so the settle can run it off
+    # the main thread. `next` takes a default for a reason: without one this
+    # raised `StopIteration` and killed the harness, which reports as FATAL
+    # rather than as the one failed check it is.
+    _ex = next((n for n in _a.walk(_src)
+                if isinstance(n, _a.FunctionDef)
+                and n.name in ("execute", "_transport")
+                and any("unpushed_lines" == getattr(c.func, "id", None)
+                        for c in _a.walk(n) if isinstance(c, _a.Call))), None)
     check("the push operator is what says it now",
           _ex is not None,
-          "no operator `execute` calls unpushed_lines -- the sub-panel was "
+          "no push code calls unpushed_lines -- the sub-panel was "
           "deleted TO the console, so the console has to receive it")
+
+    # ---- the push LEAVES THE MAIN THREAD ---------------------------------
+    # Reported from use: *"when I am painting, I will let go and stop, and
+    # then in a bit it will randomly freeze for a bit before starting again --
+    # it's awkward and slow."* The freeze was `push_after_compile` calling the
+    # operator and waiting out the whole round trip on Blender's own thread.
+    # Measured on MAP022 a0, this box: `assemble` is 375 ms of Blender reads
+    # that cannot leave, and the transport is about 670 ms that is not work at
+    # all -- 16 whole-RAM GETs at 31 ms plus 5 whole-VRAM GETs at 34 ms, spent
+    # waiting on another process. So the transport moved to a worker, the same
+    # split decision 30 already made for the compile.
+    import threading as _th
+    import time as _tm
+    from exmateria_map import settle_op as _SO
+
+    # 1. THE CONTRACT, and it is the whole of why this is safe: the transport
+    #    may name `bpy` nowhere. Not "rarely" and not "only on the happy path"
+    #    -- `bpy` from a worker is undefined behaviour, and the symptom is a
+    #    crash in a thread whose traceback the artist never sees. Read off the
+    #    SOURCE rather than by running it, because most of this function is
+    #    refusal branches a runtime arm would never take.
+    def _names_in(tree, *fns):
+        return {n.name: sorted({c.id for c in _a.walk(n)
+                                if isinstance(c, _a.Name)
+                                and c.id in ("bpy", "self")})
+                for n in _a.walk(tree)
+                if isinstance(n, _a.FunctionDef) and n.name in fns}
+
+    _TRANSPORT = ("push_transport", "_transport")
+    check("the push's transport half names no `bpy` and no `self`",
+          _names_in(_src, *_TRANSPORT) == {k: [] for k in _TRANSPORT},
+          str(_names_in(_src, *_TRANSPORT)))
+    # ...and the arm can go red, seeded on the source it just read. Without
+    # this it passes just as well against a function that was renamed away.
+    _seed = _a.parse(_pl.Path(UI.__file__).read_text().replace(
+        "    # 2. the gate", "    bpy.context.scene\n    # 2. the gate", 1))
+    check("...and a single `bpy` put back into it is caught",
+          _names_in(_seed, *_TRANSPORT) != {k: [] for k in _TRANSPORT},
+          str(_names_in(_seed, *_TRANSPORT)))
+
+    # 2. IT RETURNS WHILE THE TRANSPORT IS STILL RUNNING. The fake's first
+    #    whole-RAM GET is held on an Event, which is the emulator being slow
+    #    -- exactly the thing the artist was waiting for.
+    RAM = fresh_ram()
+    UI._LAST_PUSH.clear()
+    UI._BG.update(thread=None, ob_name="", done=None, pending=False)
+    _SO.resume_pushing()
+    _gate = _th.Event()
+    _real_get = FakeRam.get
+
+    def _held_get(self, *a, **k):
+        _gate.wait(20.0)
+        return _real_get(self, *a, **k)
+
+    FakeRam.get = _held_get
+    _t0 = _tm.monotonic()
+    _r = _SO.push_after_compile(ob, "test")
+    _returned_ms = (_tm.monotonic() - _t0) * 1000
+    check("the settle's push returns while the transport is still running",
+          _r == {"RUNNING_MODAL"} and UI.background_push_busy(),
+          f"{_r} busy={UI.background_push_busy()} after {_returned_ms:.0f}ms")
+    # A second settle inside that window is COALESCED, not queued: queueing
+    # would send the emulator a sheet the artist has already painted over.
+    check("a push started while one is in flight is coalesced",
+          _SO.push_after_compile(ob, "test") is None and UI._BG["pending"],
+          str(UI._BG))
+    check("nothing lands while the transport is still in flight",
+          UI.background_push_land() is None)
+    _gate.set()
+    for _ in range(600):
+        if not UI.background_push_busy():
+            break
+        _tm.sleep(0.02)
+    FakeRam.get = _real_get
+    check("the worker finished", not UI.background_push_busy())
+
+    # 3. THE REPORT LANDS ON THE MAIN THREAD. `push_report` writes the marker
+    #    property and the Log's Text datablock, both of which are `bpy` -- so
+    #    a worker that landed its own report would be the very crash arm 1
+    #    exists to prevent.
+    ob[UI.LAST_PUSH_KEY] = "[]"
+    _SO._drain_push()
+    check("the finished push's report reaches the marker",
+          any("pushed" in ln for ln in last_push()), str(last_push())[:200])
+    # ...and the coalesced one is sent, rather than dropped. The artist stopped
+    # painting twice; both sheets must reach the emulator, the second last.
+    check("the coalesced push is sent once the first one lands",
+          UI.background_push_busy() or UI._BG["done"] is not None,
+          str(UI._BG))
+    for _ in range(600):
+        if not UI.background_push_busy():
+            break
+        _tm.sleep(0.02)
+    _SO._drain_push()
+    check("and the queue empties rather than looping",
+          UI._BG["done"] is None and not UI._BG["pending"], str(UI._BG))
+
+    # 4. A REFUSAL IS STILL IMMEDIATE. `lua.check()` and `assemble`'s refusals
+    #    both run on the calling thread, so "there is no emulator" is still an
+    #    answer the settle gets now rather than a tick later -- which is what
+    #    keeps the back-off in `push_after_compile` working the way it did.
+    RAM.up = False
+    _SO.resume_pushing()
+    _r = _SO.push_after_compile(ob, "test")
+    check("a push with no emulator is refused on the calling thread",
+          _r == {"CANCELLED"} and not UI.background_push_busy(), str(_r))
+    check("...and it still backs off rather than latching",
+          _SO._PUSH["quiet_until"] > _tm.monotonic())
+    RAM.up = True
+    _SO.resume_pushing()
+    UI._BG.update(thread=None, ob_name="", done=None, pending=False)
 
     # ---- the two panels an artist reaches PCSX-Redux through --------------
     # The emulator does not load the live link's handlers by itself, so the
@@ -1558,6 +1982,528 @@ try:
                   for _, pr in _push_layout.ops),
           str([(i, vars(pr)) for i, pr in _push_layout.ops]))
 
+    # ---- decision 12: the camera sync ------------------------------------
+    # The artist's rule: *"what I see in Blender should be what I see in
+    # PCSX-Redux."* The arithmetic is the core's and `tests/test_live_link.py`
+    # has it against the battle savestate; what is graded here is the half that
+    # only exists inside Blender -- the section's four controls, the one
+    # viewport the sync refuses, and whether a match REPORTS a pose that did
+    # not land rather than going green over an unchanged picture.
+
+    class Ctx:
+        """`bpy.context` with a viewport bolted on.
+
+        Blender in `--background` has no `space_data`, so a panel that reads
+        the 3D view cannot be drawn against the real context -- and drawing it
+        against a fake one is not a compromise: `view_perspective` is a
+        property of the SPACE, so the panel has to be graded with a space and
+        without one, and the second is a real state (a `draw` that raises
+        renders everything before it and nothing after).
+        """
+
+        def __init__(self, real, space):
+            self._real, self.space_data = real, space
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    class FakeView:
+        """A `RegionView3D`, using Blender's own `mathutils` for the rotation
+        so the quaternion-to-matrix step is really exercised."""
+
+        def __init__(self, perspective="ORTHO", rotation=None,
+                     location=(182.0, 154.0, -4.75), distance=336.0):
+            import mathutils
+            self.view_perspective = perspective
+            self.view_location = mathutils.Vector(location)
+            self.view_rotation = rotation or mathutils.Quaternion((1, 0, 0, 0))
+            self.view_distance = distance
+
+    _view = FakeView()
+    rows_cam = []
+    _cam_layout = FakeLayout(rows_cam)
+    UI.MAP_PT_live_camera.draw(
+        type("P", (), {"layout": _cam_layout})(),
+        Ctx(bpy.context, type("S", (), {"region_3d": _view})()))
+    cam_ops = [r[1] for r in rows_cam if r[0] == "operator"]
+    cam_props = [r[1] for r in rows_cam if r[0] == "prop"]
+    check("the camera section offers `Match camera`",
+          "map.live_camera_match" in cam_ops, str(cam_ops))
+    # Decision 12: the ortho toggle IS its own indicator, which is why there is
+    # no warning line beside it. That only holds if what is drawn shows the
+    # current state -- a plain operator button would not.
+    check("...and the ortho toggle, drawn as the view's own property",
+          "view_perspective" in cam_props, str(cam_props))
+    check("...and the zoom dial", "live_camera_zoom_dial" in cam_props,
+          str(cam_props))
+    # The panel's own rule, from use: *"you are putting console stuff in the ui
+    # area."* A section that grew a warning line about unit sprites would be
+    # the same defect the deleted sub-panel was.
+    check("...and no prose at all",
+          not [r for r in rows_cam if r[0] == "label"], str(rows_cam))
+    rows_cam_bare = []
+    UI.MAP_PT_live_camera.draw(
+        type("P", (), {"layout": FakeLayout(rows_cam_bare)})(), bpy.context)
+    check("the section draws with no viewport at all rather than raising",
+          True, f"{len(rows_cam_bare)} rows")
+
+    _prefs_now = bpy.context.preferences.addons["exmateria_map"].preferences
+    check("the zoom dial is a preference that really exists",
+          hasattr(_prefs_now, "live_camera_zoom_dial"))
+
+    # ---- a match, against the fake emulator ------------------------------
+    RAM = fresh_ram()
+    _before = bytes(RAM.mem)
+    _client = L.RamClient()
+    _pose, _lines = UI.push_camera(_client, _view, dial=1.0)
+    _touched = sorted({L.RAM_BASE + i for i in range(L.RAM_BYTES)
+                       if RAM.mem[i] != _before[i]})
+    _spans = sorted({a for a in (L.WORK_POSITION, L.WORK_ROTATION,
+                                 L.SPRITE_SCALE, L.CAMERA_VERTICAL_DATUM)})
+    _in_span = all(any(a <= t < a + 12 for a in _spans) for t in _touched)
+    check("a match writes the camera sinks and nothing else",
+          _in_span and _touched,
+          f"{len(_touched)} bytes, first {hex(_touched[0]) if _touched else '-'}")
+    check("...at the engine's own widths and values",
+          RAM.read(L.WORK_POSITION, 12) == struct.pack(
+              "<3i", 745472, 19456, 630784)
+          and RAM.read(L.WORK_ROTATION, 6) == struct.pack("<3h", 1024, 0, 0)
+          and RAM.read(L.SPRITE_SCALE, 12) == struct.pack(
+              "<3i", 4096, 4096, 4096)
+          and RAM.read(L.CAMERA_VERTICAL_DATUM, 4) == struct.pack("<i", 120),
+          RAM.read(L.WORK_ROTATION, 6).hex())
+    # The dial has to reach the write. A dial the panel draws and the push
+    # ignores is the same shape of defect as a `prop` on a property that does
+    # not exist: everything renders, nothing moves.
+    RAM = fresh_ram()
+    UI.push_camera(L.RamClient(), _view, dial=2.0)
+    check("...and the dial reaches the write",
+          RAM.read(L.SPRITE_SCALE, 4) == struct.pack("<i", 8192),
+          RAM.read(L.SPRITE_SCALE, 4).hex())
+
+    # ---- the readback, which is the engine's arithmetic, not ours ---------
+    RAM = fresh_ram()
+    RAM.rebuild_camera(honest=False)         # a frame at the ENGINE's own pose
+    _pose, _lines = UI.push_camera(L.RamClient(), _view)
+    check("a pose the engine never rebuilt from is REPORTED, not hidden",
+          any("did not" in ln or "disagree" in ln for ln in _lines),
+          str(_lines))
+    RAM = fresh_ram()
+    _client = L.RamClient()
+    _real_write = _client.write
+
+    def _write_then_frame(plan):
+        n = _real_write(plan)
+        RAM.rebuild_camera()                 # the vsync -- see below
+        return n
+
+    _client.write = _write_then_frame
+    # The fake makes that vsync land BETWEEN the write and the read. The real
+    # button does NOT wait for one -- a localhost round trip is a fraction of a
+    # 16.7 ms frame, so the readback can genuinely precede the engine's rebuild
+    # and report a disagreement about a write that was fine. This harness
+    # cannot represent that boundary: pressing twice is what tells the two
+    # apart, and it is one of the reasons the continuous sync does not read
+    # back at all.
+    _pose, _lines = UI.push_camera(_client, _view)
+    # Positively, not by the absence of a complaint: a `push_camera` that
+    # skipped the readback altogether would say nothing either way and pass an
+    # arm written as "no disagreement was reported".
+    check("...and the engine's own matrix agreeing is what says it landed",
+          any("rebuilt its own view matrix" in ln for ln in _lines)
+          and not any("did not" in ln for ln in _lines), str(_lines))
+
+    # ---- the one viewport the sync refuses -------------------------------
+    RAM = fresh_ram()
+    _before = bytes(RAM.mem)
+    _refused = ""
+    try:
+        UI.push_camera(L.RamClient(), FakeView(perspective="CAMERA"))
+    except L.LiveLinkError as e:
+        _refused = str(e)
+    check("looking through a scene camera is refused, and named",
+          "scene camera" in _refused, _refused or "no refusal")
+    check("...and a refused match writes NOTHING",
+          bytes(RAM.mem) == _before)
+    # Perspective is NOT refused: the toggle is the indicator, and the addon
+    # does not reach in and change a view the artist set.
+    RAM = fresh_ram()
+    UI.push_camera(L.RamClient(), FakeView(perspective="PERSP"))
+    check("a perspective viewport still syncs",
+          RAM.read(L.WORK_ROTATION, 6) == struct.pack("<3h", 1024, 0, 0))
+
+    # ---- the continuous sync, decision 12 part 2 -------------------------
+    # The ticker's decisions are graded in `test_live_link.py`, where they need
+    # neither `bpy` nor a socket. What is graded HERE is the half that has
+    # both: that a tick really writes, really does NOT read, and that the panel
+    # and the preferences reach the thing that decides.
+    check("...and the continuous sync toggle", "live_camera_sync" in cam_props,
+          str(cam_props))
+    check("the sync toggle is a preference that really exists, and is ON",
+          getattr(_prefs_now, "live_camera_sync", None) is True,
+          repr(getattr(_prefs_now, "live_camera_sync", "missing")))
+
+    RAM = fresh_ram()
+    _tick_ticker = L.CameraSyncTicker()
+    _client = L.RamClient()
+    _reads = []
+    _client.read_live = lambda *a, **k: _reads.append(a) or b"\0" * 18
+    _lines = UI.sync_camera(_client, _view, ticker=_tick_ticker)
+    check("a tick writes the pose the viewport is holding",
+          RAM.read(L.WORK_ROTATION, 6) == struct.pack("<3h", 1024, 0, 0),
+          RAM.read(L.WORK_ROTATION, 6).hex())
+    # The readback is the BUTTON's instrument. On a timer it is a second round
+    # trip and a Log line per tick to re-answer what one press already
+    # answered -- so its absence is asserted, not assumed.
+    check("...and does NOT read back, unlike the button",
+          _reads == [], f"{len(_reads)} reads")
+    check("...and says nothing while it is working",
+          _lines == [], str(_lines))
+
+    RAM = fresh_ram()
+    _before = bytes(RAM.mem)
+    UI.sync_camera(L.RamClient(), _view, ticker=_tick_ticker)
+    check("a tick on an UNCHANGED view writes nothing at all",
+          bytes(RAM.mem) == _before,
+          "a still viewport must cost no traffic -- this is what makes ON by "
+          "default free")
+    RAM = fresh_ram()
+    _moved = FakeView(location=(182.0, 155.0, -4.75))
+    UI.sync_camera(L.RamClient(), _moved, ticker=_tick_ticker)
+    check("...and a tick on a MOVED view writes again",
+          RAM.read(L.WORK_POSITION, 12) != _before[
+              L.WORK_POSITION - L.RAM_BASE:][:12],
+          RAM.read(L.WORK_POSITION, 12).hex())
+
+    # A dead emulator, which is the state the toggle spends most of its life in.
+    class _DeadClient:
+        def write(self, plan):
+            raise L.LiveLinkError("connection refused")
+
+    _dead_ticker = L.CameraSyncTicker()
+    _said = UI.sync_camera(_DeadClient(), _view, ticker=_dead_ticker)
+    check("a tick that cannot reach the emulator says so once",
+          any("cannot reach" in ln for ln in _said), str(_said))
+    check("...and does not say it again on the next tick",
+          UI.sync_camera(_DeadClient(), _view, ticker=_dead_ticker) == [])
+    check("...and backs the rate off while it is failing",
+          _dead_ticker.interval() == L.CAMERA_SYNC_BACKOFF,
+          str(_dead_ticker.interval()))
+    RAM = fresh_ram()
+    _back = UI.sync_camera(L.RamClient(), _view, ticker=_dead_ticker)
+    check("...and the pose it could not deliver is delivered on recovery",
+          RAM.read(L.WORK_ROTATION, 6) == struct.pack("<3h", 1024, 0, 0)
+          and any("again" in ln for ln in _back), str(_back))
+
+    # The two viewports a tick must survive rather than refuse. A press is a
+    # request and `push_camera` raises; a tick is a standing offer.
+    RAM = fresh_ram()
+    _before = bytes(RAM.mem)
+    _idle = UI.sync_camera(L.RamClient(), FakeView(perspective="CAMERA"),
+                           ticker=L.CameraSyncTicker())
+    check("a viewport looking through a scene camera makes the sync IDLE",
+          any("idle" in ln for ln in _idle) and bytes(RAM.mem) == _before,
+          str(_idle))
+    _none = UI.sync_camera(L.RamClient(), None, ticker=L.CameraSyncTicker())
+    check("...and so does having no 3D viewport at all, rather than raising",
+          any("idle" in ln for ln in _none), str(_none))
+
+    # The timer is the thing that makes any of this happen without a press, and
+    # `register()` is the only place it is armed.
+    check("the addon armed the camera timer at register()",
+          bpy.app.timers.is_registered(UI._camera_sync_timer),
+          "an unarmed timer is a toggle that does nothing, with a panel row "
+          "saying it is on")
+    # The arm that keeps this harness off the artist's running emulator, and
+    # the reason it is needed is measured rather than assumed: `--background`
+    # Blender holds a window with a VIEW_3D area, so `_first_region_3d` finds a
+    # real viewport here and an unguarded tick would POST a pose to whatever is
+    # listening on port 8080.
+    check("a headless Blender really does hold a viewport to be fooled by",
+          bpy.app.background and UI._first_region_3d() is not None,
+          f"background={bpy.app.background}, "
+          f"region_3d={UI._first_region_3d()!r}")
+    RAM = fresh_ram()
+    _before = bytes(RAM.mem)
+    check("...so the timer disarms itself there rather than poking port 8080",
+          UI._camera_sync_timer() is None and bytes(RAM.mem) == _before,
+          "returning None unregisters it; a tick that ran would have written "
+          "the pose of a viewport nobody is looking at")
+
+    # ---- decision 13: isolate the map ------------------------------------
+    # An ACT, not a ticker. The walk and the gate arithmetic are the core's and
+    # `tests/test_live_link.py` has them against the battle savestate; what is
+    # graded here is the half that only exists inside Blender -- the panel's
+    # two buttons, the session memory that makes a second press safe, and the
+    # sinks an isolate must NOT touch.
+
+    UNIT_STRIDE = 0x440
+
+    def seed_units(ram, flags=((1, 1),) * 4, head=None):
+        """Plant a unit list and the code gates the poke targets.
+
+        The nodes are chained through `node+0x0` with the id at `node+0x4` --
+        the offsets `unit_sprite_object_find` itself uses -- and each gate gets
+        eight bytes of its own, so a poke that restored a constant instead of
+        the saved bytes would be visible. The two renderers get a real
+        `addiu sp,sp,-0x40` prologue; the camera leash is a LEAF and gets its
+        real `lui a2,0x800a` entry instead, because a fixture that gave every
+        gate the same shape would let a gate aimed at the middle of a function
+        pass. That the shipped address really is a leaf is
+        `tests/test_live_link.py`'s arm, against the savestate.
+        """
+        base = 0x800B0000
+        for i, (show, dispatch) in enumerate(flags):
+            node = base + i * UNIT_STRIDE
+            nxt = 0 if i + 1 == len(flags) else node + UNIT_STRIDE
+            ram.mem[node - L.RAM_BASE:node - L.RAM_BASE + 4] = struct.pack(
+                "<I", nxt)
+            ram.mem[node + 4 - L.RAM_BASE] = i
+            ram.mem[node + L.UNIT_SHOW - L.RAM_BASE:
+                    node + L.UNIT_SHOW - L.RAM_BASE + 2] = struct.pack(
+                        "<H", show)
+            ram.mem[node + L.UNIT_DISPATCH - L.RAM_BASE:
+                    node + L.UNIT_DISPATCH - L.RAM_BASE + 2] = struct.pack(
+                        "<H", dispatch)
+        ram.mem[L.UNIT_LIST_HEAD - L.RAM_BASE:
+                L.UNIT_LIST_HEAD - L.RAM_BASE + 4] = struct.pack(
+                    "<I", base if head is None else head)
+        # The camera zoom at its 1.0x identity, because a fresh RAM is all
+        # zeroes and an isolate that ZEROED `sprite_scale` would then change
+        # nothing and pass the arm that exists to catch exactly that. Measured:
+        # seeded with the defect, the arm was green until this line existed.
+        ram.mem[L.SPRITE_SCALE - L.RAM_BASE:
+                L.SPRITE_SCALE - L.RAM_BASE + 12] = struct.pack(
+                    "<3i", L.ZOOM_ONE, L.ZOOM_ONE, L.ZOOM_ONE)
+        for _name, address in L.CODE_GATES:
+            o = address - L.RAM_BASE
+            words = ((0x3C06800A, 0x8CC61C48)
+                     if address == L.CAMERA_LEASH
+                     else (0x27BDFFC0, 0xAFBF0014))
+            ram.mem[o:o + 8] = struct.pack("<II", *words)
+        return base
+
+    def forget_isolate():
+        UI._ISOLATED["units"], UI._ISOLATED["gates"] = [], []
+
+    rows_iso = []
+    UI.MAP_PT_live_isolate.draw(
+        type("P", (), {"layout": FakeLayout(rows_iso)})(), bpy.context)
+    iso_ops = [r[1] for r in rows_iso if r[0] == "operator"]
+    check("the isolate section offers `Isolate map`",
+          "map.live_isolate" in iso_ops, str(iso_ops))
+    check("...and `Restore`", "map.live_restore" in iso_ops, str(iso_ops))
+    # Two buttons and NOT a checkbox: re-ticking an already-ticked box is a
+    # no-op, and re-pressability is the mechanism decision 13 chose.
+    check("...and no checkbox, because a re-press is the mechanism",
+          not [r for r in rows_iso if r[0] == "prop"], str(rows_iso))
+    # This sidebar's rule, from use: *"you are putting console stuff in the ui
+    # area."* The cursor's uncertain target goes to the console, once a press.
+    check("...and no prose at all",
+          not [r for r in rows_iso if r[0] == "label"], str(rows_iso))
+    # `FakeLayout.operator` records whatever string it is handed, so a panel
+    # naming an UNREGISTERED operator records perfectly and draws NOTHING in a
+    # real Blender. Both of these have to exist on `bpy.ops` as well.
+    check("both buttons name operators that are really registered",
+          hasattr(bpy.ops.map, "live_isolate")
+          and hasattr(bpy.ops.map, "live_restore"),
+          "a `classes` tuple nothing iterates registers NOTHING, and the "
+          "panel row is simply missing")
+
+    # ---- an isolate, against the fake emulator ---------------------------
+    RAM = fresh_ram()
+    forget_isolate()
+    _units = seed_units(RAM)
+    _before = bytes(RAM.mem)
+    _iso_lines = UI.isolate_map(L.RamClient())
+    _touched = sorted({L.RAM_BASE + i for i in range(L.RAM_BYTES)
+                       if RAM.mem[i] != _before[i]})
+    _allowed = set()
+    for _i in range(4):
+        _n = _units + _i * UNIT_STRIDE
+        _allowed |= {_n + L.UNIT_SHOW, _n + L.UNIT_SHOW + 1,
+                     _n + L.UNIT_DISPATCH, _n + L.UNIT_DISPATCH + 1}
+    for _a in [g[1] for g in L.CODE_GATES]:
+        _allowed |= set(range(_a, _a + 8))
+    check("an isolate writes the unit flags and the code gates, and "
+          "nothing else",
+          _touched and set(_touched) <= _allowed,
+          f"{len(_touched)} bytes, {len(set(_touched) - _allowed)} outside")
+    check("...zeroing BOTH halfwords on every unit",
+          all(RAM.read(_units + _i * UNIT_STRIDE + _o, 2) == b"\x00\x00"
+              for _i in range(4)
+              for _o in (L.UNIT_SHOW, L.UNIT_DISPATCH)),
+          "+0x1d8 is the whole-dispatch early-out at 0x80086770, and the "
+          "ground shadow follows from the same branch")
+    check("...and stubbing every code gate with `jr ra; nop`",
+          all(RAM.read(_a, 8) == L.RETURN_STUB
+              for _name, _a in L.CODE_GATES),
+          RAM.read(L.HUD_RENDERER, 8).hex())
+    # The third gate, named. The camera leash is why the artist can pan during
+    # dialogue but not during a battle: `FUN_8006FE58` steps `camera_work_position`
+    # back toward the battle's own target every frame, so a pushed camera drifts
+    # home in about a second. It rides the SAME press as the units because that
+    # is where the artist asked for it -- one act, one way back.
+    check("...the camera leash among them, so a pushed camera stays put",
+          L.CAMERA_LEASH in [g[1] for g in L.CODE_GATES]
+          and RAM.read(L.CAMERA_LEASH, 8) == L.RETURN_STUB,
+          "measured live: cut, the camera holds (120.000, -5.000, 80.000); "
+          "restored, it drifts 191 units back to the battle's target")
+    check("...and the press SAYS the camera is unleashed",
+          any("camera" in ln for ln in _iso_lines), str(_iso_lines))
+    # The trap named in the decision record. Despite its name `sprite_scale` is
+    # the camera ZOOM: `build_camera_view_matrix` scales the shared `R` by it,
+    # read by both the map affine transform and `project_all_unit_sprites`.
+    # Zeroing it collapses the MAP, which is the one thing this feature exists
+    # to leave on screen.
+    check("...and does not touch sprite_scale, which is the camera zoom",
+          RAM.read(L.SPRITE_SCALE, 12) == _before[
+              L.SPRITE_SCALE - L.RAM_BASE:L.SPRITE_SCALE - L.RAM_BASE + 12],
+          "zeroing 0x800C7CA0 collapses the map -- it is the zoom, not a "
+          "sprite size, and plan_camera already writes it")
+    # The report is a count of UNITS. `0 changed` already means *already
+    # isolated*, so a report in bytes would make one sentence mean two
+    # opposite things.
+    check("the report counts units, not bytes",
+          any("4 of 4" in ln for ln in _iso_lines), str(_iso_lines[:1]))
+    check("...and names the cursor's uncertain target for the artist's eye",
+          any(f"{L.CURSOR_RENDERER_FALLBACK:08X}" in ln for ln in _iso_lines),
+          "the acceptance is the artist looking, and *knife gone* / *knife "
+          "there but not bobbing* are different answers")
+    # Decision 13 shipped boxed dialogue as the one leg with NO located gate,
+    # and the isolate said so every press. Amendment 2 located it, so the arm
+    # that graded the apology now grades the gate -- and the apology must be
+    # GONE, because a press that hides the box and still says it cannot is the
+    # worse of the two defects.
+    check("...and the boxed-dialogue gate is stubbed too",
+          RAM.read(L.DIALOGUE_BOX_RENDERER, 8) == L.RETURN_STUB,
+          "0x8012E65C is event_portrait_render_ft4, the per-frame builder of "
+          "the box POLY_FT4s -- frame, text and speaker portrait alike")
+    check("...and the press no longer apologises for boxed dialogue",
+          not any("NOT hidden" in ln for ln in _iso_lines), str(_iso_lines))
+
+    # ---- restore -----------------------------------------------------------
+    UI.restore_map(L.RamClient())
+    check("a restore puts the battle back byte for byte",
+          bytes(RAM.mem) == _before,
+          f"{sum(1 for i in range(L.RAM_BYTES) if RAM.mem[i] != _before[i])} "
+          f"bytes still differ")
+
+    # The defect that would make Restore wrong rather than absent.
+    # `unit_sprite_object_show` writes `1` to both fields, and copying that
+    # would REVEAL a unit the battle had legitimately hidden.
+    RAM = fresh_ram()
+    forget_isolate()
+    _units = seed_units(RAM, flags=((1, 1), (0, 0), (1, 1)))
+    _before = bytes(RAM.mem)
+    UI.isolate_map(L.RamClient())
+    UI.restore_map(L.RamClient())
+    check("a restore writes the SAVED value, so a unit the battle had already "
+          "hidden stays hidden",
+          RAM.read(_units + UNIT_STRIDE + L.UNIT_SHOW, 2) == b"\x00\x00"
+          and RAM.read(_units + UNIT_STRIDE + L.UNIT_DISPATCH, 2) == b"\x00\x00"
+          and bytes(RAM.mem) == _before,
+          "writing the constant 1 reveals a unit not yet cued to appear, one "
+          "a {46} erased, or one off the roster")
+
+    # ---- re-pressable, which is the whole answer to the emulator drifting --
+    RAM = fresh_ram()
+    forget_isolate()
+    _units = seed_units(RAM)
+    _before = bytes(RAM.mem)
+    UI.isolate_map(L.RamClient())
+    _mid = bytes(RAM.mem)
+    _again = UI.isolate_map(L.RamClient())
+    check("a second isolate changes nothing and says so",
+          bytes(RAM.mem) == _mid
+          and any("already isolated" in ln for ln in _again), str(_again[:1]))
+    check("...and does not lose the way back",
+          UI.restore_map(L.RamClient()) and bytes(RAM.mem) == _before,
+          "the second walk reads back what the first press wrote, so a memory "
+          "that REPLACED itself would save show=0 for the whole roster and "
+          "Restore would leave the battle empty")
+
+    # A unit spawning mid-battle is answered by pressing Isolate again -- which
+    # is why there is no ticker and no readback.
+    RAM = fresh_ram()
+    forget_isolate()
+    _units = seed_units(RAM, flags=((1, 1), (1, 1)))
+    _before = bytes(RAM.mem)
+    UI.isolate_map(L.RamClient())
+    seed_units(RAM, flags=((1, 1), (1, 1), (1, 1)))     # one spawned
+    _spawn_before = bytes(RAM.mem)
+    UI.isolate_map(L.RamClient())
+    check("a unit that spawns while isolated is hidden by a second press",
+          RAM.read(_units + 2 * UNIT_STRIDE + L.UNIT_DISPATCH, 2) == b"\x00\x00",
+          "one press, not a per-tick round trip")
+    UI.restore_map(L.RamClient())
+    check("...and it is restored to the flags it spawned with",
+          bytes(RAM.mem) == _spawn_before,
+          "the spawned unit joins the memory with its OWN saved values")
+
+    # ---- the not-in-a-battle case ----------------------------------------
+    RAM = fresh_ram()
+    forget_isolate()
+    _before = bytes(RAM.mem)
+    _empty = UI.isolate_map(L.RamClient())
+    check("a null list head reports `found no units` rather than `0 changed`",
+          any("no units" in ln for ln in _empty), str(_empty[:1]))
+    check("...and writes nothing AT ALL, not even the code gates",
+          bytes(RAM.mem) == _before,
+          "a null head is indistinguishable from not being in a battle, and "
+          "decision 13 rules that case *found nothing, wrote nothing* -- "
+          "poking an overlay that is not loaded is the same mistake wearing "
+          "a constant")
+    check("...and a restore after it has nothing saved to write back",
+          any("nothing to restore" in ln
+              for ln in UI.restore_map(L.RamClient()))
+          and bytes(RAM.mem) == _before,
+          "saving the gates on a press that found no battle would hand "
+          "Restore eight bytes of whatever was loaded at the time")
+
+    # A chain the walk cannot finish still hides what it reached, and SAYS how
+    # far it got -- the artist's call, and the second number is what makes it
+    # safe rather than silent.
+    RAM = fresh_ram()
+    forget_isolate()
+    _units = seed_units(RAM)
+    struct.pack_into("<I", RAM.mem, _units + 2 * UNIT_STRIDE - L.RAM_BASE,
+                     _units)                            # bend the third link
+    _bent = UI.isolate_map(L.RamClient())
+    check("a chain that goes bad hides what it reached and says how far",
+          any("hid 3 units" in ln and "loops back" in ln for ln in _bent),
+          str(_bent[:1]))
+
+    # ---- Restore with nothing saved --------------------------------------
+    forget_isolate()
+    RAM = fresh_ram()
+    _before = bytes(RAM.mem)
+    _nothing = UI.restore_map(L.RamClient())
+    check("a restore with no saved values says so rather than raising",
+          any("nothing to restore" in ln for ln in _nothing)
+          and bytes(RAM.mem) == _before, str(_nothing))
+    check("...and names reloading the battle as the way back",
+          any("reload the battle" in ln for ln in _nothing), str(_nothing))
+
+    # ---- it is an ACT, and registers no timer -----------------------------
+    # Decision 13 registers no timer, which sidesteps the trap the camera sync
+    # had to be guarded against: `--background` Blender holds a window with a
+    # VIEW_3D area, so a registered timer finds a real viewport headless and
+    # would POST to port 8080 from a test run.
+    check("isolate arms no timer of its own",
+          [f for f in (getattr(UI, "_isolate_timer", None),)
+           if f is not None and bpy.app.timers.is_registered(f)] == [],
+          "isolate has no moving source: a ticker would spend a round trip "
+          "per tick to learn there is nothing to do")
+
+    # Both operators reach the Log, the way every other outcome in this addon
+    # does -- a toast expires and the console scrolls.
+    for _tag, _cls in (("isolate", "MAP_OT_live_isolate"),
+                       ("restore", "MAP_OT_live_restore")):
+        _src = inspect.getsource(getattr(UI, _cls).execute)
+        check(f"the {_tag} operator records an outcome in the Log",
+              "record(" in _src, f"{_cls}.execute never calls report_log.record")
+
     rows_prefs = []
     _prefs_obj = bpy.context.preferences.addons["exmateria_map"].preferences
     _prefs_obj.layout = FakeLayout(rows_prefs)
@@ -1591,7 +2537,7 @@ try:
         grp = getattr(bpy.ops, group, None)
         return grp is not None and name in dir(grp)
 
-    _unresolved = sorted({i for i in push_ops + prefs_ops if not _resolves(i)})
+    _unresolved = sorted({i for i in push_ops + cam_ops + prefs_ops if not _resolves(i)})
     check("every operator these panels name is actually REGISTERED",
           not _unresolved, f"unregistered: {_unresolved}")
 
@@ -1628,6 +2574,13 @@ try:
                       if not getattr(c, "is_registered", False))
     check("every class in `classes` is one `register()` actually registers",
           not _missing, f"declared but never registered: {_missing}")
+    # `live_link_ui` keeps its own `classes`, and the camera section is the
+    # first thing added to it since the tuple was written -- which makes it
+    # exactly the class that would fall in the gap above.
+    _missing_ui = sorted(c.__name__ for c in UI.classes
+                         if not getattr(c, "is_registered", False))
+    check("...and the same for `live_link_ui`'s own tuple",
+          not _missing_ui, f"declared but never registered: {_missing_ui}")
 
     # ---- the all-empty refusal -------------------------------------------
     # Zeroing all four counts would make `check_descriptors` read the block as
@@ -1674,14 +2627,98 @@ def ensure_addon():
     return zf_path
 
 
+#: A resource carrying only the two animation chunks, built here rather than
+#: taken from the corpus so this harness keeps running with no ISO. The layout
+#: is `mapfile`'s: a 196-byte header of section pointers, the `0x6c` table
+#: (32 records of 20 bytes) and the `0x70` frames (16 x 16 BGR555 words).
+ANIM_HEADER = 196
+ANIM_TABLE_BYTES = 640
+ANIM_FRAMES_BYTES = 512
+
+
+def anim_record(x, y=480, w=16, h=1, frames=4, mode=3, duration=1):
+    r = bytearray(20)
+    for off, val in ((0, x), (2, y), (4, w), (6, h)):
+        r[off:off + 2] = int(val).to_bytes(2, "little")
+    r[14], r[15], r[17] = frames, mode, duration
+    return bytes(r)
+
+
+def anim_resource(records):
+    """`records` in slots 0.., plus 16 distinct frames, in a real resource."""
+    head = bytearray(ANIM_HEADER)
+    head[0x6C:0x70] = ANIM_HEADER.to_bytes(4, "little")
+    head[0x70:0x74] = (ANIM_HEADER + ANIM_TABLE_BYTES).to_bytes(4, "little")
+    table = bytearray(ANIM_TABLE_BYTES)
+    for i, rec in enumerate(records):
+        if rec is not None:              # `None` leaves the slot empty, and a
+            table[i * 20:(i + 1) * 20] = rec   # record's slot is its identity
+    # Every frame distinct, so a row that steps really changes bytes and a row
+    # that does not really does not.
+    frames = bytearray()
+    for f in range(16):
+        for e in range(16):
+            frames += ((f * 97 + e * 5) & 0x7FFF).to_bytes(2, "little")
+    return bytes(head + table + frames)
+
+
+def write_disc_tree(root):
+    """A two-map extracted disc tree: the map this document is a diff against,
+    and the FOREIGN map the emulator is pretending to have loaded.
+
+    Two, not one, because the content guard's whole job is to recognise the
+    HOST's table -- which on a swap is not the document's map. One resource
+    would let a guard that compared against the document's own map pass.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "MAP001.GNS").write_bytes(b"\x00" * 20)
+    # The pushed map: CLUT row 13, and one texture record that must NOT be
+    # installed (its VRAM base is the loader's, #653).
+    # Slot 2, not slot 0. A record's index is part of its identity, so the
+    # install writes it back to its own slot -- and putting it anywhere but on
+    # top of the host's makes the seeded "erase does nothing" arm able to fail:
+    # the host's slots 0 and 1 survive and the readback sees them still moving.
+    ours = anim_resource([None, None, anim_record(13 * 16),
+                          anim_record(850, y=100, w=8, h=8)])
+    (root / "MAP001.9").write_bytes(ours)
+    # The host: CLUT rows 14 and 15, and three texture records. All three of
+    # its rows sit inside `CLUT_ANIMATED_MEASURED`, so the engine-animated-row
+    # tolerance in `check_clut_block` behaves exactly as it does on a real map.
+    theirs = anim_resource([anim_record(14 * 16), anim_record(15 * 16),
+                            anim_record(700, y=40, w=8, h=8),
+                            anim_record(712, y=40, w=8, h=8),
+                            anim_record(724, y=40, w=8, h=8)])
+    (root / "MAP099.9").write_bytes(theirs)
+    return ours, theirs
+
+
 def main():
     TMP.mkdir(exist_ok=True)
     if REPORT.exists():
         REPORT.unlink()                      # never grade on a stale report
     zf_path = ensure_addon()
+    disc = TMP / "disc"
+    ours, _theirs = write_disc_tree(disc)
+    # A second tree that is the SAME game and a DIFFERENT build of this map:
+    # the host's table still matches, so the erase is confirmed, and the
+    # document's pin does not, so the install is refused. That is decision
+    # 11's degradation rule, and it is the half of it that survives contact.
+    disc_bad = TMP / "disc-wrong-pin"
+    write_disc_tree(disc_bad)
+    (disc_bad / "MAP001.9").write_bytes(
+        anim_resource([None, None, anim_record(9 * 16),
+                       anim_record(850, y=100, w=8, h=8)]))
     staged = TMP / FIXTURE.name
-    staged.write_text(FIXTURE.read_text())
     doc = json.loads(FIXTURE.read_text())
+    # The stub's `sha256` for `MAP001.9` is the schema's example digest, and
+    # decision 11's read of the base resource is PINNED by it. Re-pin the
+    # staged copy against the tree above, so the animation arms exercise a
+    # verified read rather than a skipped one -- the mismatch is its own arm.
+    import hashlib
+    for entry in doc["base"]["resources"]:
+        if entry["name"] == "MAP001.9":
+            entry["sha256"] = hashlib.sha256(ours).hexdigest()
+    staged.write_text(json.dumps(doc))
     for st in doc["map_states"]:
         if st.get("texture_sheet"):
             (TMP / st["texture_sheet"]).write_bytes(
@@ -1692,6 +2729,8 @@ def main():
                       .replace("@ADDONPKG@", str(ADDON_DIR.parent))
                       .replace("@ZIP@", str(zf_path))
                       .replace("@JSON@", str(staged))
+                      .replace("@DISC@", str(disc))
+                      .replace("@DISC2@", str(disc_bad))
                       .replace("@OUT@", str(REPORT)))
     # Isolate this Blender from the artist's OWN install. Without it the
     # `addon_install` in the script above overwrites the addon they are

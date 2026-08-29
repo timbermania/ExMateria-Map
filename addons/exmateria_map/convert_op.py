@@ -25,8 +25,10 @@ unwrap, which resamples, so it is a second increment behind this same button
 and not a silent part of this one.
 """
 import bpy
+from bpy.props import EnumProperty
 from bpy.types import Operator
 
+from . import resample
 from .convert import convert
 from .export_document import (export_order, image_indices, readable_mesh,
                               set_image_indices, uv_dec)
@@ -138,7 +140,7 @@ def source_art_name(sheet):
     return f"exmateria_map.source/{sheet}"
 
 
-def _write_art(name, art):
+def _write_art(name, art, pack=True):
     """The true-colour source art as a Blender image.
 
     `Non-Color`, holding `byte / 255` -- exactly the space the CLUT image is
@@ -147,13 +149,48 @@ def _write_art(name, art):
     form of "conversion is visually lossless".
 
     Rows flip: this buffer is top-scanline-first like the sidecar PNG, and
-    Blender's pixel row 0 is the BOTTOM.
+    Blender's pixel row 0 is the BOTTOM.  That flip is per ROW and stays per
+    row at every scale (ADR-0186 Amendment 10) -- flipping in N-row blocks
+    leaves each block internally upside down, which at N = 1 is
+    indistinguishable from correct and at N > 1 is a shredded picture.
+
+    **The size comes from the buffer**, through the one home the scale rule
+    has (`resample.scale_of_buffer`).  It used to be a hardcoded
+    `w, h = 256, 1024`, which took a 4x buffer, wrote its top strip into a 1x
+    image, and said nothing -- `img.pixels[:]` never sees the rest, because
+    the loop is bounded by `w` and `h` and not by `len(art)`.
+
+    `pack` is a parameter because the Painting and the native canvas want
+    OPPOSITE answers.  The Painting is the master and must survive a reload,
+    so it packs.  The canvas is derived, and ADR-0186 Amendment 10 decision 39
+    says it is never saved into the `.blend` -- regenerated from the master on
+    load, so a file cannot be reopened holding a canvas that disagrees with its
+    master.  Cross-session staleness is unreachable rather than guarded.
+
+    Cost, measured rather than feared: building the float buffer is 0.04 s at
+    1x and **0.65 s at 4x**, once per conversion.  An earlier note here
+    guessed the plain Python list was unviable at 4x and it is not; the
+    `array` + `foreach_set` idiom this file uses elsewhere is 2.6x faster and
+    is not needed for that.
     """
-    w, h = 256, 1024
+    n = resample.scale_of_buffer(len(art))
+    if n is None:
+        raise ValueError(
+            f"{len(art)} art byte(s) is no legal Painting: it must be "
+            f"3 * 256k * 1024k for k in {list(resample.SCALES)} "
+            f"(ADR-0186 Amendment 10 dec. 43)")
+    w, h = 256 * n, 1024 * n
     img = bpy.data.images.get(name)
     if img is not None and tuple(img.size) != (w, h):
-        bpy.data.images.remove(img)
-        img = None
+        # RESIZED, never removed and remade.  Removing it frees the datablock
+        # every reference is holding: the material's `source_art` node loses
+        # its image, so the model goes untextured; an Image Editor the artist
+        # is painting in empties; and any Python name for it dies with
+        # `ReferenceError: StructRNA of type Image has been removed`.  That
+        # cost a run here and would have cost the artist their viewport the
+        # first time they changed the scale.  `scale()` resamples in place --
+        # whatever it leaves behind is overwritten wholesale below.
+        img.scale(w, h)
     if img is None:
         img = bpy.data.images.new(name, w, h, alpha=False, float_buffer=True)
         img.colorspace_settings.name = "Non-Color"
@@ -167,9 +204,210 @@ def _write_art(name, art):
             px[j + 2] = art[at + 2] / 255.0
             px[j + 3] = 1.0
     img.pixels[:] = px
-    img.pack()                    # or it reloads BLANK from a path it has not got
+    if pack:
+        img.pack()                # or it reloads BLANK from a path it has not got
     img.update()
     return img
+
+
+def native_canvas_name(sheet):
+    return f"exmateria_map.canvas/{sheet}"
+
+
+#: What was last DERIVED into each native canvas, keyed by image name.
+#:
+#: Module state and nothing else -- not a datablock, not an
+#: `exmateria_map/...` key, and so never in the `.blend`.  ADR-0186
+#: Amendment 10 decision 39 makes the canvas itself unsaved, and a baseline
+#: that outlived the session would describe a canvas that no longer exists:
+#: every pixel would read as freshly painted and one reopen would flatten the
+#: whole master.  That is the failure `paint.py`'s `resolve()` records on the
+#: colour axis, and here it is unreachable rather than guarded.
+_CANVAS_WAS = {}
+
+
+def _derive_canvas(sheet, master, w, h, n):
+    """Shrink the master into the native canvas and record what was written."""
+    small = resample.shrink(master, w, h, n)
+    img = _write_art(native_canvas_name(sheet), small, pack=False)
+    _CANVAS_WAS[img.name] = small
+    return img
+
+
+def _painting_and_sheet(ob):
+    from .paint import painting_of
+    sheet = sheet_of_state(ob, int(ob.get("exmateria_map/preview_state") or 0))
+    return sheet, painting_of(ob, sheet)
+
+
+def painting_scale_get(ob):
+    """The Painting's N, read off the picture.  1 when there is no Painting.
+
+    ADR-0186 Amendment 10 decision 43: N is DERIVED and never stored, because
+    a picture already carries its own width and height and a stored `scale`
+    would be the redundant, driftable copy.  A plain registered property would
+    be exactly that copy -- `bpy.props` writes into the ID property store, so
+    it would survive a rescale done any other way and then disagree with the
+    image.  `get`/`set` is what keeps decision 43 true of the UI as well as of
+    the document.
+    """
+    _sheet, painting = _painting_and_sheet(ob)
+    if painting is None:
+        return 1
+    return resample.scale_of(painting.size[0], painting.size[1]) or 1
+
+
+def _warn_down_conversion(sheet, old, new):
+    """Say what a shrink just destroyed.  Never raises -- it is a report.
+
+    It does NOT tell the artist to undo.  Whether Blender's undo restores image
+    PIXEL data is not something this package has measured, and it cannot be:
+    `ed.undo` is disabled in background mode, so every harness here is blind to
+    it.  A line promising a way back that may not exist is worse than the
+    silence decision 36 was closing -- it would stop the artist saving the file
+    under a new name, which is the recovery that certainly does work.
+    """
+    try:
+        from .report_log import record
+        record("painting scale", sheet, [
+            f"{old}x -> {new}x: the Painting was box-averaged down and the "
+            f"detail between those two scales is GONE.",
+            f"Raising it back to {old}x replicates pixels; it does not "
+            f"recover what was averaged away.",
+            "If that was not what you meant, close WITHOUT saving.",
+        ])
+    except Exception:                  # a log that failed must not eat the edit
+        pass
+
+
+def painting_scale_set(ob, value):
+    """Rescale the Painting in place, snapping `value` to a legal scale.
+
+    Raising is a REPLICATE and is lossless -- the same replicate the bake does,
+    which is why converting at 1x and then raising this to 4 is byte-identical
+    to converting at 4x (grading criterion 2, restated as a gesture).  Lowering
+    box-averages and cannot be undone, so a value between two scales snaps UP
+    (`resample.snap_scale`, which holds the rule and the reasoning).
+
+    The ratio is always itself a legal scale -- `SCALES` is a power-of-two
+    ladder, so every quotient of two members is a member -- which is what lets
+    2 -> 4 replicate directly instead of going down to 1 and back up, losing
+    the 2x detail on the way through.
+
+    **A down-conversion is REPORTED.**  Decision 36 makes it "a deliberate,
+    warned act", and a property setter has no dialog to warn in -- but it has
+    the Log, which is where everything else this addon does with consequences
+    goes.  Silence here would be decision 11's blur handed back without a word;
+    the artist can still undo, and the line is what tells them they need to.
+    """
+    sheet, painting = _painting_and_sheet(ob)
+    if painting is None:
+        return
+    old = resample.scale_of(painting.size[0], painting.size[1])
+    if old is None:
+        return
+    new = resample.snap_scale(value)
+    if new == old:
+        return
+    from .export_document import image_rgb
+    w, h = painting.size[0], painting.size[1]
+    master = image_rgb(painting)
+    if new > old:
+        master = resample.expand(master, w, h, new // old)
+    else:
+        master = resample.shrink(master, w, h, old // new)
+        _warn_down_conversion(sheet, old, new)
+    _write_art(source_art_name(sheet), master)
+    # The canvas is derived FROM the master, so a master that changed shape
+    # leaves it the wrong size and its baseline describing a picture that no
+    # longer exists -- `write_through_canvas` would then compare buffers of
+    # different lengths on the very next tick.  Re-derive rather than guard.
+    if bpy.data.images.get(native_canvas_name(sheet)) is not None:
+        _derive_canvas(sheet, master, 256 * new, 1024 * new, new)
+
+
+def write_through_canvas(ob, sheet, painting):
+    """Stamp the native canvas's CHANGED pixels back into the master.
+
+    ADR-0186 Amendment 10 decision 39, and the first stage of the settle tick:
+    *write-through -> shrink -> compile -> push*.  Not on the mode switch,
+    which would leave the Sheet and anything pushed stale for as long as the
+    artist paints natively, and not behind a button.
+
+    Only the pixels that DIFFER are written, and `resample.write_through` says
+    why: stamping every block would be correct on the canvas and catastrophic
+    underneath it, since one native stroke would flatten the entire N-times
+    painting.  That is grading criterion 4.
+
+    A canvas with no baseline is RE-DERIVED rather than stamped through.  It
+    means this session did not put those pixels there -- a reopened file, whose
+    canvas decision 39 declines to save -- so there is nothing to say which of
+    them are strokes.  Stamping all of them would flatten the master; stamping
+    none of them and carrying on would leave the canvas disagreeing with the
+    master for the rest of the session.  Re-deriving is decision 39's own
+    answer, moved from load time (where there is no hook) to the first tick
+    that notices.
+    """
+    canvas = bpy.data.images.get(native_canvas_name(sheet))
+    if canvas is None or painting is None:
+        return 0
+    n = resample.scale_of(*painting.size)
+    if not n or n == 1:
+        return 0
+    from .export_document import image_rgb
+    w, h = painting.size[0], painting.size[1]
+    was = _CANVAS_WAS.get(canvas.name)
+    if was is None:
+        _derive_canvas(sheet, image_rgb(painting), w, h, n)
+        return 0
+    now = image_rgb(canvas)
+    if now == was:
+        return 0
+    master, changed = resample.write_through(image_rgb(painting), w, h, n,
+                                             now, was)
+    if changed:
+        _write_art(source_art_name(sheet), master)
+        _CANVAS_WAS[canvas.name] = now
+    return changed
+
+
+def apply_canvas(ob):
+    """Point the paint target at the master, or at the derived native canvas.
+
+    ADR-0186 Amendment 10 decision 40.  This is the half of the Canvas control
+    that does something, and what it does is move where a stroke LANDS -- see
+    `_show_source_art`, where `nodes.active` and `Material.paint_active_slot`
+    are two views of one pointer.  That is the reason Canvas could not be a
+    third `PREVIEW_MODES` item: those change "nothing about the document".
+
+    Derived on demand and never cached against a stamp.  The canvas is a pure
+    function of the master (decision 35), and the settle tick is the only thing
+    that writes the master, so re-deriving on a switch cannot be wrong -- where
+    a stale cache could be, and would be exactly the cross-session staleness
+    decision 39 removes by refusing to save the canvas at all.
+
+    At N = 1 there is nothing to switch between, so this is a no-op rather than
+    a rebuild of the same picture under a second name.  It does NOT touch the
+    brush (decision 41): the chunkiness is delivered by the canvas, and seeding
+    a size here would be the force #423 spent months rejecting, over
+    `tool_settings` that live in the `.blend`.
+    """
+    from .paint import painting_of
+    sheet = sheet_of_state(ob, int(ob.get("exmateria_map/preview_state") or 0))
+    painting = painting_of(ob, sheet)
+    if painting is None:
+        return None
+    n = resample.scale_of(*painting.size)
+    if not n or n == 1:
+        return None
+    if str(getattr(ob, "exmateria_map_canvas", "HIGH")) != "NATIVE":
+        _show_source_art(ob, painting)
+        return painting
+    from .export_document import image_rgb
+    canvas = _derive_canvas(sheet, image_rgb(painting), painting.size[0],
+                            painting.size[1], n)
+    _show_source_art(ob, canvas)
+    return canvas
 
 
 def _show_source_art(ob, img):
@@ -245,6 +483,34 @@ surface. One-way, and it changes nothing you can see"""
     bl_label = "Convert"
     bl_options = {"REGISTER", "UNDO"}
 
+    #: ADR-0186 Amendment 10 decision 36.  The Painting is baked at N pixels
+    #: per texel; the **Sheet** is not, ever -- it is the disc's own resource
+    #: and carries no scale (decision 35).
+    #:
+    #: The default is **4**, decision 36's own number.  It was staged at 1
+    #: while decision 40's Canvas (High / Native) control did not exist -- an
+    #: artist handed a 4x canvas with no native view has no gesture that means
+    #: "one texel" -- and that blocker is gone: Canvas ships, and the scale is
+    #: a number field in the Paint panel beside the two compile buttons, so it
+    #: no longer has to be found in the redo panel to be changed.
+    #:
+    #: What it costs, said out loud: a 4x Painting is sixteen times the pixels,
+    #: which is 12.6 MB of buffer per state, a compile that box-averages
+    #: sixteen texels per output pixel, and a settle digest over all of it.
+    #: The default is what most maps will be authored at, so that is the
+    #: budget the settle tick is now sized against.
+    scale: EnumProperty(
+        name="Painting scale",
+        description="Pixels per texel in the Painting. Higher lets you author "
+                    "above the sheet's own resolution; the compile box-averages "
+                    "it back down. The Sheet the game reads never changes size",
+        items=[(str(n), f"{n}x", f"{256 * n} x {1024 * n} -- "
+                + ("one pixel per texel" if n == 1
+                   else f"{n * n} pixels per texel"))
+               for n in resample.SCALES],
+        default="4",
+    )
+
     @classmethod
     def poll(cls, context):
         ob = marker_in_scene(context)
@@ -285,7 +551,8 @@ surface. One-way, and it changes nothing you can see"""
             with readable_mesh(ob):
                 polygons = _face_ordered(me)
                 converted, art, moved = convert(polygons,
-                                                image_indices(img), rows)
+                                                image_indices(img), rows,
+                                                scale=int(self.scale))
                 _write_back(me, converted)
         except RuntimeError as e:      # readable_mesh refuses a non-active edit
             self.report({"ERROR"}, str(e))

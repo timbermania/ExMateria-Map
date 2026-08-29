@@ -115,6 +115,24 @@ def terrain_source(files: mapfile.MapFiles, rows) -> tuple[str, int, int, int, b
     return None
 
 
+def terrain_tiles(payload: bytes, size_x: int, size_z: int) -> list[list[int]]:
+    """Every slot of the base's 0x68 chunk, raw: ``[x, z, level, b0 ... b7]``.
+
+    Derived, information-bearing, ``build`` ignores it (schema §4) -- the same
+    standing as ``floor_steps``.  It is what the addon draws the grid from, and
+    it declares nothing: decision 22's ``"terrain": None`` is untouched.
+    """
+    out = []
+    for level in range(mapfile.TERRAIN_LEVELS):
+        for z in range(size_z):
+            for x in range(size_x):
+                o = (2 + level * mapfile.TERRAIN_LEVEL_BYTES
+                     + (z * size_x + x) * mapfile.TERRAIN_RECORD_BYTES)
+                out.append([x, z, level]
+                           + list(payload[o:o + mapfile.TERRAIN_RECORD_BYTES]))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # dump
 # ---------------------------------------------------------------------------
@@ -154,10 +172,12 @@ def dump(map_dir: Path, number: int, arrangement: int) -> tuple[dict, dict]:
     if picked is None:
         terrain_name = terrain_digest = terrain_grid = None
         steps: list[list[int]] = []
+        tiles: list[list[int]] = []
     else:
         terrain_name, size_x, size_z, _offset, payload = picked
         terrain_digest = hashlib.sha256(payload).hexdigest()
         terrain_grid = {"size_x": size_x, "size_z": size_z}
+        tiles = terrain_tiles(payload, size_x, size_z)
         rings = [ring(p) for key in ("tt", "tq", "ut", "uq")
                  for p in mesh.positions[key]]
         by_tile = floor_steps(rings, size_x, size_z)
@@ -209,6 +229,7 @@ def dump(map_dir: Path, number: int, arrangement: int) -> tuple[dict, dict]:
             "terrain_source": terrain_name,
             "terrain_digest": terrain_digest,
             "terrain_grid": terrain_grid,
+            "terrain_tiles": tiles,
             "floor_steps": steps,
         },
         "polygons": polygons(mesh, slots),

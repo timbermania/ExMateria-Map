@@ -45,8 +45,9 @@ except ImportError:
     from charts import charts
     from quantise import error, nearest, quantise, snap
 
-__all__ = ["compile_sheet", "select_binding", "measure", "regressions",
-           "texel_addresses", "Compiled", "Selection", "ROWS"]
+__all__ = ["compile_sheet", "select_binding", "score_and_palettes",
+           "snapped", "measure", "regressions", "texel_addresses",
+           "held_and_free", "Compiled", "Selection", "ROWS"]
 
 SHEET_W, SHEET_H = 256, 1024
 PAGE = 256
@@ -111,6 +112,29 @@ def histogram(art, addresses):
         c = (art[at], art[at + 1], art[at + 2])
         counts[c] = counts.get(c, 0) + 1
     return counts
+
+
+def snapped(bag):
+    """One histogram, folded onto the lattice -- the SEARCH's bag.
+
+    A CLUT row is sixteen BGR555 words, so it cannot hold an off-lattice
+    colour at all: ranking bindings on the true painting asks the quantiser to
+    tell apart differences no row could express (ADR-0186 Amendment 7,
+    decision 31).  Snapping first is therefore the better-posed question and
+    not a shortcut, and it caps the bag at the lattice's 32,768 colours where
+    a painted canvas measured 136,133.
+
+    It folds the histogram rather than the Painting: `snap` runs once per
+    DISTINCT colour a chart reads instead of once per texel, and the counts
+    add the same way either order.  The **fit** (`compile_sheet`) is untouched
+    and still runs on the true painting -- what ships is a picture of what was
+    painted, and only the ranking happens on the lattice.
+    """
+    out = {}
+    for c, n in bag.items():
+        k = snap(c)
+        out[k] = out.get(k, 0) + n
+    return out
 
 
 def _pool(bags, members):
@@ -213,45 +237,108 @@ def measure(polygons, art, palettes, atoms=None):
                  if total else 0.0)
 
 
-def _score(bags, rows, weights):
-    """The objective: count-weighted mean squared error of the whole map.
+def score_and_palettes(bags, rows):
+    """The objective, and the sixteen rows it implies, from ONE quantise pass.
 
-    One number per candidate binding, and the ONLY thing selection compares.
+    `(count-weighted mean squared error of the whole map, {row: entries})`.
+    The error is the only thing selection compares; the palettes are what the
+    next pass needs to let every chart pick the row that fits it best.
+
+    They are returned together because they are the same sixteen `quantise`
+    calls (ADR-0186 Amendment 7, decision 31).  Scoring a binding and then
+    re-quantising the same rows from the same members ran the quantiser twice
+    over identical input -- provably a refactor to fuse, and worth 23 % of a
+    search that `cProfile` puts almost entirely inside `quantise._nearest`.
+
+    A row nothing is bound to is absent rather than empty: it reads nothing,
+    so it has no colours to be scored on and is not a row a chart may move to.
     """
     total = err = 0
+    palettes = {}
     for r in range(ROWS):
         members = [i for i, row in enumerate(rows) if row == r]
         if not members:
             continue
         pooled = _pool(bags, members)
         entries = quantise(pooled, ROWS)
+        palettes[r] = entries
         n = sum(pooled.values())
         err += error(pooled, entries) * n
         total += n
-    return err / total if total else 0.0
+    return (err / total if total else 0.0), palettes
 
 
-def _seed(bags):
+def held_and_free(incumbent, animated):
+    """Split the search's freedom by the map's `0x6c` table (decision 49).
+
+    `animated` is the set of CLUT rows this map's animation instruction table
+    drives -- `live_link.animation_rows` reads it off the base resource, and
+    it is EMPTY for most maps, which is what makes this a no-op there.
+
+    An animated row is not a colour the search may spend.  A polygon bound to
+    one does not show the sixteen colours the compile wrote there: the engine
+    repaints that row out of the `0x70` frames several times a second, so what
+    it shows is the cycle, whatever was quantised underneath it.  The scorer
+    cannot see that -- it ranks on colour error alone -- and MAP022 measures
+    what follows: rows 14 and 15 are animated and EMPTY on the disc, so they
+    look free, and one painted canvas put 152 of 385 polygons onto animated
+    rows.  The artist's report is exactly that picture: *"a bunch of polygons
+    would turn blue and shimmer like water"*.
+
+    So the rule is **the search never changes whether a chart is animated**,
+    and it is one rule in both directions:
+
+    * A chart the disc put on an animated row is **held**.  It keeps the row
+      it has, which keeps the cycle it has -- and the animated rows are not
+      interchangeable either, because each record carries its own frames, so
+      moving water from row 13 to row 14 would swap one animation for another.
+    * Every other chart searches over the **un**animated rows only.
+
+    This refuses nothing the map already ships and needs no new authoring
+    surface, which is what makes it the smaller answer than a row the artist
+    marks: `build` carries `0x6c` and `0x70` verbatim (schema §8), so the
+    addon cannot say "this row is no longer animated" and a fix that assumed
+    it could would be proposing a document member.  What it costs is the
+    ability to move water off its row by search; that is an authoring act, and
+    `palette_id` is still the artist's to set.
+
+    Returns `(movable, free_rows)` -- the chart indices the search may move,
+    and the rows it may move them to.  With no animation that is every chart
+    and all sixteen rows, which is today's search unchanged.
+    """
+    animated = set(animated or ())
+    free_rows = [r for r in range(ROWS) if r not in animated]
+    movable = [i for i, r in enumerate(incumbent) if r not in animated]
+    return movable, free_rows
+
+
+def _seed(bags, movable, free_rows, incumbent):
     """The starting assignment -- and NOT the incumbent (decision 8).
 
-    Charts are ordered by their mean colour, green first, and cut into sixteen
-    equal runs.  Any spread-out start does; what matters is that it is not the
-    binding being compared against, because a search that starts there
-    measured 44.41 against 34.68 for one that does not.
+    Charts are ordered by their mean colour, green first, and cut into equal
+    runs over the rows the search may use.  Any spread-out start does; what
+    matters is that it is not the binding being compared against, because a
+    search that starts there measured 44.41 against 34.68 for one that does
+    not.
+
+    A chart the animation holds (`held_and_free`) starts on its incumbent row,
+    because that is the only row it may ever be on -- the seed is a place for
+    the search to start, and a chart that cannot move has nowhere else.
     """
     def key(i):
         n = sum(bags[i].values()) or 1
         return tuple(sum(c[ch] * k for c, k in bags[i].items()) / n
                      for ch in (1, 0, 2))
 
-    order = sorted(range(len(bags)), key=key)
-    rows = [0] * len(bags)
+    rows = list(incumbent)
+    order = sorted(movable, key=key)
     for place, i in enumerate(order):
-        rows[i] = place * ROWS // len(order)
+        rows[i] = free_rows[place * len(free_rows) // len(order)]
     return rows
 
 
-def select_binding(polygons, art, atoms=None, passes=SEARCH_PASSES):
+def select_binding(polygons, art, atoms=None, passes=SEARCH_PASSES,
+                   animated=None):
     """The search: which CLUT row each chart should read through (decision 8).
 
     The candidate set is the incumbent plus every pass of the clusterer, and
@@ -260,40 +347,58 @@ def select_binding(polygons, art, atoms=None, passes=SEARCH_PASSES):
     over candidates, not a last pass -- and what buys "never lose to what the
     disc already ships" without seeding from it.
 
+    `animated` is the CLUT rows this map's `0x6c` table drives, and it bounds
+    the search rather than scoring it -- see `held_and_free` for why an
+    animated row is not a colour the search may spend.  It defaults to nothing
+    animated, which is most of the corpus and is today's search exactly.
+
     Returns a `Selection`.  `is_incumbent` is a real outcome, not a failure:
     the disc's own binding can be the best one, and a caller must say so
     rather than report a search that looks like it did nothing.
     """
     atoms = _atoms_of(polygons, atoms)
-    bags = [histogram(art, atom_texels(polygons, a)) for a in atoms]
-    weights = [sum(b.values()) for b in bags]
+    bags = [snapped(histogram(art, atom_texels(polygons, a))) for a in atoms]
 
     incumbent = [polygons[a[0]]["palette_id"] for a in atoms]
     best = list(incumbent)
-    best_err = incumbent_err = _score(bags, incumbent, weights)
+    best_err = incumbent_err = score_and_palettes(bags, incumbent)[0]
     scored = 1
 
-    rows = _seed(bags)
+    movable, free_rows = held_and_free(incumbent, animated)
+    free = set(free_rows)
+    if not movable or not free_rows:
+        # Nothing the search may move: the incumbent is the whole candidate
+        # set, and that is a RESULT (decision 8), not a refusal.
+        binding = [None] * len(polygons)
+        for i, atom in enumerate(atoms):
+            for m in atom:
+                binding[m] = best[i]
+        return Selection(binding, atoms, best_err, incumbent_err, scored, True)
+
+    rows = _seed(bags, movable, free_rows, incumbent)
     for _ in range(passes + 1):
-        err = _score(bags, rows, weights)
+        # Scoring this binding ALREADY quantised every row off what is in it
+        # now, and that is exactly what the next step needs to let every chart
+        # pick the row that fits it best -- so it comes back with the score
+        # rather than being computed a second time (decision 31).  A chart
+        # moves whole or not at all.
+        err, palettes = score_and_palettes(bags, rows)
         scored += 1
         if err < best_err:
             best, best_err = list(rows), err
-        # Requantise each row off what is in it now, then let every chart pick
-        # the row that fits it best.  A chart moves whole or not at all.
-        palettes = {}
-        for r in range(ROWS):
-            members = [i for i, row in enumerate(rows) if row == r]
-            if members:
-                palettes[r] = quantise(_pool(bags, members), ROWS)
-        moved = []
-        for i in range(len(atoms)):
+        moved = list(rows)
+        for i in movable:
             pick, pick_err = None, None
             for r, entries in palettes.items():
+                # An animated row may hold members -- the charts held on it --
+                # so it is quantised and scored like any other.  It is just not
+                # a row a movable chart may be offered.
+                if r not in free:
+                    continue
                 e = error(bags[i], entries)
                 if pick_err is None or e < pick_err:
                     pick, pick_err = r, e
-            moved.append(pick)
+            moved[i] = pick if pick is not None else rows[i]
         if moved == rows:
             break
         rows = moved

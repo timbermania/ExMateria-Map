@@ -15,6 +15,7 @@ exact rather than approximate, and it needs no reference implementation --
 the disc is the reference.
 """
 
+import random
 import sys
 from pathlib import Path
 
@@ -194,6 +195,169 @@ def test_the_search_is_not_seeded_from_the_incumbent():
     assert all(r.error < r.incumbent_error for r in runs)
 
 
+def bag(colours, texels=1):
+    """A histogram in `histogram()`'s shape -- `{(r, g, b): texels}`."""
+    return {Q.snap(c): texels for c in colours}
+
+
+#: Sixteen lattice colours, which is exactly what one CLUT row holds.
+SIXTEEN = [Q.snap((8 * i, 200 - 8 * i, 4 * i)) for i in range(16)]
+
+#: Twenty, which is four more than a row can hold, so a row pooling these
+#: cannot be exact and its error is above zero for a reason from the format.
+TWENTY = [Q.snap((6 * i, 240 - 6 * i, 3 * i)) for i in range(20)]
+
+
+def test_the_scorer_hands_back_the_palettes_it_quantised():
+    """Decision 31's free half, and the shape that makes it possible.
+
+    `select_binding` quantised all sixteen rows inside its scorer and threw
+    the palettes away, then re-quantised the same rows from the same members
+    so each chart could pick its next one.  The fused call returns both.
+
+    The contract is graded against the FORMAT, not against the code it
+    replaces: a CLUT row holds sixteen entries, so a row whose pooled bag
+    carries no more than sixteen lattice colours must come back holding
+    exactly them, at zero error.  That is the same oracle
+    `test_the_first_compile_of_a_real_map_changes_no_colour` runs on the disc.
+    """
+    bags = [bag(SIXTEEN[:8]), bag(SIXTEEN[8:])]
+
+    err, palettes = C.score_and_palettes(bags, [3, 3])
+
+    assert set(palettes) == {3}, \
+        "a row nothing is bound to reads nothing, so it has no palette here"
+    assert sorted(palettes[3]) == sorted(SIXTEEN), (
+        "sixteen lattice colours pooled into one row are exactly what that "
+        "row can hold, so they must come back unchanged")
+    assert err == 0.0
+
+
+def test_the_score_is_weighted_by_TEXELS_and_not_by_ROWS():
+    """The objective is the whole map's count-weighted mean error, which is
+    what makes a big badly-fitted surface matter more than a small one.
+
+    Two rows, one exactly representable and one that cannot be: which of them
+    carries the map's texels is the whole difference.  Asserted as a
+    comparison rather than a number, so nothing here recomputes the mean the
+    way the scorer does.
+    """
+    clean, dirty = bag(SIXTEEN), bag(TWENTY)
+
+    heavy_clean, _ = C.score_and_palettes(
+        [bag(SIXTEEN, 100), bag(TWENTY, 1)], [0, 1])
+    heavy_dirty, _ = C.score_and_palettes(
+        [bag(SIXTEEN, 1), bag(TWENTY, 100)], [0, 1])
+
+    alone, _ = C.score_and_palettes([dirty], [1])
+    assert alone > 0.0, (
+        "twenty colours do not fit in a sixteen-entry row; if this is zero "
+        "the fixture proves nothing about weighting")
+    assert C.score_and_palettes([clean], [0])[0] == 0.0
+    assert heavy_clean < heavy_dirty, (
+        "the same two rows, weighted the other way, must not score the same")
+
+
+#: A fixture with more colour FAMILIES than there are CLUT rows, so rows must
+#: pool, no binding can be exact, and the search does not settle on its first
+#: pass.  `random.Random(11)` is not decoration: seeds 0-10 all reached a fixed
+#: point immediately (`scored == 2`), which would have pinned a single pass.
+PINNED_SEED, PINNED_CHARTS, PINNED_COLOURS = 11, 24, 12
+
+
+def pinned_fixture():
+    rnd = random.Random(PINNED_SEED)
+    quads = chart_quads(PINNED_CHARTS)
+    for q in quads:                     # everything on one row: a bad binding
+        q["palette_id"] = 0
+    families = [family((rnd.randrange(160), rnd.randrange(160),
+                        rnd.randrange(160)), PINNED_COLOURS)
+                for _ in range(PINNED_CHARTS)]
+    return quads, painted(quads, families)
+
+
+def test_fusing_the_scorer_and_the_palette_build_moves_no_binding_and_no_bit():
+    """Amendment 7 decision 31 calls the fuse *"provably a refactor -- same
+    binding, same error to the last bit, same pass count"*.  This is the proof.
+
+    The four literals below were captured from the search as it stood BEFORE
+    `score_and_palettes` existed, when it scored a binding with one set of
+    sixteen `quantise` calls and then re-quantised the same sixteen rows from
+    the same members to move the charts.  They are a pin, and that is the
+    point: a fuse that changed any of them would not be a refactor, and
+    nothing cheaper can tell the difference between the two.
+
+    It keeps its value after the fuse, because the objective is what every
+    other decision in this ADR is argued against: decision 8's "never lose to
+    the disc", decision 9's per-chart report and decision 31's own
+    equal-quality claim are all statements about THIS number.  Moving it
+    should cost a deliberate re-pin.
+    """
+    quads, art = pinned_fixture()
+
+    chosen = C.select_binding(quads, art)
+
+    assert list(chosen.binding) == [12, 12, 5, 15, 11, 4, 13, 14, 1, 2, 6, 10,
+                                    15, 8, 0, 8, 3, 7, 2, 4, 9, 0, 6, 10]
+    assert chosen.error == 24.951171875
+    assert chosen.incumbent_error == 880.55712890625
+    assert chosen.scored == 3, (
+        "the pin is worth less if the search settles on its first pass: "
+        "three candidates is one seed plus two passes of the clusterer")
+    assert not chosen.is_incumbent
+
+
+def off_lattice_twin(art, seed=7, spread=3):
+    """The same picture to the FORMAT, different everywhere else.
+
+    Every texel is offered a small move and the move is kept only where `snap`
+    is unmoved -- so no CLUT row could tell the two paintings apart, and a
+    search that ranks on the lattice must not either.
+    """
+    rnd = random.Random(seed)
+    out = bytearray(art)
+    moved = 0
+    for i in range(0, len(out), 3):
+        was = (out[i], out[i + 1], out[i + 2])
+        if was == (0, 0, 0):
+            continue
+        cand = tuple(max(0, min(255, c + rnd.randint(-spread, spread)))
+                     for c in was)
+        if cand != was and Q.snap(cand) == Q.snap(was):
+            out[i:i + 3] = bytes(cand)
+            moved += 1
+    return bytes(out), moved
+
+
+def test_a_colour_no_CLUT_ROW_could_hold_moves_no_chart_and_no_score():
+    """Decision 31: the search's bags are lattice-snapped, and the ADR argues
+    that as the better-POSED question rather than as a shortcut -- a CLUT row
+    cannot hold an off-lattice colour, so a difference no row could ever
+    express must not change which row a chart is bound to.
+
+    Measured before it was built: the exact fixture below moved 6,124 texels
+    without moving a single colour the format can hold, and the search read
+    them as 6,124 more distinct colours and re-bound seven of twenty-four
+    charts.  It also caps the bag at the lattice's 32,768 colours instead of a
+    painted canvas's 136,133, which is where the 10.6x comes from.
+
+    The score is asserted alongside the binding because that is the other half
+    of the same claim: `Selection.error` is a number about the lattice, and it
+    is the FIT (`compile_sheet`, still on the true painting) that measures what
+    the artist will actually see.
+    """
+    quads, art = pinned_fixture()
+    twin, moved = off_lattice_twin(art)
+    assert moved > 1000, (
+        f"only {moved} texels differ off-lattice; the fixture proves nothing")
+
+    one, two = C.select_binding(quads, art), C.select_binding(quads, twin)
+
+    assert list(one.binding) == list(two.binding)
+    assert one.error == two.error
+    assert one.incumbent_error == two.incumbent_error
+
+
 def test_regressions_are_reported_per_chart_and_ranked_by_how_much():
     """Decision 9: rule per map, report per chart.  A global mean can improve
     while one corner of the mesh gets visibly worse."""
@@ -277,3 +441,188 @@ def test_a_real_maps_search_never_loses_to_the_disc():
         "a freshly converted map is exactly representable under its own "
         "binding, so this is the tie case and `is_incumbent` must say so")
     assert chosen.is_incumbent
+
+
+# ---------------------------------------------------------------------------
+# Decision 49 -- an animated CLUT row is not a colour the search may spend.
+# ---------------------------------------------------------------------------
+#
+# Reported from use, on MAP022: *"if I choose a color, and then paint, it will,
+# sometimes, do an issue we resolved before which is a palette would inherit
+# the water animation -- and then a bunch of polygons would turn blue and
+# shimmer like water."*  Measured: MAP022's `0x6c` animates rows 13, 14 and 15;
+# the disc puts 52 of 385 polygons on row 13 and NOTHING on 14 or 15, so those
+# two look free to a scorer that ranks on colour error alone.  Over a painted
+# canvas the unbounded search put up to 152 of 385 polygons onto animated rows.
+#
+# Note what does NOT have to be pressed for the artist to see this: the settle
+# runs the whole compile, search included, and pushes (Amendment 9, decision
+# 28).  Painting alone re-binds.
+
+def repainted(art):
+    """A converted map's Painting, as an artist leaves it.
+
+    Each 16x16 block of the sheet is flooded with one colour taken from the
+    map's OWN distinct set, on a coarse two-prime pattern.  Three properties
+    it is chosen for, in the order they matter:
+
+    * It really is a different picture, so the incumbent stops being exactly
+      representable and the search starts choosing rows.  `off_lattice_twin`
+      -- the other repaint in this file -- deliberately does not: it moves
+      only where `snap` is unmoved, so no row can tell the two apart and the
+      search correctly does not move either.
+    * A *permutation* of the colours does not work either, and it is the
+      obvious thing to reach for: it maps each row's sixteen colours to
+      sixteen others, so the incumbent still represents the picture exactly
+      and ties.  Colours have to cross chart boundaries, which is what a
+      block pattern does and a per-colour remap cannot.
+    * The distinct-colour count is unchanged, and that is the whole cost:
+      `cProfile` puts the search almost entirely inside `quantise._nearest`,
+      over the bag.  A per-texel jitter asserts the same thing and takes ten
+      seconds a call instead of a tenth of one.
+    """
+    seen = sorted({bytes(art[i:i + 3]) for i in range(0, len(art), 3)})
+    out = bytearray(art)
+    for t in range(len(art) // 3):
+        u, v = t % C.SHEET_W, t // C.SHEET_W
+        out[3 * t:3 * t + 3] = seen[((u // 16) * 7 + (v // 16) * 13) % len(seen)]
+    return bytes(out)
+
+
+def test_the_partition_is_by_the_incumbents_animatedness():
+    """`held_and_free` is the whole rule, and it is one rule in two directions.
+
+    A chart on an animated row may not leave it -- the animated rows are not
+    interchangeable, each record carrying its own frames -- and no other chart
+    may arrive on one.
+    """
+    incumbent = [13, 5, 14, 5, 0]
+
+    movable, free_rows = C.held_and_free(incumbent, [13, 14, 15])
+
+    assert movable == [1, 3, 4], "the charts on 13 and 14 are held"
+    assert free_rows == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    assert 15 not in free_rows, (
+        "row 15 holds no chart and is still animated -- an EMPTY animated row "
+        "is exactly the one the scorer finds cheapest, which is the defect")
+
+
+def test_no_animation_is_the_search_this_module_already_had():
+    """The common map, and the arm that says this decision costs it nothing.
+
+    1,465 of the corpus's 1,575 resources carry no `0x6c` at all, so the
+    default has to be today's search and not a near miss of it.  Asserted as
+    an identical BINDING rather than an identical error, because two searches
+    can score the same and bind differently.
+    """
+    quads = chart_quads(24)
+    art = painted(quads, [EIGHT_FAMILIES[i % 8] for i in range(24)])
+
+    plain = C.select_binding(quads, art)
+    absent = C.select_binding(quads, art, animated=None)
+    empty = C.select_binding(quads, art, animated=())
+
+    assert absent.binding == plain.binding
+    assert empty.binding == plain.binding
+    assert absent.error == plain.error == empty.error
+    assert absent.scored == plain.scored == empty.scored
+
+
+def test_a_held_chart_keeps_its_OWN_animated_row_not_merely_an_animated_one():
+    """Row 13's frames are not row 14's, so "still animated" is not enough.
+
+    The `0x70` chunk is one cycle per record, so moving water from 13 to 14
+    swaps one animation for another -- a different defect wearing the same
+    shape.  The assertion is on the row, not on the set.
+    """
+    quads = chart_quads(24)
+    for i, q in enumerate(quads):
+        q["palette_id"] = 13 if i < 4 else 14 if i < 6 else 0
+    art = painted(quads, [EIGHT_FAMILIES[i % 8] for i in range(24)])
+
+    chosen = C.select_binding(quads, art, animated=[13, 14, 15])
+
+    assert [chosen.binding[i] for i in range(4)] == [13, 13, 13, 13]
+    assert [chosen.binding[i] for i in range(4, 6)] == [14, 14]
+    assert all(chosen.binding[i] not in (13, 14, 15) for i in range(6, 24)), (
+        "a chart the disc did not animate must not become animated")
+
+
+def test_a_map_whose_every_row_is_animated_is_a_no_op_RESULT():
+    """Nothing to move is decision 8's tie, not a refusal.
+
+    No corpus map does this, and the guard is here because the seed and the
+    reassign step both divide by the number of rows the search may use: an
+    empty candidate set is a `ZeroDivisionError` one map away, and it must be
+    a result instead.
+    """
+    quads = chart_quads(8)
+    for i, q in enumerate(quads):
+        q["palette_id"] = i % 4
+    art = painted(quads, EIGHT_FAMILIES)
+
+    chosen = C.select_binding(quads, art, animated=range(16))
+
+    assert chosen.is_incumbent
+    assert chosen.binding == [q["palette_id"] for q in quads]
+    assert chosen.error == chosen.incumbent_error
+
+
+@needs_corpus
+def test_MAP022s_search_moves_no_chart_onto_its_water_rows():
+    """The reported defect, on the map it was reported on.
+
+    The Painting is jittered off the disc's own sheet, which is what an artist
+    painting does to it: a freshly converted map is exactly representable
+    under its own binding, so the incumbent ties and the search never moves at
+    all -- an arm on the untouched conversion is BLIND to this and would pass
+    with the bound deleted.  The control below is what makes it not blind: the
+    same painting, unbounded, moves charts onto rows 14 and 15.
+    """
+    doc, sheets = dump(MAP_DIR, 22, 0)
+    plane, palettes = a_state_with_both(doc, sheets)
+    converted, art, _ = V.convert(doc["polygons"], plane, palettes)
+    art = repainted(art)
+
+    animated = [13, 14, 15]
+    was = [q["palette_id"] for q in converted if "uv" in q]
+
+    loose = C.select_binding(converted, art)
+    bound = C.select_binding(converted, art, animated=animated)
+
+    def on_animated(binding):
+        return sum(1 for i, q in enumerate(converted)
+                   if "uv" in q and binding[i] in animated)
+
+    assert not loose.is_incumbent, "the control has to have MOVED something"
+    assert on_animated(loose.binding) != was.count(13), (
+        "the control: unbounded, this painting moves polygons on or off the "
+        "animated rows -- without that this test cannot fail")
+
+    now = [bound.binding[i] for i, q in enumerate(converted) if "uv" in q]
+    assert [r for r in now if r in animated] == [r for r in was if r in animated]
+    assert all((a in animated) == (b in animated) for a, b in zip(was, now)), (
+        "the search changed whether a chart is animated")
+    assert now.count(13) == was.count(13) == 52
+    assert now.count(14) == now.count(15) == 0, (
+        "rows 14 and 15 are animated and EMPTY on the disc, which is what "
+        "makes them look free to the scorer")
+
+
+@needs_corpus
+def test_the_bound_search_still_never_loses_to_the_disc():
+    """Decision 8 survives the bound, and that is not automatic.
+
+    The incumbent is feasible under decision 49 by construction -- every chart
+    is already on a row of its own class -- so it stays in the candidate set
+    and the minimum over that set can still only tie or improve.  A bound that
+    excluded the incumbent would have traded one defect for a worse one.
+    """
+    doc, sheets = dump(MAP_DIR, 22, 0)
+    plane, palettes = a_state_with_both(doc, sheets)
+    converted, art, _ = V.convert(doc["polygons"], plane, palettes)
+    art = repainted(art)
+
+    bound = C.select_binding(converted, art, animated=[13, 14, 15])
+
+    assert bound.error <= bound.incumbent_error

@@ -64,9 +64,12 @@ from bpy.props import (BoolProperty, CollectionProperty, EnumProperty,
 from bpy.types import (AddonPreferences, Menu, Operator, Panel,
                        PropertyGroup)
 
-from . import png_indexed
+from . import png_indexed, resample
 from .live_link import DEFAULT_HOST as LIVE_DEFAULT_HOST
 from .live_link import DEFAULT_PORT as LIVE_DEFAULT_PORT
+#: ADR-0186 Amendment 7 decision 28.  Imported rather than repeated: the
+#: settle's own module owns the number and says why it is a guess.
+from .settle_clock import QUIET_DEFAULT as SETTLE_QUIET_DEFAULT
 from .live_link import launch_command as live_launch_command
 from . import live_link
 
@@ -84,9 +87,59 @@ AUTHORED_RIG = "authored_light_rig"
 TOP_LEVEL = ("format", "version", "base", "polygons", "terrain", "map_states", "carry")
 REQUIRED_BASE = ("map", "arrangement", "resources", "geometry_source", "geometry_digest")
 
+# The record codec is the CANONICAL one: the addon decodes a carried tile with
+# exactly the bit layout `build` encodes with, so the two cannot drift apart.
+# Both spellings are needed -- the addon imports this module as a package
+# member, the tests and the CLI tools import it as a top-level module.
+try:                                     # pragma: no cover - import shape only
+    from ._vendor.exmateria_map.document import decode_record, encode_record
+except ImportError:                      # pragma: no cover
+    from _vendor.exmateria_map.document import decode_record, encode_record
+
 UNLIT_GREY = "exmateria_map_unlit_grey"
 TILE_UNITS = 28      # world units per terrain tile (decision 13's scale)
 HEIGHT_STEP = 12     # world Y per terrain `height` step
+# ADR-0187 decision 7: GaneshaDx's own display nudge -- one twelfth of a step,
+# there to stop a tile z-fighting the mesh floor it is coplanar with on 85.4%
+# of the corpus.  It is a DISPLAY fact, so it rides `delta_location.z` and
+# never `me.vertices[].co`.
+TILE_NUDGE = 1
+#: One terrain record on disc.
+TERRAIN_RECORD_BYTES = 8
+#: ADR-0187 decision 10.  The per-vertex colour attribute the grid is drawn
+#: with, and the one material every tile shares to read it.
+TILE_COLOR_ATTR = "exmateria_map_terrain"
+TILE_MATERIAL = "exmateria_map_terrain"
+#: ADR-0187 decision 5's predicate.  15,754 of the corpus's 16,999 level-1
+#: slots hold exactly this, and a slot that does not is one someone wrote.
+LEVEL1_DEFAULT = [0, 0, 0, 0, 0, 0, 1, 0]
+
+#: ADR-0187 decision 6.  Slope byte -> the MESH CORNER INDICES lifted by
+#: `slope_height * HEIGHT_STEP`.  Ported from GaneshaDx
+#: (`Resources/ContentDataTypes/Terrains/TerrainTile.cs:100-151` and
+#: `Common/CommonLists.cs:92`); a byte not listed here draws Flat, which is
+#: GaneshaDx's own `ContainsKey` fallback.
+#:
+#: **These are NOT GaneshaDx's vertex indices.**  Its V0..V3 walk
+#: `(x, z), (x, z+1), (x+1, z+1), (x+1, z)` while `_plain_quad_mesh` walks
+#: `(x, z), (x+1, z), (x+1, z+1), (x, z+1)` -- so its 1 and 3 are our 3 and 1,
+#: and a table copied across unswapped mirrors every incline about Z while
+#: still moving the right NUMBER of corners.
+SLOPE_LIFTS = {
+    0x00: (),                # Flat
+    0x85: (2, 3),            # InclineNorth
+    0x52: (1, 2),            # InclineEast
+    0x25: (0, 1),            # InclineSouth
+    0x58: (0, 3),            # InclineWest
+    0x41: (2,),              # ConvexNortheast
+    0x11: (1,),              # ConvexSoutheast
+    0x14: (0,),              # ConvexSouthwest
+    0x44: (3,),              # ConvexNorthwest
+    0x96: (1, 2, 3),         # ConcaveNortheast
+    0x66: (0, 1, 2),         # ConcaveSoutheast
+    0x69: (0, 1, 3),         # ConcaveSouthwest
+    0x99: (0, 2, 3),         # ConcaveNorthwest
+}
 
 TEXTURED_KINDS = {"textured_quad", "textured_triangle"}
 # The FF FF terrain binding -- "this face is not on the grid".  NOT schema
@@ -219,6 +272,16 @@ FACE_INTS = ("visible_angles", "palette_id", "palette_byte_high_nibble",
              "terrain_level", "unknown_untextured_0", "unknown_untextured_1",
              "unknown_untextured_2", "unknown_untextured_3")
 CORNER_VECS = ("normals",)                       # positions get a shadow only
+#: The `exmateria_map/tile` kinds.  They live here because IMPORT and the
+#: growth operator are what write them; `export_document` re-exports them for
+#: the readers.  Since ADR-0187 decision 3 they are not `build`'s authority --
+#: `tile_record` derives the class from position and the drift set -- but the
+#: sidebar reads the growth/carried half off the object, because that boundary
+#: is the base map's and cannot move within one document.
+TILE_IMPORTED = "imported"
+TILE_DRIFT = "drift"
+TILE_GROWTH = "growth"
+
 TILE_PAYLOAD_FIELDS = ("surface_type", "height", "depth", "slope_height",
                        "slope_type", "thickness", "shading", "rotation",
                        "unknown_1", "unknown_0a", "unknown_0b", "unknown_5a",
@@ -246,12 +309,25 @@ def _remove_collection(name):
     kept = []
     col = bpy.data.collections.get(name)
     if col is not None:
-        for ob in list(col.objects):
+        # ADR-0187 decision 13 nests the grid, so this walk has to be a walk:
+        # `col.objects` alone would leave the tiles alive in an orphaned child
+        # and the next import would build a SECOND set beside them.  The same
+        # flag rule decides a child collection's fate as an object's -- ours
+        # goes, the artist's is handed back with the survivors.
+        for child in list(col.children):
+            if any(k.startswith("exmateria_map/") for k in child.keys()):
+                for ob in list(child.all_objects):
+                    bpy.data.objects.remove(ob, do_unlink=True)
+                bpy.data.collections.remove(child)
+        for ob in list(col.all_objects):
             if any(k.startswith("exmateria_map/") for k in ob.keys()):
                 bpy.data.objects.remove(ob, do_unlink=True)
-            else:
-                col.objects.unlink(ob)
-                kept.append(ob)
+        for child in list(col.children):
+            col.children.unlink(child)
+            kept.append(child)
+        for ob in list(col.objects):
+            col.objects.unlink(ob)
+            kept.append(ob)
         bpy.data.collections.remove(col)
     ob = bpy.data.objects.get(name)
     if ob is not None:
@@ -412,6 +488,7 @@ def _build_source_art(doc, doc_path):
     from .convert_op import _write_art, source_art_name
     states = doc.get("map_states") or []
     out = {}
+    scales = {}
     for fname, entry in sorted(art.items()):
         path = _find_sidecar(fname, doc_path)
         if path is None:
@@ -420,17 +497,36 @@ def _build_source_art(doc, doc_path):
             continue
         try:
             w, h, rgb = png_indexed.read_rgb_png(path.read_bytes())
-            if (w, h) != (256, 1024):
-                raise ValueError(f"{w}x{h}, expected 256x1024")
+            n = resample.scale_of(w, h)
+            if n is None:
+                raise ValueError(
+                    f"{w}x{h} is not a legal Painting: it must be "
+                    f"256k x 1024k for k in {list(resample.SCALES)} "
+                    f"(ADR-0186 Amendment 10 dec. 43)")
         except Exception as exc:
-            print(f"EXMATERIA-MAP: warning: source art '{fname}': {exc}")
+            print(f"EXMATERIA-MAP: warning: source art '{fname}': {exc}; "
+                  f"its map state(s) preview through the CLUT instead")
             continue
+        scales[fname] = n
         for i in entry.get("states") or []:
             if not (0 <= i < len(states)):
                 continue
             sheet = states[i].get("texture_sheet")
             if sheet and sheet not in out:
                 out[sheet] = _write_art(source_art_name(sheet), rgb).name
+    # Decision 43: N is per MAP, so paintings that disagree are not one map's
+    # worth of art.  Import still WARNS -- schema 7.3b gives the two legs
+    # opposite postures on this same fact, and the refusal is the export's:
+    # a `.blend` that will not open loses the artist everything, and a bundle
+    # that shipped without the painting loses them the irreplaceable half.
+    # Every painting that could be read is loaded, and the export says no
+    # until one of them is resized.
+    if len(set(scales.values())) > 1:
+        print("EXMATERIA-MAP: warning: this map's paintings disagree on "
+              "scale ("
+              + ", ".join(f"{n}: {s}x" for n, s in sorted(scales.items()))
+              + "); they are all loaded, and the export will refuse until "
+                "they agree (ADR-0186 Amendment 10 dec. 43)")
     return out
 
 
@@ -1391,44 +1487,221 @@ def build_grid(base, collection):
     return ob
 
 
-def build_tile(record, collection):
-    """One 28x28 plane per level-0 record (import-v1 §5).
+def tile_vertex_color(ix, iz, vertex_z, impassable, unselectable):
+    """GaneshaDx's `TerrainTile.GetVertexColor`, ported (ADR-0187 decision 10).
 
-    Record fields are schema-v1 custom properties, written ONLY for declared
-    fields (an absent field is not zero) plus `x`/`z`/`level` — each with a
-    `<field>_shadow` twin.  The record is authoritative: Z is
-    height * HEIGHT_STEP, locked."""
-    height = record.get("height", 0)
-    x, z, level = record["x"], record["z"], record["level"]
+    Per VERTEX, not per tile: the ramp is keyed on the vertex's own height, so
+    a slope shades across itself and the artist can read an incline without
+    selecting it.  The chequer on `(x + z) % 2` is what separates two adjacent
+    tiles at the same height.  `R += 32` is the impassable/unselectable tell.
+
+    GaneshaDx's tab, hover and selection branches are NOT ported -- selection
+    and hover are Blender's here (decision 10), and a right-panel tab has no
+    counterpart.  The clamp is ours: XNA's `Color` takes the wrap, and a map
+    tall enough to reach it would show the artist a colour that wrapped.
+    """
+    base = int(vertex_z / HEIGHT_STEP) * 7 + 16 + (0 if (ix + iz) % 2 == 0 else 8)
+    r, g, b = base + 16, base + 16, base
+    if impassable or unselectable:
+        r += 32
+    return tuple(min(255, max(0, c)) for c in (r, g, b))
+
+
+def _tile_material():
+    """The ONE material every tile shares -- unlit, reading the attribute.
+
+    One material rather than one per tile: 260 tiles is 260 materials in the
+    .blend otherwise, and the colour is already per-vertex data, so nothing
+    about a tile needs its own shader.
+    """
+    mat = bpy.data.materials.get(TILE_MATERIAL)
+    if mat is not None and mat.use_nodes:
+        return mat
+    if mat is None:
+        mat = bpy.data.materials.new(TILE_MATERIAL)
+    mat.use_nodes = True
+    nt = mat.node_tree
+    nt.nodes.clear()
+    out = nt.nodes.new("ShaderNodeOutputMaterial")
+    out.location = (400, 0)
+    emit = nt.nodes.new("ShaderNodeEmission")
+    emit.location = (200, 0)
+    col = nt.nodes.new("ShaderNodeVertexColor")
+    col.layer_name = TILE_COLOR_ATTR
+    col.location = (0, 0)
+    nt.links.new(col.outputs["Color"], emit.inputs["Color"])
+    nt.links.new(emit.outputs["Emission"], out.inputs["Surface"])
+    return mat
+
+
+def _paint_tile(ob, ix, iz, impassable, unselectable):
+    """Write decision 10's colours onto the tile's own vertices."""
+    me = ob.data
+    attr = me.color_attributes.get(TILE_COLOR_ATTR)
+    if attr is None:
+        attr = me.color_attributes.new(name=TILE_COLOR_ATTR,
+                                       type="BYTE_COLOR", domain="POINT")
+    for i, v in enumerate(me.vertices):
+        r, g, b = tile_vertex_color(ix, iz, v.co[2], impassable, unselectable)
+        attr.data[i].color_srgb = (r / 255.0, g / 255.0, b / 255.0, 1.0)
+
+
+def build_tile(entry, collection):
+    """One tile object per carried slot of `base.terrain_tiles` (ADR-0187 §1).
+
+    `entry` is the schema's raw row -- `[x, z, level, b0 ... b7]` -- so the tile
+    is drawn from the BASE's bytes and the document declares nothing: every
+    payload field is written as a value whose `<field>_declared` twin is FALSE.
+    Shown, never declared, which is exactly what makes it a **carried tile**
+    (decision 22 stands; `dump` still writes `"terrain": None`).
+
+    Geometry is GaneshaDx's (decision 6): the quad sits at
+    `(height + depth) * HEIGHT_STEP` and the slope type lifts the corners
+    `SLOPE_LIFTS` names by `slope_height * HEIGHT_STEP`.  The `+1` nudge is a
+    display fact and rides `delta_location.z`, so `me.vertices[].co` stays
+    exactly the record's own number and `export_terrain`, the drift checker and
+    the lighting bake's BVH all read the truth (decision 7)."""
+    x, z, level = int(entry[0]), int(entry[1]), int(entry[2])
+    rec = decode_record(bytes(entry[3:11]))
     cx, cz = x * TILE_UNITS, z * TILE_UNITS
-    h = height * HEIGHT_STEP
+    floor = (rec["height"] + rec["depth"]) * HEIGHT_STEP
+    lift = rec["slope_height"] * HEIGHT_STEP
+    named = SLOPE_LIFTS.get(rec["slope_type"], ())
+    zs = [floor + (lift if i in named else 0) for i in range(4)]
     me = _plain_quad_mesh(
-        f"tile {x} {z}",
-        [(cx, cz, h), (cx + TILE_UNITS, cz, h),
-         (cx + TILE_UNITS, cz + TILE_UNITS, h), (cx, cz + TILE_UNITS, h)])
+        f"tile {x} {z} L{level}",
+        [(cx, cz, zs[0]), (cx + TILE_UNITS, cz, zs[1]),
+         (cx + TILE_UNITS, cz + TILE_UNITS, zs[2]), (cx, cz + TILE_UNITS, zs[3])])
     ob = bpy.data.objects.new(f"tile_{x}_{z}_L{level}", me)
     collection.objects.link(ob)
-    # The flag export reads, and its KIND: a tile the document named is neither
-    # a drift handle nor growth-created, so decision 23's declare-only-the-three
-    # rule (export-v1 §5.1.3) does not reach it.
-    ob["exmateria_map/tile"] = "imported"
-    for key in ("x", "z", "level"):
-        ob[key] = record[key]
-        ob[f"{key}_shadow"] = record[key]
-    # Export-v1 §1/§6.3: a payload field carries a DECLARED-FLAG twin beside
-    # its value.  Presence alone cannot express the state growth and the drift
-    # checker both need — a value SHOWN beside a field the record does not
-    # declare (§7.2's seed, §6.3's base value) — and "an absent field is not
-    # zero" (schema §7.2) makes the distinction load-bearing.
+    ob.delta_location[2] = TILE_NUDGE
+    # The flag export finds tile objects by.
+    ob["exmateria_map/tile"] = TILE_IMPORTED
+    for key, val in (("x", x), ("z", z), ("level", level)):
+        ob[key] = val
+        ob[f"{key}_shadow"] = val
     for key in TILE_PAYLOAD_FIELDS:
-        declared = key in record
-        ob[f"{key}_declared"] = declared
-        if declared:
-            ob[key] = record[key]
-            ob[f"{key}_shadow"] = record[key]
-    ob.data.materials.append(_new_material(UNLIT_GREY))
+        ob[f"{key}_declared"] = False
+        ob[key] = rec[key]
+    ob.data.materials.append(_tile_material())
     ob.data.polygons[0].material_index = 0
+    _paint_tile(ob, x, z, rec["impassable"], rec["unselectable"])
     return ob
+
+
+TERRAIN_COLLECTION = "terrain"
+
+
+def _terrain_collection(parent):
+    """The nested collection the grid lives in (ADR-0187 decision 13).
+
+    The toggle the artist asked for is this collection's own visibility --
+    Blender's eye and checkbox, not a property of ours -- and one toggle covers
+    both levels (decision 14).  It carries `exmateria_map/terrain` so
+    `_remove_collection` can tell it from a collection the ARTIST nested here,
+    which is the same flag rule decision 30 already uses for objects.
+
+    FIND or create.  The growth operator creates handles into this same
+    collection, and it runs long after the import that built it: creating a
+    second `terrain` beside the first would put the handles somewhere the
+    toggle cannot reach, which is decision 13 failing quietly on exactly the
+    tiles the artist just made.
+    """
+    for child in parent.children:
+        if child.get("exmateria_map/terrain") is not None:
+            return child
+    col = bpy.data.collections.new(TERRAIN_COLLECTION)
+    col["exmateria_map/terrain"] = True
+    parent.children.link(col)
+    return col
+
+
+def _layer_collection(view_layer, col):
+    """The view layer's handle on `col` -- where its EYE lives.
+
+    `Collection.hide_viewport` is the monitor icon, which the Outliner's
+    default filter does not even show; the eye is `LayerCollection`'s and is
+    per view layer, so it has to be walked for rather than assigned.
+    """
+    if view_layer is None:
+        return None
+    stack = [view_layer.layer_collection]
+    while stack:
+        lc = stack.pop()
+        if lc.collection == col:
+            return lc
+        stack.extend(lc.children)
+    return None
+
+
+def hide_terrain(col, view_layer=None):
+    """Close the grid's eye.  Reported from use, on the first import that drew
+    it: 260 tiles arrive covering the map, and the thing the artist opened a
+    map to look at is under them.  The grid is SHOWN in the sense the ADR
+    means -- it exists, it is one toggle away, and the toggle is Blender's own
+    -- rather than in front of the mesh on arrival.
+
+    Only the eye moves.  `exclude` (the checkbox) would take the collection out
+    of the view layer's depsgraph, which is a different claim, and the export
+    reads `all_objects` and is blind to both.
+    """
+    if view_layer is None:
+        view_layer = getattr(bpy.context, "view_layer", None)
+    lc = _layer_collection(view_layer, col)
+    if lc is not None:
+        lc.hide_viewport = True
+    return lc is not None
+
+
+def build_terrain(doc, collection):
+    """Every carried slot of `base.terrain_tiles` becomes an object (ADR-0187).
+
+    Level 0 always; level 1 only where the slot is not the format's default
+    (decision 5) -- about 1,245 objects corpus-wide rather than 16,999.  The
+    tempting predicate is `selectable`, which would hide the 977 corpus slots
+    that are unselectable AND carry a real height; a byte that is not the
+    default is a byte someone put there.
+
+    A record in `doc["terrain"]` does NOT create a tile.  Decision 4 says the
+    object is always there, so a record composes over the base's bytes -- the
+    same `encode_record` `build` writes with -- and then marks its own fields
+    declared.  That keeps three things agreeing that would otherwise drift: the
+    geometry, the shown value, and the declaration `export_terrain` reads.
+    """
+    collection = _terrain_collection(collection)
+    carried = {}
+    for entry in (doc["base"].get("terrain_tiles") or []):
+        carried[(int(entry[0]), int(entry[1]), int(entry[2]))] = bytes(entry[3:11])
+    declared = {}
+    for rec in (doc.get("terrain") or []):
+        key = (int(rec["x"]), int(rec["z"]), int(rec.get("level", 0)))
+        declared[key] = {k: int(v) for k, v in rec.items()
+                         if k not in ("x", "z", "level")}
+
+    # The pre-growth extent is the BASE map's, and it is exactly what the
+    # carried rows cover -- a key outside it is a tile someone GREW, which is
+    # how `export_document.tile_record` classifies it too.  Stamped once here
+    # rather than derived in `draw`, because this boundary cannot move within a
+    # document: only drift moves, and `sync_drift` owns that flag.
+    grown_x = max((k[0] for k in carried), default=-1) + 1
+    grown_z = max((k[1] for k in carried), default=-1) + 1
+
+    out = {}
+    for key in sorted(set(carried) | set(declared), key=lambda k: (k[2], k[1], k[0])):
+        base_bytes = carried.get(key, bytes(TERRAIN_RECORD_BYTES))
+        fields = declared.get(key)
+        if key[2] and fields is None and list(base_bytes) == LEVEL1_DEFAULT:
+            continue
+        raw = encode_record(base_bytes, fields) if fields else base_bytes
+        ob = build_tile(list(key) + list(raw), collection)
+        if key[0] >= grown_x or key[1] >= grown_z:
+            ob["exmateria_map/tile"] = TILE_GROWTH
+        for field in (fields or {}):
+            ob[f"{field}_declared"] = True
+            ob[f"{field}_shadow"] = ob[field]
+        out[key] = ob
+    hide_terrain(collection)
+    return out
 
 
 def build(doc, context=None, doc_path=None):
@@ -1443,7 +1716,10 @@ def build(doc, context=None, doc_path=None):
     scene = context.scene if context is not None else bpy.context.scene
     scene.collection.children.link(col)
     for survivor in kept:
-        col.objects.link(survivor)
+        if isinstance(survivor, bpy.types.Collection):
+            col.children.link(survivor)
+        else:
+            col.objects.link(survivor)
 
     polys = doc["polygons"]
     flipped = [_wound_against(p) for p in polys]
@@ -1583,10 +1859,7 @@ def build(doc, context=None, doc_path=None):
     col.objects.link(ob)
 
     build_grid(base, col)
-    recs = doc.get("terrain") or []          # schema v1: bare list or null
-    for rec in recs:
-        if rec.get("level", 0) == 0:
-            build_tile(rec, col)
+    tiles = build_terrain(doc, col)
 
     # ---- marker JSON properties (§6) + §4 preview wiring ----
     for section in TOP_LEVEL:
@@ -1632,7 +1905,8 @@ def build(doc, context=None, doc_path=None):
         _show_source_art(ob, bpy.data.images[_painting])
 
     print(f"EXMATERIA-MAP: imported {name}: "
-          f"{len(polys)} polygons, {len(recs)} terrain records, "
+          f"{len(polys)} polygons, {len(tiles)} tile object(s), "
+          f"{len(doc.get('terrain') or [])} declared record(s), "
           f"{len(doc['map_states'])} states, "
           f"light rig {rig_source or 'ABSENT (albedo only)'}, "
           f"{_n_drift} drifted tile(s)"
@@ -1684,6 +1958,69 @@ class MAP_AddonPreferences(AddonPreferences):
         description="After importing a map or a GNS, switch to the three-pane "
                     "Map workspace, building it the first time",
         default=True)
+    # ADR-0186 Amendment 7 decisions 28 and 29.  ON by default because the
+    # amendment exists to delete two clicks from the loop, and an off-by-
+    # default automation deletes nothing.  The interval is a PREFERENCE and
+    # not a constant because the amendment says in as many words that nothing
+    # measured 1.5 s -- it is a first guess at "long enough not to fire
+    # between two strokes of one gesture", and an artist who paints in slow
+    # deliberate dabs needs a longer one.
+    #
+    # **Amendment 14 decision 62 rewords both, and adds no third.**  A lighting
+    # change now settles on the same clock, and neither NAME survived contact
+    # with it: "Compile and push on a settle" promised a compile that a
+    # lighting settle does not run, and "Push after a compile" named a compile
+    # that a lighting push does not follow.  So the two are cut along the line
+    # `auto_push`'s own comment already argued -- one gate on ACTING WITHOUT A
+    # BUTTON, one gate on REACHING THE EMULATOR -- and a third switch is
+    # refused, because three would make the artist debug which of them is off.
+    settle_on: BoolProperty(
+        name="Act on a settle",
+        description="When painting or the lighting stops changing, act on it "
+                    "with no button pressed: recompile the sheet if the "
+                    "picture moved, and push. The two compile buttons stay as "
+                    "the manual override",
+        default=True)
+    # The artist asked for this by name: "maybe it should be a setting?".  ONE
+    # switch rather than two, because "should this reach the emulator by
+    # itself" is one question however the push was started.
+    auto_push: BoolProperty(
+        name="Reach the emulator by itself",
+        description="Push into a running emulator with no button pressed, "
+                    "however the push was started -- a settle, a lighting "
+                    "change, or either compile button. Nothing happens if "
+                    "none is running",
+        default=True)
+    # Shared by both, because "have they stopped" is one question: a colour
+    # drag and a brush stroke are the same gesture as far as it goes.
+    settle_quiet: FloatProperty(
+        name="Settle after",
+        description="How long painting or the lighting must have stopped "
+                    "before the settle acts, in seconds",
+        default=SETTLE_QUIET_DEFAULT, min=0.2, max=30.0, subtype="TIME")
+    # Decision 12 part 4. The emulator's frame is a fixed 256x240 and a Blender
+    # viewport is whatever shape the artist dragged it to, so the two can agree
+    # on at most one axis -- and rather than pick one, the push derives a zoom
+    # from the view distance and multiplies it by this. *"Just make the center
+    # axis align and we can dial in a zoom in the UI."*
+    #
+    # A PREFERENCE and not a scene property, because it calibrates this
+    # artist's screen against a 256x240 frame once, and that answer is the same
+    # for every map they open.
+    live_camera_sync: BoolProperty(
+        name="Sync camera continuously",
+        description="Keep the battle's camera pointed where this viewport is "
+                    "pointed, instead of only when Match camera is pressed. "
+                    "Costs nothing while the view is still or no emulator is "
+                    "running -- a pose is written only when it changes",
+        default=True)
+    live_camera_zoom_dial: FloatProperty(
+        name="Camera zoom",
+        description="Calibrates how far a Blender view distance zooms the "
+                    "emulator. Zooming in Blender still moves the emulator "
+                    "after it is set -- this scales the relationship, it does "
+                    "not replace it",
+        default=1.0, min=0.001, max=1000.0, soft_min=0.1, soft_max=10.0)
     live_port: IntProperty(
         name="PCSX port",
         description="Port of PCSX-Redux's Lua web server "
@@ -2032,6 +2369,12 @@ def _preview_source_update(self, context):
     apply_preview_source(self)
 
 
+def _canvas_update(self, context):
+    # Lazily, like the import above: `convert_op` imports THIS module.
+    from .convert_op import apply_canvas
+    apply_canvas(self)
+
+
 #: The scene colour management an FFT map has to be looked at under, and the
 #: whole of it.
 #:
@@ -2266,9 +2609,9 @@ class MAP_PT_preview(Panel):
     bl_region_type = "UI"
     bl_category = "Map"
     bl_label = "Preview"
-    # Renumbered again when `What a push carries` was deleted; the
-    # remaining five keep their relative order.
-    bl_order = 1
+    # Renumbered again when `Isolate` joined Push and Camera at the top
+    # (decision 13); the relative order below them is unchanged.
+    bl_order = 3
 
     def draw(self, context):
         # The scene's map, not the selection's -- see `marker_in_scene`, 38
@@ -2710,6 +3053,56 @@ def register():
                     "game will actually display",
         items=[(k, label, desc) for k, label, desc in PREVIEW_MODES],
         default="RAW", update=_preview_source_update)
+    #: Which resolution of the Painting the artist works at (ADR-0186
+    #: Amendment 10 decision 40).  Its OWN control, deliberately NOT a third
+    #: item on `PREVIEW_MODES`: the questions are independent -- Compiled is
+    #: worth reaching at either resolution, and is how you check that a 4x
+    #: gradient survived the squeeze to sixteen colours -- and `PREVIEW_MODES`
+    #: documents itself as changing "nothing about the document and nothing
+    #: about what ships", which a paint-TARGET control would make false.
+    #:
+    #: `HIGH` by default because decision 35 makes the N-x Painting the sole
+    #: master: the native canvas is derived from it, so the master is where
+    #: authoring happens and the native view is the thing you reach for.
+    #:
+    #: View state, so a registered Object property rather than an
+    #: `exmateria_map/...` custom property -- same reason `light_debug` and
+    #: `preview_source` are: those carry the document in the ROM's own shape,
+    #: and where you are looking from has no ROM representation.
+    bpy.types.Object.exmateria_map_canvas = EnumProperty(
+        name="Canvas",
+        description="Paint at the Painting's full resolution, or at the "
+                    "sheet's own -- where one pixel is one texel. Both write "
+                    "into the same master; the game reads neither directly",
+        items=[("HIGH", "High", "The N-x Painting itself -- the master, and "
+                                "every pixel you have"),
+               ("NATIVE", "Native", "One pixel per texel, the resolution the "
+                                    "game reads. Strokes here are written "
+                                    "back into the master")],
+        default="HIGH", update=_canvas_update)
+    #: The Painting's scale, as a number the artist can type.  `get`/`set`
+    #: rather than a stored value -- see `convert_op.painting_scale_get`, and
+    #: decision 43, which refuses a stored `scale` as the driftable copy.
+    #:
+    #: Reported from use: the scale used to live only on the Convert operator,
+    #: which put it in Blender's Adjust Last Operation panel -- available for
+    #: exactly one gesture after the button and gone the moment you click
+    #: anything else.  That is a power-user idiom, not somewhere to go and
+    #: change your mind.
+    def _scale_get(self):
+        from .convert_op import painting_scale_get
+        return painting_scale_get(self)
+
+    def _scale_set(self, value):
+        from .convert_op import painting_scale_set
+        painting_scale_set(self, value)
+
+    bpy.types.Object.exmateria_map_painting_scale = IntProperty(
+        name="Scale",
+        description="Pixels per texel in the Painting. Raising it replicates "
+                    "and loses nothing; lowering it averages and cannot be "
+                    "undone. The Sheet the game reads never changes size",
+        min=1, max=8, get=_scale_get, set=_scale_set)
     bpy.types.Object.exmateria_map_light_boost = FloatProperty(
         name="Light boost",
         description="Exaggerate the isolated stage, then clamp "
@@ -2772,6 +3165,14 @@ def unregister():
     bpy.utils.unregister_class(MAP_AddonPreferences)
     del bpy.types.Object.exmateria_map_light_boost
     del bpy.types.Object.exmateria_map_light_debug
+    # These two specifically, and not as tidiness -- several properties
+    # registered above are deliberately left in place and this is not a
+    # sweep of them.  They are the only two carrying CALLBACKS
+    # (`_canvas_update`, and `get`/`set` closing over `convert_op`), so a leak
+    # here is a live pointer into a disabled addon: touching the property from
+    # a script after unregister runs code the artist has turned off.
+    del bpy.types.Object.exmateria_map_canvas
+    del bpy.types.Object.exmateria_map_painting_scale
 
 
 def viewport_draw_overlays(self, context):

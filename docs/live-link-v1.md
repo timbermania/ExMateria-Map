@@ -26,7 +26,7 @@ the gate and a small `urllib` Lua-over-HTTP client. Its assertions run under pla
 **The loop no longer leaves Blender.** `live_link_ui.py`'s *Push to PCSX* button assembles
 the document in memory and hands it to the core — no file, no CLI, ~0.9 s for the whole of
 MAP022 a0 (454 polygons, six bucket/field plans, self-check included). Decision 7 records
-what it compares against and why. Graded by `tests/blender_live_push.py` (**153/153**,
+what it compares against and why. Graded by `tests/blender_live_push.py` (**177/177**,
 headless, a fake emulator that really parses the wire form), and accepted the only way a
 rendering change can be: A/B/A on a live Gariland battle, through the button in both
 directions — 0 changed bytes untouched, 1,676 waved, 1,676 back.
@@ -45,6 +45,21 @@ which is weaker and says so. Graded on a seeded foreign map in `tests/blender_li
 Two legs it does not deliver and reports rather than hides: the terrain grid (units walk the
 map you replaced) and the derived VRAM addresses (§5.3). **[fake]** — the acceptance A/B/A
 against a real second savestate has not been run; §5.3 is what has been measured offline.
+
+**A swap ERASES the host map's animation table** (decision 11, 2026-08-28). Reported as
+*"one chunk of map got the blue water palette and it's animated"* after a Replace. The push
+had landed -- what repainted it 4.49 times a second was the replaced map's `0x6c` instruction
+table, still running at `0x80121D7C`. A swap now guards that table by **content** against the
+110 `0x6c` chunks in the extracted disc tree, erases it, and installs the pushed map's own
+palette records and `0x70` frames read from its **base resource, pinned by the document's
+sha256**. The scope is the table: 94 of the 110 drive TEXTURE regions, and Gariland's eight
+point inside the pages a swap has just uploaded a foreign sheet to. Texture records are
+erased and not installed (#653: their VRAM base is the loader's). The readback is
+**behavioural** -- the set of CLUT rows that move over the dwell must equal the set the
+pushed map's own table names -- and the texture half is a byte confirmation reported in
+different words. On *Push to PCSX* the animation is named and never touched. Graded by
+`tests/test_live_animation.py` (49, plain `pytest`, rooted in the corpus and in the Gariland
+savestate) and `tests/blender_live_push.py`, whose fake emulator now runs the table it holds.
 
 **It runs on a stock pcsx-redux** (#606 part 2). Every endpoint the push uses is upstream —
 main RAM is `/api/v1/cpu/ram/raw`, VRAM is `/api/v1/gpu/vram/raw`, the Lua dispatch is
@@ -91,6 +106,8 @@ opposite property: that a push never trips the packed-Lua walk at all.
 | palettes, VRAM sink | **built**, **[fake]** — §2.3, `plan_clut`. The only sink that reaches the screen on those 127; a render has not confirmed it |
 | polygon COUNTS (shrink + growth) | **built** [LIVE] — decision 8, #598, A/B/A on a live battle. Both growth GATES are fake-RAM only |
 | bytes 6-7 (binding + VISIBLE_ANGLES) | **built** — 1,816/1,816 against a captured Gariland RAM |
+| camera sync (Blender viewport → battle camera) | **built** — decision 12 and its three amendments. The button, the continuous toggle, the section and the arithmetic, accepted on a live Gariland battle by the artist (*"this works incredible"*), which is what closes the sink A/B in `work_position`'s favour. Emulator → Blender is not built |
+| isolate the map (units, shadows, HUD, cursor, camera leash, boxed dialogue) | **built** — decision 13, 2026-08-28 (Amendment 1 adds the camera leash, Amendment 2 the dialogue box). Two buttons in an `Isolate` panel: the list walk, the per-unit `+0xa`/`+0x1d8` gate and the four code pokes, restored from SAVED values. The walk and both plans are re-measured against the Gariland savestate on every `pytest` run — 11 units, the ids read as the **byte** `unit_sprite_object_find` matches on — and the Blender half is graded by `blender_live_push.py`. **Not accepted on a picture yet**: the artist's eye is the acceptance, and the cursor's poke target is the one address decision 13 ships uncertain. Boxed dialogue is still out |
 | terrain grid | not built — §5 |
 | `polygons[].unknown_untextured` | not built — no located sink, its own ticket |
 
@@ -130,6 +147,31 @@ Measured [LIVE] by A/B/A on a Gariland battle, 2026-08-26. What survived the mov
 geometry (`locate`, `identify`, `diff`, the page stride and row pitch), which was always
 about VRAM; the savestate was only ever the container it was read through. The origin drift,
 the search window, the live cache and the size-settling poll went with the container.
+
+**The viewport aims the battle camera** (decision 12, 2026-08-28). Reported as *"Blender is
+looking at one part of the map and the emulator at another"*, which makes an authored map
+impossible to compare against what the engine renders. A *Match camera* button in a new
+`Camera` section pushes the Blender view's pose -- pivot, pitch, yaw, zoom -- into the running
+battle, **faithfully**: past the pad's eight yaw notches, its 13-degree pitch band and its two
+zoom steps, because that envelope is the very thing that makes a map uninspectable. It also
+pokes the engine's own vertical datum to 120, which is what closes the 40-world-unit gap the
+artist was actually seeing; the cost, named, is that the emulator's framing is then not
+authentic.
+
+The camera model itself is now an **assertion** rather than prose: `Rx(pitch)*Ry(yaw)*Rz(roll)`
+reproduces the engine's own view matrix in
+`reference-assets/thief_whats_this.sstate` within the 4096-quantization floor, and the rival
+orders and both sign flips are asserted to fail, because a fit that only checks the winner
+cannot report that the winner stopped winning. The Blender half has no savestate to be graded
+against -- the savestate holds a pose the *engine* authored -- so it is graded by geometry: the
+three axis-aligned viewports whose FFT pose can be worked out by hand, and a spec on 96
+turntable views saying what "synced" means. `tests/blender_live_push.py` is **193/193**.
+
+**[fake]** in one specific sense: which link in the chain survives a write during a running
+battle has not been measured, and the button carries a **behavioural** readback that says so on
+every press -- it requires `CAMERA_VIEW_MATRIX`, which the engine recomposes every frame, to be
+the matrix the pushed pose implies. Amendment 1 to decision 12 reverses that A/B's favourite on
+the evidence of F14: `work_position` is the default sink, not the scratch struct.
 
 One thing the button settled for free. Every earlier proof pushed a document from `dump`;
 the button pushes one **assembled out of Blender**, so `export(import(doc)) == doc` — 148/148
@@ -409,6 +451,18 @@ The control that works is **three screenshots and a pixel diff** — a live batt
 ~6,500-subpixel floor, a dead one is byte-identical — and it is worth spending before any
 rendering claim. Launch with `-iso <cue> -run` and let the game reach the shell first.
 
+#### What triggers a rig push (2026-08-29)
+
+This section is the **sink**; it says nothing about when anything arrives at it.
+Until ADR-0186 Amendment 14 the answer was *"only when the source art changed"* —
+`settle_op`'s clock watched the painting's pixels alone, so every byte in the
+table above had a working transport and no trigger, and moving a light reached
+the emulator only if a brush stroke happened to follow it. Amendment 14 gives
+the settle clock three more witnesses — the lamps (under **Lamp authority**),
+the rig **Override**s, and the previewed state — and routes them to this sink
+with no compile in between. The 39 bytes here are unchanged by it; the six
+gradient bytes stay out, for the reason above.
+
 ### 2.3 The picture: the sheet is VRAM, the palettes are RAM
 
 The two halves of decision 9's `(texture_sheet, palettes)` atom live in different memories,
@@ -454,6 +508,12 @@ a row at a time, which is why four POSTs are the cheap shape and one is the expe
 > Every number is still true. The conclusion drawn from them — *"the engine re-uploads the
 > whole CLUT block from main RAM every frame"* — is true **on Gariland and on 41 other maps,
 > and false on 127.**
+
+> **Note on the denominator (2026-08-27).** "42 of 169" counts *textured resources carrying a
+> `0x70`*. The chunk that decides behaviour is the `0x6c` **instruction table**, and it is
+> carried by **138** resources: 60 drive CLUT rows, 94 drive texture regions (44 do both), 28
+> tables are present but empty. Scoping a fix by the 42 scopes it to the palette half of a
+> table whose majority is texture records. See `CONTEXT.md`, *Animation instruction*.
 
 **The per-frame re-upload is the palette ANIMATION doing its work**, and only 42 of the
 corpus's 169 textured resources carry one. `mapfile.read_palette_animation` is present on
@@ -509,20 +569,68 @@ decision 2's locate-by-verify at the one address here a scan cannot settle.
 
 That block was first written up here as an *"inert twin"*, which was right about its
 behaviour and **wrong about what it is** (corrected 2026-08-27, #624). It is the map's own
-`0x44` chunk as the loader left it, and it is not idle: the palette-animation routine writes
-every animated frame into **both** blocks in one loop body — `0x800926AC` into this one,
-`0x8009269C` into `CLUT_BLOCK`, same function, `ra = 0x80092794`, confirmed by watchpoint
-(60 and 20 hits, one writer each). A push into it is ineffective because nothing re-uploads a
-*static* row from either block after map load, not because the block is dead. Anything that
-later wants to hold an **animated** row has to contend with both.
+`0x44` chunk as the loader left it, and it is not idle: each animated entry is written into
+**both** blocks in one loop body — `0x800926AC` into this one, `0x8009269C` into `CLUT_BLOCK`
+— confirmed by watchpoint (60 and 20 hits, one writer each). A push into it is ineffective
+because nothing re-uploads a *static* row from either block after map load, not because the
+block is dead. Anything that wants to hold an **animated** row has to contend with both.
+
+> **Amended 2026-08-27 (the animated-palette leg).** What stood here called that loop body
+> *"the palette-animation routine … one function, `ra = 0x80092794`"*. **It is not the
+> animation.** The function containing both stores is `clut_strip_load_base` @`0x80092620`,
+> a shared CLUT loader taking `(source, block, row)`, and it has exactly **two** callers,
+> both inside `color_field_dispatch` @`0x800926D8` — the `{33}` **Color Field** opcode
+> handler, which `CONTEXT.md` classifies as a *modulator*. `ra = 0x80092794` is the
+> instruction after that function's single-row `jal`, so the watchpoint identified the
+> **helper**, one frame below whoever called it. The palette animation is one of
+> `color_field_dispatch`'s 24 call sites and **has not been identified**. Every byte
+> measurement above stands; the name attached to them did not.
+>
+> The corollary is that a `Write` watchpoint answers *who stores* and not *what drives* —
+> and here the two were different functions. What settles the second question is the data:
+> the map's own `0x6c` table names its animated rows, and poking that table moves the
+> picture (see decision 11).
+
+**`CLUT_BLOCK` is block 0 of fourteen, not a 512-byte block.** `clut_strip_load_base`
+computes its destination as `0x800E4EA4 + block*512`, and `clut_view_strip_init`
+@`0x80093048` initialises **14** blocks (its loop runs `0 → 0x851C` step `0x982`).
+`flush_clut_view_strip` @`0x80092F98` uploads all 7,168 bytes as one `256 x 14` rectangle at
+VRAM `(0, 494)` — but only when `DAT_800995EC` is non-zero, a dirty flag set by
+`color_field_dispatch` and cleared by the flush. Measured [LIVE] 2026-08-27: blocks 1-13
+against VRAM rows 495-507 are **0 of 512 bytes different each**, and VRAM `(0, 480)` — the
+line the polygons actually sample — is **0 of 512** against block 0.
+
+That dirty flag is the mechanism behind the 42/127 split named above, stated properly: a map
+with no animation never runs the path that sets `DAT_800995EC`, so nothing carries the RAM
+block to VRAM and a write there is byte-perfect and invisible. Which also means the split is
+a property of *the flag being set*, not of the animation as such — a leg that ever wants the
+RAM sink to work on the other 127 has a candidate, unmeasured, and named here rather than
+attempted.
 
 **Some CLUT rows are engine-animated and cannot be pushed.** Writing all 16 and reading back
-named rows 13, 14 and 15 as reverted on MAP022 a0. That set is *reported from the readback,
-never predicted* (decision 3): the period is unknown, and a probe short enough to run inside
-a press can report "nothing animated" on a map that animates. It is also why no disc resource
-matches all 16 live rows — the live block differs from `MAP022.9`'s own `0x44` chunk by 35
-bytes over rows 0, 7, 8, 10, 13 and 14. That is the palette **animation**, whose source chunk
-`mapfile.PALETTE_ANIM_PTR` (`0x70`) is populated and still has no reader.
+named rows 13, 14 and 15 as reverted on MAP022 a0. That set is still *reported from the
+readback rather than predicted* (decision 3) — but that is now a rule about what a report may
+claim, **not a limit on what is knowable**, and the two reasons this paragraph used to give
+for it are both false:
+
+- *"The period is unknown."* It is byte 17 of the record. `MAP022.9` reads 12 ticks; measured
+  [LIVE] 2026-08-27 at **4.49 steps/s** on all three rows, and poking that byte to 60 took the
+  poked row alone to **0.99 steps/s** while its two siblings held 4.46. Corpus-wide the
+  slowest palette record is 30 ticks, so **0.6 s** is a dwell that cannot miss one.
+- *"A probe short enough to run inside a press can report nothing animated."* Only a probe
+  that guesses. One sized from the table's own `duration` bytes cannot, which is what
+  decision 11's readback does.
+
+It is also why no disc resource matches all 16 live rows — the live block differs from
+`MAP022.9`'s own `0x44` chunk by 35 bytes over rows 0, 7, 8, 10, 13 and 14. **Only 13, 14 and
+15 of those are the animation**, and this paragraph used to attribute all six to it.
+`MAP022.9`'s `0x6c` carries exactly three palette records, naming 13/14/15 and nothing else,
+and a 2.5 s readback finds those three rows moving and the other thirteen still. Whatever
+moved rows 0, 7, 8 and 10 away from the disc's bytes did it **once**, and is unidentified.
+
+`mapfile.PALETTE_ANIM_PTR` (`0x70`) **has a reader** since #624 —
+`read_palette_animation` for the frames, `read_animation_instructions` for the table that says
+which rows they drive.
 
 **Where the bytes come from.** `export_document.export_sheets` already computes
 `png_indexed.pack_4bpp(indices)` — exactly the 131,072-byte blob the push needs — and used to
@@ -1279,6 +1387,1056 @@ polygons displaced, at the same addresses, with the descriptor declaring three q
 document has one. Garbage would have passed an arm that only asked *"is RAM not ours"* and
 would not have exercised the shrink. The default mode refuses it, as it always has; the swap
 replaces the geometry **and** the counts.
+
+> **Amended 2026-08-27 — the goal line moves.** Stated by the artist, in these words:
+> *"when you replace the map, the goal is the total removal of the old map, and adding the new
+> map."* This decision's closing line — *"This is a picture, not a playable map"* — was
+> written as the **intended end state**. It is now **outstanding debt**. Nothing about the
+> built behaviour changes; what changes is that the terrain grid, and anything else the host
+> map still owns after a swap, is no longer settled scope that a future session may read as
+> decided. `UNPUSHED` names them; naming is the interim, not the answer.
+>
+> The first item paid down under this line is the host map's **animation table**, which was
+> not in the list at all because nobody had looked: see decision 11.
+
+### Decision 11 — a swap erases the host map's animation table, and installs the new map's palette half
+
+Reported by the artist, live: *"I just did a Replace the loaded map call and it looks almost
+right except for one chunk of map which got the wrong palette. It got the blue water palette
+and it's animated."*
+
+Closed end to end, offline, from the corpus and one live battle:
+
+| | |
+|---|---|
+| host | `sstate2` = **`MAP022.9`**, Gariland. Its `0x6c` names CLUT rows **13, 14, 15** |
+| pushed | **`MAP002.9`** — descriptor counts `49 / 395 / 4 / 52`, read live |
+| overlap | MAP002 names rows 13 and 14 on **59 of its 444** textured polygons (13.3%) |
+| the push itself | **landed** — `CLUT_BLOCK` rows 0-12 are MAP002's, **0 of 416 bytes off** |
+
+So the wall is not a failed push. It is a correct push being repainted 4.49 times a second by
+a map that was supposed to be gone. `MAP002` carries **no `0x6c` and no `0x70` at all**, so on
+this pair a swap can only ever lose an animation, never gain one.
+
+Worth knowing for the next report of this: **14 corpus resources carry `MAP022.9`'s `0x70`
+frames byte for byte** (`MAP001.9`, `MAP003.9`, `MAP006.12`, `MAP007.9`, …). The blue water
+cycle is a shared asset, so *"it looks like water from a map I have never opened"* will recur.
+
+#### The scope is the table, not the palettes
+
+The ask was "handle animated palettes." Palette records are the **minority** of the chunk that
+causes this: 138 resources carry a `0x6c`, 60 drive CLUT rows and **94 drive texture regions**.
+Gariland's own table is 3 palette records and **8 texture records**, and those eight point at
+`x = 839..923, y = 28..208` — *inside* the four VRAM pages MAP002's sheet was just uploaded to.
+A fix scoped to palettes leaves them copying rectangles around inside the new sheet and would
+be reported next, in words that sound unrelated. The unit is the table.
+
+#### The five parts
+
+**1. Erase the host's table.** The live table is at **`0x80121D7C`** — 20-byte stride, disc
+layout, byte-identical to the loaded resource's `0x6c` except bytes 14/16/18/19 of the running
+palette records. Zeroing a record stops that record's animation and nothing else. Measured
+[LIVE] 2026-08-27, self-controlled:
+
+    baseline                     row13 4.49/s   row14 4.49/s   row15 4.49/s
+    record 0 duration 12 -> 60   row13 0.99/s   row14 4.46/s   row15 4.46/s
+    record 0 zeroed              row13 0.00/s   row14 4.57/s   row15 4.57/s
+    restored                     row13 4.46/s   row14 4.46/s   row15 4.46/s
+
+An all-zero record is **the corpus's own encoding for no animation** — 21 of `MAP022.9`'s 32
+slots ship that way and the engine already walks them every frame — so this writes what the
+disc writes rather than disabling a feature. A second structure at `0x800F6DC4` (24-byte
+stride, sharing each record's leading 8 bytes) is **not** what drives the picture; the poke is
+what separated them, and inspection would not have.
+
+**2. Guard it by content, not by the address.** Decision 5's locate-by-verify. The address was
+confirmed on one battle; writing 640 bytes there on any other is a bet. Compare the live table
+against all 110 `0x6c` chunks in the corpus, ignoring the runtime bytes, and **refuse unless it
+matches a map's**. Measured: the live table matches exactly 6 resources and all six are MAP022
+states; corpus-wide there are 83 distinct tables among 110 carriers, largest identical group 6.
+This also stops the case that cannot be ruled out — if anything other than a map ever writes
+records there, it matches nothing and we stop instead of erasing it.
+
+**3. Install the new map's palette records and frames, read from its BASE.** The interchange
+document does not carry `0x6c` or `0x70`; schema §8 and `build` put both on the *carried from
+base* side. So the live link reads the previewed state's **base resource** off the extracted
+disc tree, which is a dependency the package already declares — `CONTEXT.md`, *Base map*: a
+document "is a diff against it, never a replacement… and pins the one it expects by a sha256
+per resource." The pin makes the read **verifiable** rather than hopeful.
+
+Rejected: putting the chunks in the document. It would make them look authorable when nothing
+in the preview can show an animation, and it would put `build` in the business of writing bytes
+it currently copies, on the one leg whose entire value is byte-exactness over 1,575 files. The
+shape chosen does not foreclose it — if animation ever becomes authorable, the install reads
+the document instead of the base and nothing else changes.
+
+The animation is **per map state**, not per arrangement (`MAP022.9/.31/.37/.43/.49/.55` each
+carry `[13,14,15]`; `.13/.17/.21/.25` carry none), so decision 9's existing aim already picks
+the right resource and no new aiming rule is needed.
+
+**4. Texture records are erased and NOT installed.** A palette record needs no translation —
+the CLUT line is `y = 480` on every map, forced by the packet encoding that gave `0x7800` on
+385 of 385 polygons. A texture record is **absolute VRAM** against its own map's sheet base,
+and that base is assigned by the loader: it is in neither the document nor the base resource,
+and it is not a constant — 439 of 577 texture records sit in the `x >= 768` band but 80 sit at
+`x = 0` and 18 at `x = 192 / 704`. Rebasing by the dominant value would be right for most and
+silently wrong for ~98 records with no way to tell which, which is the failure
+`live_vram.derive_addresses` exists to prevent (*"one disagreeing witness is a refusal, not a
+vote"*). **Named debt, not accepted scope** (#653), per decision 10's amendment.
+
+A further ~40 records name rectangles **outside VRAM** (`x = 3840, 61440, 61632`;
+`y = 3840, 4032, 61440, 65472`). Those are *absent* records, never corrupt files — schema
+§10.3's terrain rule applied here — and must be refused rather than written. `is_palette` does
+not screen for it.
+
+**5. Only on *Replace*. On *Push to PCSX*, report.** The rule is one line: **neutralise foreign
+animation; never neutralise a map's own.** On the edit path the animation belongs to the
+document's own map, `build` will carry `0x6c`/`0x70` to the disc verbatim, and freezing it
+would show the artist a picture the shipped map can never produce — the loupe lying in exactly
+the way the shared palette packing exists to prevent. So that path names the rows this map
+animates, read from its own table, and says the colours are in the document and on the disc and
+the battle repaints them. That reporting half is needed on the *Replace* path anyway
+(decision 4), so this is **cheaper than saying nothing**, not dearer.
+
+#### Order, and what the push may claim
+
+**Erase, then palettes and sheet, then install.** Erasing first means the last host frame is
+overwritten by the document's colours rather than racing them; installing last means a pushed
+map's own animation is not immediately flattened by the static palette write behind it.
+
+The readback is **behavioural, and phrased as the goal**: sample `CLUT_BLOCK` twice across the
+dwell and require that **the set of rows that move equals the set the pushed map's own table
+names**. A host row still moving is the old map not removed; a pushed row not moving is the new
+map not added; and for a map with an empty table it reduces correctly to *nothing moves*. The
+dwell is `max(duration)/60`, which is **≤ 0.6 s** for every palette record in the corpus.
+
+A byte readback is **not** sufficient on its own here and the reason is on the record:
+`check_clut_block` **passed on Orbonne with both sides holding Orbonne's palettes while the
+write went nowhere**. Bytes prove the values are at an address, never that anything reads it.
+
+**The texture half is byte-confirmed only** — its dwell runs to 4.00 s and that is not spent
+inside a press — and it is reported in **different words**, because decision 10 already states
+the rule: *"a weaker check reported in the same words as the strong one is worse than no
+check."*
+
+#### It degrades in one direction
+
+**Erasing needs nothing from the disc** — it is a write of zeros to a verified, content-guarded
+address. Only the *install* needs the base resource. So a missing extracted disc tree, or a
+sha256 that does not match the document's pin, costs the install and not the removal: the
+artist gets a correct static picture and a line saying the animation was not installed and why.
+The whole push is **not** refused over an animation chunk, and the animation leg is **not**
+skipped silently.
+
+#### Open, and named rather than assumed
+
+- **The animation's caller is unidentified.** Every write to `CLUT_BLOCK` goes through
+  `clut_strip_load_base`, whose only callers are inside `color_field_dispatch` — 24 call sites,
+  and which one ticks the map animation is not known. Nothing in this decision depends on it:
+  the lever is the data, not the code path.
+- **`duration = 0`** (#654), on 2 palette and 93 texture records, is undecoded. It may mean *every
+  tick* or *inert*. A dwell sized from it computes to zero, so those records need a floor, and
+  the floor is reported as an assumption rather than hidden.
+- **The sheet base derivation** (#653), which blocks part 4.
+
+> **BUILT 2026-08-28.** `live_link.py`'s animation section, `live_link_ui.py`'s
+> steps 5b-bis and 5d, and the two buttons. Graded by
+> `tests/test_live_animation.py` (49 checks, plain `pytest`) and
+> `tests/blender_live_push.py` (23 new arms, 177/177, two seeded defects).
+>
+> **The savestate answers part 2 offline.**
+> `reference-assets/thief_whats_this.sstate` is a real Gariland battle, and
+> `0x80121D7C` in it holds `MAP022.9`'s `0x6c` chunk, differing at exactly
+> bytes 14/16/18/19 of its three running palette records and **nowhere else in
+> all 640**. So the address, the runtime mask and the content guard are all
+> graded without an emulator, and the decoy at `0x800F6DC4` is in the same
+> image, sharing each record's leading eight bytes -- which is the arm that
+> shows why the guard is on the content.
+>
+> **Three numbers above are wrong, corrected by measurement:**
+>
+> - **83 distinct tables on the disc, but 82 under the mask.** Masking byte 14
+>   collapses `MAP061.9` and `MAP061.10`, which differ only there -- byte 14 is
+>   the frame count on the disc and the engine's frame cursor in a running
+>   table. Two states of ONE map, and the guard claims "some map's table" and
+>   not "this map's", so it loses nothing.
+> - **479 texture records sit at `x >= 768`, not 439.** 479 + 80 + 18 = 577,
+>   which is the arithmetic part 4 already does.
+> - **Three of the six out-of-VRAM coordinates are one nibble low**: `x`
+>   reads 3,840 / 61,440 / **61,680** and `y` reads 3,840 / **4,080** / 61,440 /
+>   **65,520**. 84 non-empty records name a rectangle that does not fit in the
+>   1024x512 frame buffer; 40 of them by `x` alone.
+>
+> **Two things this decision does not say, and both would have shipped a check
+> that cannot fail:**
+>
+> - **A pair of samples is not a readback.** `MAP022.9`'s frame 3 is
+>   byte-identical to its frame 1 (§`test_palette_animation.py`), so a pair
+>   that straddles two steps reads three running rows as still and calls a
+>   healthy install *the new map not added*. `moved_clut_rows` is variadic,
+>   samples five times **across** the dwell, and refuses a single sample.
+> - **A held image cannot answer a readback.** `RamClient.hold()` answers every
+>   `read` from one 2 MB fetch (Amendment 7, decision 32), so five samples of it
+>   would be five copies of one instant. `read_live` is the one read in the
+>   module that must cost a fetch, and it neither reads nor fills the held
+>   image.
+>
+> **One departure from the letter of the degradation rule.** *"A missing
+> extracted disc tree costs the install and not the removal"* cannot hold, and
+> part 2 is why: the erase's only proof that it is writing to a map's table is
+> a match against the corpus, and a candidate set of nothing verifies nothing.
+> `check_animation_table({})` **refuses**, and says so in those words. The
+> animation leg therefore degrades as a unit; the half of the rule that does
+> hold -- a base resource whose sha256 does not match the document's pin costs
+> the install and leaves the erase standing -- is built and graded. The rest of
+> the push is unaffected either way.
+>
+> **#654's palette half is empty.** Both `duration = 0` palette records
+> (`MAP053.8`, `MAP053.22`) carry `frame_count = 0` as well, so they animate
+> nothing, name no row, and are never dwelled on. The floor stands behind an
+> authored or foreign table instead, is set to the corpus's own slowest palette
+> step (30 ticks), and is reported as the assumption it is. The 93 texture
+> records are untouched by this leg.
+>
+> **Two things the live machine refuted, both after the offline build passed.**
+>
+> - **A disc record is INERT until the loader arms it, and byte 19 is the
+>   flag.** The running emulator held `MAP022.9`'s three palette records at
+>   `0x80121D7C` byte for byte off the disc -- the state a verbatim install
+>   leaves -- and rows 13, 14 and 15 were **still**. Measured [LIVE]
+>   2026-08-28, one byte at a time with the record's own siblings as the
+>   control: writing **byte 19 = 1** into record 0 alone started row 13 and left
+>   14 and 15 at zero, and putting the record back stopped it again. Byte 14
+>   (`0x81`) and byte 16 (`0x02`) alone did nothing, so the engine initialises
+>   the rest from the record it is handed. The disc ships byte 19 clear on 127
+>   of 128 palette records and every running record in the savestate carries
+>   it, so it is the loader's field. `plan_install_animation` sets it and
+>   carries every other byte verbatim.
+>
+>   **This is the case the behavioural readback exists for.** The chunk really
+>   was at the address, byte-perfect, and nothing read it -- the same shape as
+>   `check_clut_block` passing on Orbonne while the write went nowhere, and the
+>   second instance of it on this leg.
+>
+> - **The guard refused the table this leg leaves behind.** After one Replace
+>   the table holds the pushed map's palette records and otherwise-empty slots,
+>   and **no map on the disc ships a table like that** -- so the second press
+>   matched 0 of 110 and refused, on the machine the leg was built for. A live
+>   slot that is EMPTY where a candidate's is not is what this leg itself
+>   produces, and it is now forgiven; a slot that is PRESENT and different is
+>   still a refusal. An **all-empty** table matches nothing rather than
+>   everything: it is compatible with every map on the disc, which is not a
+>   match, and there is nothing there to erase anyway. The cost is named -- on
+>   a host with no animation table, this document's own animation is not
+>   installed, because an empty table cannot confirm the address. That is what
+>   every push did before this decision existed, and it is **#659**.
+>
+> **Accepted [LIVE] 2026-08-28**, whole leg, shipped code, against a running
+> Gariland battle: the guard matched the six MAP022 states, the erase changed
+> 24 bytes, the install 27, and the readback said *"CLUT row(s) 13, 14, 15 move
+> and no others do, which is exactly what this map's own table names"*. The
+> texture half read back clear.
+>
+> **The frames may live on a sibling.** `MAP053.19` and `MAP061.10` declare a
+> palette animation with a null `0x70` pointer and keep their frames on `.8`.
+> `MAP053` a1 pins one resource, so the sibling is **not** pinned by the
+> document, and the provenance says which resource the frames came from rather
+> than reporting them in the same words as a pinned read.
+
+### Decision 12 — the Blender viewport drives the battle camera, and the engine's own datum is what makes the centres agree
+
+Reported by the artist: *"Blender is looking at one part of the map and the emulator at
+another"*, so an authored map cannot be compared against what the engine renders. Settled by
+grilling on 2026-08-28, before any of it was built.
+
+**Built 2026-08-28, except the continuous timer.** The `bpy`-free arithmetic is in
+`live_link.py` -- `camera_rotation`, `camera_angles`, `camera_position`, `camera_zoom`,
+`camera_pose`, `plan_camera`, `camera_readback`, `check_view_syncable` -- and the *Match
+camera* button and the `Camera` section are `live_link_ui.py`'s. Graded by
+`tests/test_live_link.py` (the camera model against the battle savestate, and the Blender
+half against geometry) and `tests/blender_live_push.py` (**193/193**, headless, seeded).
+The **timer is built too, on 2026-08-28**, after the button was accepted on a live battle:
+`CameraSyncTicker` in `live_link.py` holds what a tick decides, `sync_camera` and
+`_camera_sync_timer` in `live_link_ui.py` are the tick and the `bpy.app.timers` callback, and
+the `Sync camera continuously` preference is the toggle, ON by default. **209/209** on
+`blender_live_push.py`, 179 in `test_live_link.py`. See Amendment 3.
+
+**Two of this decision's own premises were refuted by re-reading the savestate, and the
+amendment at the end of it carries both.** Neither changes what is built; one changes which
+sink is the default and one deletes a trap that was about to be designed around.
+
+#### Why the push goes one way only
+
+The direction is **Blender → emulator**, and the reason is not preference. The battle camera's
+player-reachable envelope is tiny (`research/wiki_articles/battle_camera_system.txt` §2.2):
+
+| axis | control | what the pad can reach |
+|---|---|---|
+| yaw | L1/R1 | full 360° but **snaps to 45°** — 8 poses, nothing between |
+| pitch | D-pad | **`0x12E`–`0x1C0` only** (26.5°–39.4°), and only ever *more* down |
+| roll | none | fixed 0 |
+| zoom | L2/R2 | **`0xC00`–`0x1000` only** (0.75×–1.0×) |
+| position | none | not player-controlled — smooth-tracked to the cursor tile by `FUN_8008B6E4` |
+
+*"I can't move the camera freely in game."* Emulator → Blender would therefore only ever
+replay eight poses the artist already cannot escape. It is **not built**, and it is named here
+rather than silently omitted, the way decision 4 handles unpushed sinks.
+
+#### The camera model, and what was already closed before this decision existed
+
+The engine is `screen = R·(world − work_position) + camera_tracked_target`, orthographic,
+with `R = Rx(pitch)·Ry(yaw)·Rz(roll)` — right-handed elementary rotations, **positive** signs,
+4096 = 360°, on PSX world axes (X lateral, Y **down**, Z depth).
+
+This is not re-derived here. F4 in `camera_framing_pivot_decode.md` fitted it to **65 live
+(angles → R) samples** off a chapel cinematic at max error 0.0019. This decision confirmed it a
+second time, **offline and in a battle** — `reference-assets/thief_whats_this.sstate`, Gariland,
+RAM located by the same verify-don't-offset locator `test_live_link.py` already uses:
+
+| read | value |
+|---|---|
+| `work_position` `0x800E4E74` | `[745472, 19456, 630784]` = `(182.0, 4.75, 154.0)` world units = tile `(6.5, ·, 5.5)` |
+| `work_rotation` `0x800A7784/86/88` | `[302, 4608, 0]` — pitch 26.5°, yaw 405°, roll 0 |
+| `sprite_scale` `0x800C7CA0` | `[4096, 4096, 4096]` = 1.0× |
+| `camera_view_matrix` `0x80098A24` | `[2892,0,2896; 1294,3661,-1293; -2589,1830,2584]` |
+| scratch `+0x68/6C/70` | `[745472, 19456, 630784]` — **byte-identical to `work_position`** |
+| scratch `+0x74/78/7C` | `[302, 0, 4608]` |
+| scratch `+0x80` | `4096` |
+| `saved`/`start`/`current` `0x801B8AD8…` | all `[4096, 4096, 4096, w=0]` |
+
+`Rx(302)·Ry(4608)·Rz(0)` reproduces that matrix at **max error 0.00172** — the 4096-quantization
+floor. `Ry·Rx·Rz` and `Rz·Ry·Rx` land at 0.316, `Rx(−p)·Ry(y)` at 0.894, `Rx(p)·Ry(−y)` at 1.414.
+The model holds in **both** game modes, cinematic and battle.
+
+Five things that reading fixed, each of which a design was about to be built on:
+
+* ~~**The scratch struct's angle offsets are mislabelled.**~~ `renames_high.tsv` calls
+  `+0x74/78/7C` pitch/yaw/roll, and the live struct read `[302, 0, 4608]` while the camera's
+  yaw is 4608, so this decision put the yaw at `+0x7C`, the slot labelled roll. **REFUTED —
+  see Amendment 1.** That triple is what a *two-byte* stride yields; the fields are four
+  bytes apart and the labels are right.
+* **`camera_current_w` (`0x801B8B04`) is not the zoom.** It reads **0** in a running battle;
+  the whole `saved`/`start`/`current` block is an idle effect save/restore slot. The live zoom
+  is `sprite_scale` (`0x800C7CA0`), mirrored at scratch `+0x80`.
+* **The scratch struct is live in battle idle**, not cinematic-only — its XYZ is byte-identical
+  to `work_position`. ~~It is therefore the leading sink, upstream of everything the per-vsync
+  ticker fans out.~~ The first half stands; the inference does not. Byte-identity is what a
+  copy in *either* direction looks like, and F14 settles the direction the other way. **See
+  Amendment 1.**
+* **Yaw is stored unwrapped.** 4608 = 4096 + 512 = 405°, not 45°. Consumers mask `& 0xfff`
+  (`unit_anim_state_machine`, `0x80085C0C`). A write must not normalise blindly.
+* **The projection is orthographic, measured** — F15's depth sweep is flat at +20.0 px/tile
+  across 280 units where perspective would swing ~25%, and F20 reproduced a real unit's screen
+  store to the pixel with `R·SV/4096 + TR` while `H·v/SZ` gave (210,143) against an actual
+  (235,160). `H = 512` is set and is used for **sprite scale / OTZ only**.
+  `battle_camera_system.txt` §1.2 still describes a 28° perspective frustum. It is the older,
+  refuted source; do not reopen `h`.
+
+#### The units already agree, and there is no scale factor to invent
+
+`TILE_UNITS = 28` (`import_document.py:91`, ADR-0004 decision 13) — the addon imports geometry
+at **FFT world scale**, so 1 Blender unit *is* 1 FFT world unit. `work_position` is s32 20.12,
+so `raw / 4096` is world units. The axis map is pinned at `AXIS_NAME = ("x", "z", "-y")`
+(`import_document.py:109`, ADR-0004 decision 14) and ratified by `blender_axis_baseline.json`:
+
+    blender = (fft.x, fft.z, -fft.y)          fft = (blender.x, -blender.z, blender.y)
+
+det = **+1**, a rotation. This is *not* the map `godot-learning` uses — `psx_position_to_godot`
+is `(x, −y, z)`, det = **−1**, a reflection — and godot needed a different map for the camera
+than for the units it films (F19). See the reuse note below.
+
+#### The five decisions inside this one
+
+**1. The pose is pushed faithfully — no clamping to the game's envelope.** Yaw between the
+notches, pitch outside 26.5°–39.4°, zoom past 1.0×, pivot anywhere. Clamping would hand back
+the same eight poses the artist cannot escape, which is the whole reason this exists.
+
+The cost is named and not warned about in the UI: **unit sprites will be wrong.**
+`unit_anim_state_machine` picks each sprite's SEQ slot and mirror flags from
+`(work_rotation_y + unit_facing) >> 10` and `>> 8` — the octant is quantized off camera yaw, so
+between the notches sprites pop to the nearest octant and stop agreeing with the terrain, and at
+an unreachable pitch they are still upright billboards. Terrain is a matrix and is unaffected,
+and terrain is what is being compared. Decision 4's rule: push what has a sink, **name** what is
+skipped, never refuse.
+
+**2. A *Match camera* button first; the continuous toggle is built on top of it.** Not a
+compromise — sequencing. The button is the same arithmetic and the same write plan with none of
+the cadence risk, and it is the instrument that answers whether the sink holds at all. A sink
+that survives one frame is still *visible and photographable* through a button; through a 20 Hz
+timer the same sink strobes, which is the hardest failure to read and the easiest to mistake for
+broken arithmetic. The enable toggle then gates the timer only, so **ON by default** costs
+nothing when no emulator is running.
+
+**3. The centres agree, and the engine's own constant is what makes them.** F20 decomposes the
+GTE translation exactly: `TR = camera_tracked_target − R·work_position`, with
+`camera_tracked_target` = `0x800A77B0` = `{256, 160, 640}`. The `160` at **`0x800A77B4`** *is*
+the vertical datum — not a fitted constant, the engine's own named word — which is why
+`work_position` lands at screen y=160 on a 240-line frame instead of 120. FFT frames the action
+⅔ down, leaving headroom.
+
+Uncorrected, a perfect sync still leaves the two views **40 world units — 1.43 tiles — apart
+vertically**, which presents as *"they are looking at different parts of the map"*: the reported
+symptom, surviving every other part of the sync being right.
+
+The push therefore pokes **`0x800A77B4` = 120**. One extra word, in the same push. The
+correction lives in the engine rather than in `live_link.py`, so it scales with zoom for free,
+there is no hand-tuned 40 to keep right, and it is robust to the one thing F20 leaves open —
+whether terrain takes the same datum as sprites. `0x80098A24` is documented as read by **both**
+the map affine transform and `project_all_unit_sprites`, and TR was recovered from the GTE
+**control** registers, which are global for the frame, so they almost certainly share it. If
+they do not, the datum poke says so on the first framebuffer dump instead of after a hand-tuned
+constant ships.
+
+Two costs, named: the emulator's framing is then **not authentic** — it is not how FFT would
+frame that shot, and everything rides 40 px higher — and `0x800A77B4` is maintained per-frame by
+`smooth_track_camera_target` (`FUN_8008B6E4`), so it may not stick. That is the same unknown as
+the main sink question and is answered by the same A/B, at no extra cost. The fallback if it
+does not stick is to apply `R⁻¹·(0, −40, 0)` to the pushed position in `live_link.py`; because
+TR is added **after** R, the correction is a pure screen-space vertical pan and is
+yaw/pitch-independent.
+
+The rule this serves, from the artist: ***"what I see in Blender should be what I see in
+PCSX-Redux."*** It is therefore graded by a **picture**, not by bytes — the tradition decision 11
+paid for, where a byte readback passed a dead animation.
+
+**4. Zoom is a dial, and pixel aspect is not corrected at all.** The emulator's frame is a fixed
+256×240; a Blender viewport is whatever shape the artist dragged it to, so the two can only agree
+on one axis. Rather than pick one, the push derives a zoom from the Blender view distance and
+multiplies it by a **user-adjustable factor in the panel** — so zooming in Blender still moves
+the emulator, and the dial calibrates the relationship once. *"Just make the center axis align
+and we can dial in a zoom in the UI."*
+
+This deliberately removes the one contested number in the whole camera model from the design.
+The horizontal store-to-pixel factor is **not settled** in the RE record: F15 measured
+`screen_x ≈ view_x` at 1:1 while F20's decomposition (`work_position` → store 256 → on-screen
+128) implies a factor of two, and F19's entire finding was godot's horizontal being compressed
+0.82×. Under this decision nothing in the addon depends on which is right. Pixel aspect is
+likewise not corrected anywhere: *"if we want a PAR-less comparison we can watch the VRAM viewer
+in pcsx redux."*
+
+**5. Roll is forced to zero.** This is a deliberate exception to decision 1 above, and the
+difference is the point: a pitch or yaw outside the game's envelope is **unreachable but
+well-understood**, whereas roll is **reachable in Blender but unmeasured**. FFT has a roll axis
+and has never used it — fixed 0, no control, roll = 0 in all 65 of F4's samples *and* in the
+battle savestate above — so `Rz`'s placement in the composition is *assumed*, never confirmed.
+Blender's default turntable orbit cannot roll either; it takes trackball mode or a view-align to
+get there. Clamping costs the artist a rotation they would have to go out of their way to reach;
+not clamping makes them the first person ever to drive an unverified path, and a wrong picture
+would read as broken arithmetic. **What would unblock it:** one live capture with a non-zero
+roll, fitted the way F4 fitted the other two.
+
+#### The Blender side
+
+The panel section is *Camera*, in `MAP_PT_live_push`'s existing `Map` sidebar
+(`bl_category = "Map"`, `live_link_ui.py:956`) — the sidebar the Map workspace already opens.
+It carries the enable toggle (**ON by default**), an **orthographic ↔ perspective** toggle for
+the viewport, the zoom dial, and the *Match camera* button. No prose: the ortho toggle **is** its
+own indicator, which is what the panel's own rule demands (*"you are putting console stuff in the
+ui area"*).
+
+The ortho toggle is a prerequisite, not a convenience — FFT is orthographic, so in a perspective
+viewport no arithmetic can make the pictures match and the mismatch is invisible in the UI. It is
+still **not forced**: the addon does not reach in and change a view the artist set. Looking
+through a scene camera (`view_perspective == 'CAMERA'`) is different — `view_location` and
+`view_rotation` then describe the last *free* view, not what is on screen — so the sync
+**refuses and says so** rather than pushing a stale pose.
+
+`depsgraph_update_post` does **not** fire on view navigation; orbiting changes no datablock. The
+continuous leg uses `bpy.app.timers.register` (`workspace.py:451/486/532`) or a
+`SpaceView3D.draw_handler_add` (the viewport badge, `import_document.py:2178`) — the two shapes
+this addon already has. Not a third.
+
+#### Where the arithmetic lives, and what was taken from `godot-learning`
+
+The Blender-pose → FFT-raws arithmetic goes in **`addons/exmateria_map/live_link.py`**: imports
+`bpy` never, stdlib only (ADR-0005 decision 2), one copy (decision 6). The toggle, the section
+and the timer are `live_link_ui.py`'s, the only parts allowed to need `bpy`.
+
+`godot-learning` is **reference for understanding the camera, not a dependency** — the artist's
+own framing. Read and taken: the rotation order and units, which F4 established there and which
+are re-confirmed above. Read and **not** taken, with reasons, so this is answered rather than
+silently dropped:
+
+| file | why not |
+|---|---|
+| `CameraCalib.gd` | `GODOT_CAMERA_SIZE = 12.6` is in godot units, where 1 unit = 1 tile (`PsxUnits.tile_to_game` divides by 28); Blender is 28 units per tile, so it is off by 28× used directly. Its own file calls it *"dialled in"*. Decision 4 above means no such constant is needed. |
+| `PSXCameraConvert.psx_position_to_godot` | godot's axis map is a **mirror** (det −1) where the addon's is a **rotation** (det +1), and godot needed a different map for the camera than for the units it films (F19). |
+| `PSXCameraConvert.psx_angles_to_godot_rotation` | discards roll and returns a Godot Euler triple whose signs were tuned against that mirrored space. The RE record says it outright: *"the empirical Godot rotation is NOT R."* |
+
+#### What is not proven, and the way out if the poke does not stick
+
+**Which link in the chain survives a write during a live battle is not established.** The chain
+is scratch struct → `camera_per_vsync_ticker` (`FUN_801439C0`, per vsync) → `FUN_8008BA60` /
+`FUN_8008B834` / `FUN_8008B30C` → `work_rotation` / `work_position` → `build_camera_view_matrix`
+→ GTE. `work_position` is documented as *"poking it sticks and re-projects the scene"* **[LIVE]**
+(F14), but that was a settled savestate, not a battle with a controller running. The scratch
+struct is the leading candidate on the evidence above. This is the first live measurement, and it
+is an A/B: poke, read back one frame later, poke the other, compare — with a **framebuffer dump**
+as the witness, because only a render settles a rendering question.
+
+There is an automatable half as well: poke a known pose, then read `0x80098A24` and require the
+engine's own derived view matrix to equal the one that was intended. That is a *behavioural*
+readback in decision 11's sense — the engine rebuilt it from the write — rather than a byte
+readback of the write itself.
+
+**If it does not stick, the way out is to pause the emulator while sync is on.** Nothing runs, so
+nothing overwrites: poke, step one frame to redraw, and the picture is exactly the pushed pose,
+regardless of which link is the real sink. The cost is a frozen game, which for parking on a
+battle screen and comparing geometry is not a cost. `RamClient.exec` already runs arbitrary Lua,
+so this is a few lines and not a subsystem. It is the **fallback**, not the design.
+
+Also not handled, and named: what happens when the game legitimately wants the camera — a spell
+effect or a cutscene writing the same scratch fields. Sync will fight it. The artist's loop is a
+static battle screen, so this is left rather than solved.
+
+> **Amendment 1, 2026-08-28 — the scratch angles were never mislabelled, and `work_position`
+> is the sink that sticks.** Both come out of re-reading the same savestate and the same
+> primary source this decision already cites, during the build; neither needed an emulator.
+>
+> **The stride, not the labels.** This decision reads `[302, 0, 4608]` at scratch `+0x74` and
+> concludes the yaw sits in the slot labelled roll. That reading is at a **two-byte** stride.
+> The fields are four bytes apart, and `renames_high.tsv` says so itself in the aliases it
+> gives for the same three fields — `camera_scratch_pitch` `0x80057790`, `camera_scratch_yaw`
+> `0x80057794`, `camera_scratch_roll` `0x80057798`, twelve bytes for three angles. At four
+> bytes the struct reads `[302, 4608, 0]` and agrees with `work_rotation` word for word.
+>
+> The 0.948 is real and is kept as an assertion, because that number is what makes this
+> legible: get the stride wrong and it is the **camera model** that looks broken, not the
+> read. `tests/test_live_link.py` asserts the four-byte pose, the two-byte triple, and the
+> 0.948 the two-byte triple composes to, so neither claim can be made again without the other
+> beside it. The struct's base is confirmed by **content** in the same test — its position and
+> zoom are byte-identical to `work_position` and `sprite_scale`, three words agreeing at once.
+>
+> **The direction of the copy, and therefore the ranking.** This decision makes the scratch
+> struct the leading candidate for a live write on the strength of that byte-identity. But a
+> copy in *either* direction produces byte-identity, so the savestate cannot rank them — and
+> **F14 ranks them**, statically at `0x80143AC8/0x80143B24` and validated live: the per-vsync
+> ticker copies `work_position` → scratch → GTE, *"so a `work_position` poke **sticks and
+> re-projects**; the handoff had it backwards"*. F14's own rig note is blunter still:
+> ***"Camera-scratch pokes do NOT stick"*** — an interpolator re-drives `+0x68` every frame
+> back to the keyframe target.
+>
+> That was measured on a **cinematic**, where an interpolator is running, and the artist's
+> loop is a battle idle where one may not be. So this does not close the A/B, it reverses its
+> favourite: `plan_camera` plans **both** sinks and `CAMERA_SINK_DEFAULT` is `work_position`.
+> F14 is the finding this decision's own reading list omits — it cites F4, F6, F15, F19 and
+> F20 — and it is the one that answers the question the decision left open.
+
+> **Amendment 2, 2026-08-28 — the readback ships in the button, as a report.** The
+> "automatable half" above is not a follow-up; it is what *Match camera* does on every press.
+> It reads `CAMERA_VIEW_MATRIX` one fetch after the write and requires it to be the matrix the
+> pushed pose implies — the engine recomposed it, so agreement means the write reached
+> something downstream really consumes.
+>
+> It **reports** rather than refuses, which the decision above does not say and which matters:
+> the way out for a sink that does not stick is to pause the emulator, and a paused emulator
+> runs no frame in which to rebuild anything. A refusal here would break the fallback.
+>
+> `tests/blender_live_push.py`'s fake emulator grew the engine's per-frame rebuild for this,
+> and the arm that carries the weight is the one where it does **not** rebuild: that models a
+> write landing somewhere the engine never composes from, and it proves the button can report
+> a pose that did not take rather than going green over an unchanged picture. The agreeing arm
+> is written **positively** — a `push_camera` that skipped the readback would say nothing
+> either way and would pass an arm phrased as "no disagreement was reported".
+
+> **Amendment 3, 2026-08-28 — the sink question is closed by the picture, and the timer is
+> built on it.** Decision 12 left one live unknown: whether a poke survives a running battle,
+> to be settled by an A/B with a framebuffer dump as the witness. It was settled instead by the
+> acceptance this feature is graded on — the artist pressed *Match camera* on a live battle and
+> reported ***"this works incredible."*** That is the picture, and it is the bar §6 of the
+> handoff sets. `CAMERA_SINK_WORK` sticks; the scratch-struct arm of `plan_camera` stays,
+> unused and asserted, because Amendment 1 reversed the ranking on evidence and not on a run.
+>
+> The timer follows, and its risk is **cadence**, not arithmetic — the arithmetic is the
+> button's and is proven. So the decisions live in `live_link.py` as `CameraSyncTicker`, where
+> a plain `pytest` grades them with no `bpy` and no socket, and three of them are the defects
+> it would otherwise ship: only a **changed** pose is written, so a still viewport costs
+> nothing and decision 2's *"ON by default costs nothing"* is true rather than aspirational; a
+> **failed** write is not a push, so an emulator started after Blender gets the view the moment
+> it answers; and only state **changes** are reported, because at 20 Hz an unguarded line is
+> 1,200 identical entries a minute in the console and the Log. A failure backs the rate off to
+> 2 s. An *idle* reason — a viewport looking through a scene camera — does not, because it is
+> not the emulator's fault and leaving camera view has to be live on the next frame.
+>
+> **The tick does not read back.** The readback is the button's instrument; on a timer it is a
+> second round trip and a Log line per tick to re-answer what one press already answered. Its
+> absence is asserted, not assumed.
+>
+> Two things measured while building it, both of which change what the harnesses can claim:
+>
+> * **`--background` Blender holds a window with a `VIEW_3D` area** — `['PROPERTIES',
+>   'OUTLINER', 'DOPESHEET_EDITOR', 'VIEW_3D']` under `--factory-startup`. So a registered
+>   timer finds a real `region_3d` headless and would POST a pose to whatever is listening on
+>   port 8080: **every harness run would drive the artist's live emulator.** The timer returns
+>   `None` under `bpy.app.background`, which unregisters it, and the harness asserts both
+>   halves — that the viewport really is there to be fooled by, and that the tick declines it.
+> * **The button's readback races the frame.** It reads `CAMERA_VIEW_MATRIX` immediately after
+>   the write; the engine rebuilds it once per ~16.7 ms frame and a localhost round trip is a
+>   fraction of that, so the read can precede the rebuild and report a disagreement about a
+>   write that was fine. The fake emulator lands the vsync between the two and therefore cannot
+>   represent this. Pressing twice distinguishes them. Not fixed, named — and it is a third
+>   reason the tick does not read back.
+
+### Decision 13 — isolating the map is a set of gates over engine state, not a document push
+
+Reported by the artist, straight after the camera sync made aiming possible: *"Hide units and
+dialogue boxes so when we work on the map everything is isolated... The general goal is to
+have the map be the only thing we can see."* Settled by grilling on 2026-08-28, before any of
+it was built, the way 12 was. **Built the same day** — see §0's row for what that
+covers and the one thing it does not (the artist has not looked yet).
+
+Three things the build settled that this decision left open, recorded here rather than
+amended into the text above, because none of them changes a choice:
+
+* **The id at `node+0x4` is a BYTE.** `unit_sprite_object_find` reads it with `lbu`
+  (`0x8007A6FC`). Read as a word the Gariland list's first id is `0x0061000A`, and the
+  report would name a unit by a number nothing in the engine uses. The walk's other two
+  offsets were right as written.
+* **A null head holds back the CODE pokes too.** *Found nothing, wrote nothing* reads
+  naturally as a rule about the walk's own writes, but the HUD and cursor gates are fixed
+  addresses in `BATTLE.BIN` and poking an overlay that is not loaded is the same mistake
+  wearing a constant. Isolate outside a battle now writes nothing at all.
+* **A second press must MERGE its saved values, not replace them.** The second walk reads
+  back what the first press wrote, so a session memory that replaced itself would save
+  `show = 0` for the whole roster and Restore would leave the battle empty. Merging on
+  node address keeps the first press's answer and still admits a unit that spawned since —
+  which is what makes re-pressability answer the mid-battle spawn without a ticker.
+
+Every decision before this one pushes a **document field** at a **live sink**. This one pushes
+nothing. It writes engine state that has no document behind it, for the sole purpose of taking
+something off the screen, and it restores from a value saved before the write. `CONTEXT.md`
+gains **isolation write** for that, because calling it a live sink would break the definition
+decision 4's whole reporting rule leans on.
+
+#### The set is four things, and the ask names two of them
+
+In a live battle the non-terrain pixels are: unit sprites, their **ground shadows**, the
+bottom-left **vitals HUD**, and the **tile cursor** (the on-grid knife). A feature that hides
+units and leaves five shadows and an HP bar has not delivered the ask, so the enumeration comes
+first and the set is the feature's scope.
+
+**Boxed dialogue is skipped, and named here rather than silently omitted** (decision 4's rule). *(Superseded by Amendment 2: the gate was found and boxed dialogue is hidden. What follows is the reasoning as it stood, including the three functions that turned out to be the wrong half.)*
+The artist's loop is a *battle* with a map loaded; boxed dialogue is a cinematic thing that the
+map-authoring savestate never shows. It is also the only one of the five with **no located
+gate**: `event_display_message_handler` (`0x801308C0`), `event_dialogue_tick` (`0x8012F6D4`)
+and `event_text_glyph_reader` (`0x8014CE80`) decode the *text pipeline*, and the label set holds
+no box-drawing primitive with a hide switch. The lead, if it is ever wanted, is the per-frame
+rendering fiber `event_display_message_handler` registers through `PTR_DAT_80165F98` — a
+co-routine that can be *not* registered is a better gate than suppressing glyphs. It is the one
+leg of the ask that would turn a session into a research errand, and it is the one leg left out.
+
+#### Units and shadows are ONE lever, and it is the engine's own hide
+
+`unit_sprite_render_dispatch` (`0x80086640`) does this seven instructions in:
+
+    80086768  lhu  v0, 0x1d8(s3)
+    80086770  beq  v0, zero, LAB_80086B10      ; the epilogue
+
+`+0x1d8 == 0` is a **whole-dispatch early-out**, and it sits *before* the `+0x298` shadow
+test at `0x80086ACC` and the `jal unit_shadow_render` at `0x80086AF0`. So the shadow follows
+from the same branch: there is no second gate to build, and `unit_shadow_disable`
+(`0x8008C2A4`) is named here only to record that it is **not needed**.
+
+The write is the engine's own. `unit_sprite_object_hide` (`0x8008D18C`, the `{46} Erase Unit`
+backend) does `sh zero,0xa(v1)` **and** `sh zero,0x1d8(v1)`; `unit_sprite_object_show`
+(`0x8008D138`, `{44} Draw Unit`) writes `1` to both. Hiding a unit is a thing this engine does
+to itself every cinematic — `SCENARIO6_UNIT_REVEAL_VISIBILITY.md` is the living document on
+`unit[+0xa]`, grounded live.
+
+**The lever is per-unit and NOT the list head, and the handoff's ranking of the two was
+wrong.** `unit_sprite_list_head` (`0x80098A54`) carries 21 XREFs — three writes, **eighteen
+reads** — and one reader is `unit_sprite_object_find` (`0x8007A6E4`), the id -> node getter that
+the shadow toggles and the `{47}` ghost gate call. `FUN_8007A724`, which also walks it, has
+**21 callers** across `0x80068xxx`-`0x80073xxx`: gameplay, not rendering. So *"the unit's own
+state is untouched, so turn order and AI cannot notice"* is not established for a null head; it
+is established for the per-unit flags, which is what the dispatch itself reads.
+
+**The direction question is answered statically and cost no emulator time.** The three writers
+of the head are all list surgery, one of them (`FUN_80088018` @ `0x8008801C`, single caller
+`0x8008ED8C`) a battle-teardown clear. `+0xa`/`+0x1d8` are written at unit **spawn**
+(`0x80087BB8`/`0x80087BC0`, off a held-flag) and by the event opcodes — **not per frame**. A
+poke sticks. This is the class of mistake the camera sync was burned by, and here the
+disassembly settles it without a watchpoint.
+
+| address | what | why it is here |
+|---|---|---|
+| `0x80086770` | the `+0x1d8` early-out | the shadow follows for free |
+| `0x8008D18C` | `unit_sprite_object_hide` | the two fields, and that they move together |
+| `0x8008D138` | `unit_sprite_object_show` | writes `1` to both — the engine's restore, not ours |
+| `0x8007A6E4` | `unit_sprite_object_find` | one of eighteen readers of the head |
+
+#### The HUD and the cursor have no flag, so they take a code poke
+
+This is the first write this addon makes to the **instruction stream**. Every sink before it is
+data — descriptor block, packet buffers, palettes, camera pose. It is named as its own gate kind
+rather than smuggled in.
+
+There is no data switch to find. The nearest thing is `g_cursor_anim_pause` (`0x800960F0`), and
+its own label says it skips the phase/accumulator advance: it **freezes the bob, it does not
+hide the cursor**. So the gate is `jr ra; nop` (`0x03E00008`, `0x00000000`) over a renderer's
+first two instructions, restored by writing back the eight saved bytes. The technique is not new
+to this package — `workspace/probe496.py` already pokes `0x03e00008` and nops a guard branch.
+
+| target | state |
+|---|---|
+| `build_unit_vitals_window` `0x801363DC` | confirmed a real function head (`addiu sp,sp,-0x248`), calls `draw_number_small_font` 3x. **No direct `jal` caller** — it is dispatched through a pointer, which is what makes the entry poke the only practical gate rather than merely the easiest |
+| `FUN_8008924C` (calls `tile_cursor_bob_render` @ `0x80089294`) | the **first** cursor target, and the uncertain one |
+| `tile_cursor_bob_render` `0x8007E304` | the second candidate, and probably wrong: its own label says it subtracts the table offset from cursor sprite Y *before* `rotate_vector`, so nulling it likely leaves the knife drawn and unbobbed |
+
+**The uncertainty is shipped, not hidden.** The cursor target is a named constant, one line to
+change, and the acceptance below resolves it in one press. Naming one address and asserting it
+was correct is what this document does not do.
+
+#### It is an ACT, and the ticker is the wrong precedent
+
+The camera sync earns a timer because its **source** changes continuously: every viewport orbit
+is a new pose, and Amendment 3's economics — write only a *changed* pose — are what make it
+free. Isolate has no moving source. The artist flips it twice a session, so a ticker would spend
+a round trip per tick to learn there is nothing to do, and to learn even that it would have to
+**read back**, which Amendment 3 refused for the camera tick on three stated grounds. Nothing
+re-derives these fields per frame, so there is nothing to fight.
+
+So: two buttons, no state in the UI.
+
+* **Isolate map** pokes, and is **idempotent and re-pressable**. That is the whole answer to the
+  three ways the emulator drifts out from under Blender — a restarted emulator, a *Replace the
+  loaded map*, a unit spawning mid-battle. One press, not a per-tick round trip.
+* **Restore** writes back **saved values, not constants**. `unit_sprite_object_show` writes `1`
+  to both fields, and copying that would be a defect: a unit the game had *legitimately* hidden —
+  not yet revealed, erased by a `{46}`, off-roster — would be wrongly revealed by an un-isolate.
+  The saved value is the only correct restore.
+
+**The cost, named rather than discovered:** Blender holds the saved values, so if Blender dies
+while isolated the restore is lost and the artist reloads the battle. Decision 3 already puts
+this loop on the poke-don't-patch side of that line, so it is in character — and persisting
+emulator state into a `.blend` would be worse, because it goes stale the moment the emulator
+restarts.
+
+#### The walk hides what it can reach, and says how far it got
+
+One `hold()` fetch answers the whole walk (Amendment 7 of decision 32's mechanism): read the
+head, follow `node+0x0`, take the id at `node+0x4` and the two flags, then one `write` batch.
+**One round trip, not one per node.**
+
+Four ways the walk can be unsure: a null head (indistinguishable from *not in a battle*), a
+circular chain or an out-of-range/misaligned next-pointer, a chain longer than a roster can be
+(`entd_to_roster_loader_16` loads 16 ENTD slots, plus up to three `{47}` ghosts), and the artist
+pressing Isolate outside a battle.
+
+**It hides what it reached and carries on** — the artist's call, against the recommendation of a
+refusal. Two things make that safe rather than silent, and they are the decision:
+
+* **It only ever writes to a node it validated.** The walk stops following a bad link; it does
+  not write to an address derived from garbage. The not-in-a-battle case therefore degrades to
+  *found nothing, wrote nothing*.
+* **The report is units found and units hidden, not bytes changed.** This is what a refusal was
+  protecting and it is recoverable without one. *"hid 8 of 8"* and *"hid 3, then the chain went
+  bad"* are different sentences, and a null head says **found no units** instead of colliding
+  with the `0 changed` that already means *already isolated*. A count that means two opposite
+  things is the defect a refusal would have avoided; a second number avoids it too.
+
+Cycle detection is by **visited node address**, which is exact, with the 32-node cap as a
+backstop rather than as the mechanism.
+
+#### Where it sits, and how it is graded
+
+`MAP_PT_live_isolate`, `VIEW_3D`, **`bl_order` 2** — with Push (0) and Camera (1), on the reason
+`_HOMES` already carries for Camera: *both are the live link, and the artist presses them in one
+breath*. Aim the camera, hide the units, look at the map. Preview / PaintView / Terrain /
+LightingBake shift to 3/4/5/6; the permutation arm fails loudly if the renumber is wrong.
+
+Not inside the Camera panel, which the handoff suggested: that panel's docstring defends **four
+controls and no prose** as this sidebar's rule, and "Camera" stops describing it the moment it
+hides units. Two buttons and not a checkbox, because re-ticking an already-ticked box is a no-op
+and re-pressability is the mechanism Q4 chose.
+
+* **`pytest` against `reference-assets/thief_whats_this.sstate`** for everything structural —
+  the walk finds the capture's units, the ids match, the flags read as expected, and a **seeded**
+  circular link and a **seeded** overlong chain are caught. No emulator. It is how decision 12
+  refuted two of its own premises before running anything.
+* **`tests/blender_live_push.py`** for the Blender half — headless, fake emulator, every check
+  ships the defect it catches, `EXPECTED_CHECKS` as a floor. 209 at the time of writing.
+* **Acceptance is the artist's eye on their own battle**, the way Amendment 3 closed the
+  camera's last unknown on *"this works incredible"*. Bytes-changed grades the mechanism; only
+  looking grades the feature — and the shadow and the cursor's poke target are both places where
+  the mechanism can report success while the screen disagrees.
+
+> **Amendment 1, 2026-08-28 — the camera leash is a third code gate, and it rides the same
+> press.** The artist's report: *"if we go into battle state the camera is linked to a position,
+> like the cursor — but during dialogue it's not. This is why we can do smooth camera movement
+> and panning during dialogue, but not during battle — it is constantly fighting to get back in
+> position."* Measured, not inferred: pushed to `(100, 0, 100)`, `camera_work_position` drifts
+> **191 units** back to the battle's own target over about a second and then holds.
+>
+> The leash is **`FUN_8006FE58`** (`0x8006FE58`), a per-frame step-toward-target integrator that
+> adds the signed velocities `DAT_800A1C48` / `DAT_800A1C4C` into `camera_work_position` against
+> a clamp of `DAT_800961B4 * 28 + 14`. Cut with `jr ra; nop` the camera holds at
+> `(120.000, -5.000, 80.000)`; restored it drifts to `(233.914, -17.941, 44.029)`.
+>
+> **Static analysis named the wrong function**, and this is the reason the address is recorded
+> here rather than re-derived. The first answer was `FUN_8008B440`, the countdown-gated glide —
+> cutting it changed the trajectory not at all, and its counter `DAT_8009616A` reads 0 for the
+> whole pull-back. Worse, the writer set was **incomplete**: four functions were known and
+> grepping every store into `camera_work_position` found **six**, with the answer in one of the
+> two that were missing. The other five are innocent, each cut alone and measured:
+> `FUN_8008B440`, `FUN_800700BC`, `FUN_8006EF00`, `FUN_8008B30C`, `FUN_8008B2C4`.
+>
+> **It goes in `CODE_GATES`, beside the HUD and the cursor**, on the artist's own direction —
+> *"it would go in the same place as where we hide the units"*. One act, one way back: the leash
+> is saved before the write and restored with everything else, and the same null-head rule holds
+> (not in a battle → write nothing, gates included). It is **not** wired to the camera push,
+> which would have made a second piece of state to keep straight and would have left the leash
+> cut with no press that puts it back.
+>
+> **It is a LEAF**, and that broke a guard rather than the feature. `test_live_link.py` asserted
+> every gate's entry word was an `addiu sp,sp,-N` prologue; `FUN_8006FE58` has no frame at all —
+> 141 instructions to its `jr ra` at `0x80070088`, no `sp` adjust, no `ra` save, no `jal`. The
+> guard now classifies **by gate name**: the two renderers must still be prologue-shaped, and the
+> leash must walk to a `jr ra` with no frame built. Name-based on purpose, so a prologue function
+> cannot silently re-file itself as a leaf to escape the stricter check. A leaf is in fact the
+> *safer* poke of the two — there is no half-built frame to strand.
+>
+> Boxed dialogue is still not gated here. It has since been hidden a different way — by clearing
+> its palette, CLUT `0x7C3C`, in a savestate (`research/hide_dialogue_box.py`) — which is an
+> offline patch and not a live poke, so decision 13's *no located gate* stands as written.
+
+> **Amendment 2, 2026-08-28 — boxed dialogue HAS a gate, and it is one draw with the portrait.**
+> Decision 13 shipped boxed dialogue as *the one leg of the ask with no located gate*, and every
+> press said so. That is now false. **`event_portrait_render_ft4`** (`0x8012E65C`) is the
+> per-frame builder of the box's `POLY_FT4`s, and `jr ra; nop` over its entry takes the frame,
+> the text **and the speaker portrait** off the screen together — A/B/A against
+> `scenario6_delita_tough_dialogue_pc334`, with the box back byte-for-byte on restore.
+>
+> The three functions decision 13 named really were the wrong half: they are the *text pipeline*,
+> not the draw. So is `dialog_box_compositor` (`0x8014C18C`) — it composites the box **once** at
+> open, so cutting it mid-dialogue leaves the picture untouched, which is measured here rather
+> than reasoned about.
+>
+> **It is scoped to boxed dialogue, and that is why it is its own gate.** Cut against a battle
+> with the action menu, the unit panel and a damage number on screen, the picture does not move.
+> Cut across a running cutscene, three CROSS presses still advance the scene — the dialogue task
+> ticks, it simply draws nothing.
+>
+> **How the portrait was found, and why the palette was the wrong lever.** The box was first
+> hidden by zeroing CLUT `0x7C3C` in a savestate (`research/hide_dialogue_box.py`), and the
+> **portrait survived it** — so the portrait does not read the box palette. A whole-VRAM bisect
+> against the box-hidden picture put the portrait's pixels in a single 16×24-halfword block at
+> VRAM `(848, 424)`, inside the unit-SPR portrait column at x832 that `boxed_dialog_decode.md`
+> already documents. But no palette anywhere in VRAM changed it: painting every other 32-row band
+> green moved nothing, and clearing the block to index 0 left an opaque plate rather than a hole.
+> The lever was never in VRAM — it is the draw, and the existing label set already named it.
+> A picture-first hunt found the *pixels*; the labels found the *gate*.
+>
+> `research/hide_dialogue_box.py` is kept, not deleted: it is the offline answer for a savestate
+> with no emulator attached, and it is the measurement that proved the portrait is a separate
+> consumer.
+
+
+### Decision 14 — the push is split at the `bpy` line, and the transport runs off the main thread
+
+Reported from use, on the settle loop: *"when I am painting, I will let go and stop, and then
+in a bit it will randomly freeze for a bit before starting again — it's awkward and slow."*
+
+The freeze was the push. `settle_op.push_after_compile` called `bpy.ops.map.live_push()` and
+waited out the whole round trip on Blender's own thread, so the artist's UI was locked for the
+length of an HTTP conversation with another process. ADR-0186 decision 30 had already made this
+split for the *compile* — "read on the main thread, compile off it" — and the push had simply
+never been given the same treatment.
+
+**The measurement, before the design.** `MAP_OT_live_push.execute` was instrumented against the
+harness's fake emulator (which is a real `RamClient` wired to a byte buffer, so the clustering,
+the bounds checks and the changed-byte count are the shipped ones) and the round trips were
+counted; the per-trip latency is the real emulator's, measured on localhost.
+
+| leg | cost | main thread? |
+|---|---|---|
+| `assemble(ob)`, MAP022 a0, 454 polygons | **375 ms** | yes, and it cannot leave — it *is* the Blender read |
+| whole-RAM GETs (`/api/v1/cpu/ram/raw`, 2 MB) | **16 × 31 ms = 498 ms** | no |
+| whole-VRAM GETs (`/api/v1/gpu/vram/raw`, 1 MB) | **5 × 34 ms = 171 ms** | no |
+| the push's own planning and diffing | tens of ms | no |
+
+So the half that could move was the bigger half, and it was also the half that is not *work* —
+it is waiting on another process.
+
+**The sixteen GETs are not a redundancy to remove.** `RamClient.hold()` answers every read from
+one image, and every `apply` drops it on purpose: the reads *after* a write — `verify`, the
+packet witnesses, the picture's readback — exist precisely to see what landed, and a hold that
+survived a write would turn each of them into a tautology. The traffic is the price of the
+checks, and the checks are the reason this rig is trustworthy. Moving it off the main thread
+costs nothing and keeps all of them.
+
+**The cut is at the `bpy` line, and it is enforced.** Three functions in `live_link_ui.py`:
+
+- `push_gather(context, ob, say)` — MAIN THREAD. Every `bpy` read the push makes: the
+  preferences, `ensure_compiled`, `assemble`, the marker's imported polygons, its preview state,
+  its base map directory. Returns the keyword arguments the transport takes, all plain data —
+  `doc` and `base` are JSON-shaped, `rep.sheets` is `{name: bytes}` because `export_sheets`
+  hands back the disc's own 131,072-byte layout rather than a Blender image, and `anim_dir` is a
+  `Path`.
+- `push_transport(say, **kw)` — **no `bpy` at all.** Everything from the descriptor gate to the
+  animation install, inside one `hold()`.
+- `push_report(ob, lines)` — MAIN THREAD. The marker property, the Log's Text datablock and the
+  terminal print. Split out of the old nested `finish` because a background push lands its
+  report long after the operator that started it returned.
+
+`MAP_OT_live_push` runs all three in a row and is otherwise unchanged: **the button still
+blocks**, because the artist who pressed it is waiting for the answer and an operator has to
+return a status. It is the *settle* that goes to a worker.
+
+**The `bpy`-free contract is graded on the source, not on a run.** Most of `push_transport` is
+refusal branches a runtime arm would never take, and the failure mode is not a slow push — it is
+a crash in another thread with no traceback the artist will ever see. So
+`tests/blender_live_push.py` parses the shipped module and asserts that neither
+`push_transport` nor `_transport` names `bpy` or `self`, and **seeds one `bpy` back into it** to
+prove the arm can go red rather than merely passing against a function that was renamed away.
+
+**A push in flight COALESCES the next one; it does not queue it.** A queue would send the
+emulator a sheet the artist has already painted over. `background_push_start` drops a second
+push and sets `pending`; when the running one lands, `_judge` sends the current document. One
+slot, for the same reason `settle_op` keeps one compile slot.
+
+**A refusal is still immediate.** `lua.check()` and `assemble`'s refusals both happen inside
+`push_gather`, on the calling thread — so *"there is no emulator"* is an answer the settle gets
+now rather than a tick later, and decision 28's back-off (retry on a slow clock, report once per
+spell, never latch) keeps working exactly as it did. `push_after_compile` gained a third return
+value for the case it cannot answer yet, `{"RUNNING_MODAL"}`; nothing reads it as success.
+
+**The report lands on the tick that already exists.** `settle_op._tick` runs at 4 Hz and now
+calls `_drain_push()` before `_step()`. A push does not get a timer of its own: a quarter of a
+second of latency on a line the artist reads in the terminal is free, and a second timer would
+be a second thing to unregister.
+
+**What is left on the main thread is `assemble`, and it is 375 ms.** That is a real remaining
+hitch and it is named rather than rounded away. It cannot be threaded — it is the Blender read
+itself — so making it cheaper is a different question (its profile is dominated by
+`image_indices` and the 4bpp repack, both of which re-run in full on a settle where only the
+sheet moved). Not attempted here.
+
+> **Two of the sentences above are wrong, and decision 15 corrects them.** The 375 ms was
+> measured at a 1x Painting and the shipped default is 4x, where the same call is **2,398 ms**;
+> and "the transport runs off the main thread" is not the same claim as "the main thread is
+> free", because of the GIL. Read decision 15 before quoting any number from this one.
+
+
+### Decision 15 — a worker THREAD does not free Blender's UI, and the push was doing the compile's work twice
+
+Reported from use, after decision 14 shipped: *"release left click to stop painting … things are
+fine for a second and then the push kicks in and pcsx-redux starts doing work. It takes maybe 3
+seconds for pcsx-redux to settle, and that whole time blender was unusable — basically."*
+
+Decision 14 halved a freeze and then reported the remainder as 375 ms. The artist was still
+losing about **four seconds**, which is the gap between what that number claimed and what a
+session actually costs. Both halves of the gap are measured below, and neither is the transport.
+
+**The instrument first: `tests/blender_settle_stall.py`.** It dumps MAP022 a0, imports it,
+converts it at the shipped default scale, paints into the Painting and then drives
+`settle_op._launch` — *the real settle path, never a copy of it* — while the main thread runs a
+heartbeat loop counting how much Python it gets through. That count is the point: a worker
+thread does not stall the main thread once, it taxes **every** Python entry, and Blender's UI is
+made of Python entries.
+
+**Finding one — the "background" compile costs the UI 62x.** Measured headful with
+`bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP')`, which is Blender drawing its own windows:
+
+| | Blender fps |
+|---|---|
+| idle | 586 |
+| one CPU-bound Python thread, CPython's default 5 ms switch interval | **8.7** |
+
+8.7 fps *is* "unusable — basically", and it is what decision 30's and decision 14's threads
+bought on their own. One window redraw enters Python once per panel `draw()`, and every entry
+waits out a GIL switch interval. `sys.setswitchinterval` is the lever, and the trade is cheap:
+
+| switch interval | Blender fps | worker throughput |
+|---|---|---|
+| 5 ms (default) | 8.7 | 212 |
+| 0.5 ms | 83.3 | 206 |
+| **0.1 ms** | **218.4** | 183 |
+| `sleep(0)` between chunks | 17.2 | 207 |
+
+`sleep(0)` is in the table because it is the obvious fix and it is nearly worthless — yielding at
+a chunk boundary does nothing about the 5 ms every *other* Python entry waits. 0.1 ms costs the
+worker 14 % and hands the UI back 25x. `addons/exmateria_map/worker.py` owns that trade:
+`worker.spawn(name, fn)` lowers the interval while one of *our* workers is alive and restores it
+when the last one finishes, refcounted because the settle can have a compile and a push in
+flight at once. Both callers moved onto it, and `tests/test_worker.py` fails on any bare
+`threading.Thread` anywhere else in the addon — seeded, because a scan for an attribute name is
+exactly the check that goes quietly blind.
+
+**Finding two — `assemble` is 2,398 ms at the shipped default, and two thirds of it is work no
+push wants.** The 375 ms in decision 14 was measured before Amendment 10 made **N = 4** the
+conversion default. Profiled on MAP022 a0 at 4x:
+
+| leg | cost | who wants it |
+|---|---|---|
+| `rgb_from_floats` over 12.6 M texels | ~1,200 ms | **the compile already did this**, on its worker, a second earlier |
+| `png_indexed.write_rgb_png` (Sub filter + zlib 9) over the result | ~900 ms | the *file* export. The push discards `files` |
+| `image_indices` + the 4bpp repack + the sheets' own PNGs | ~300 ms | the blob is wanted; the PNGs are not |
+
+So:
+
+* **`assemble(ob, sidecars=False)`.** The push consumes `doc` and `rep.sheets` and throws
+  `files` away. Both sidecar names are `sha256` of the *raw* blob — the packed 4bpp for a sheet,
+  the RGB for a painting — never of the PNG, so skipping the encode changes no name, no digest
+  and no document. It is not a flag to sprinkle: a bundle write must leave it True, or it writes
+  a document whose sidecars are missing.
+* **`export_document` remembers the master a compile derived.** `compile_off_thread` already
+  builds the full-resolution RGB (`stamp_compile` hashes it); it now also takes a
+  `master_key` — a sha256 of the float buffer it came from — and `land_compile` deposits the
+  pair. `image_rgb` serves from that deposit when the key matches. The key is **sha256 and not
+  `zlib.crc32`**, which is cheaper (24.6 ms against 14.2 ms on a 4x buffer) and is what
+  `settle_op.canvas_digest` uses: that one is a change *detector*, where a collision costs a
+  skipped settle, and this one keys a value that goes on to name a sidecar file. The 10 ms buys
+  the key the same strength as the identity it feeds. A hit still pays the `foreach_get` and the
+  key — 53 ms — and skips the 1,200 ms walk. A reload, an undo, a stroke or another tool's write
+  all move the key and take the walk.
+* **`rgb_from_floats` itself is three C-level strided moves.** `buf[c::4]` is a strided copy
+  (9.8 ms for 4.2 M floats) and `flat[c::3] = …` a strided store, so the only Python left per
+  texel is the scale-and-round; the row flip is one slice move per row rather than per texel; and
+  `round(x)` on a float already returns an int, so the `int()` around it was a second call per
+  channel and nothing else. Byte-identical, **1,031 ms → 673 ms**.
+
+**The result, MAP022 a0 at N = 4, same box, same harness:**
+
+| | before | after |
+|---|---|---|
+| the `bpy` read (`read_for_compile`) | 30 ms main thread | 31 ms |
+| the compile worker | 1,440 ms at **1 %** of main-thread Python throughput | 970 ms at **25 %** |
+| `land_compile` | 72 ms main thread | 76 ms |
+| **`push_gather`** | **2,398 ms main thread, hard block** | **228 ms** |
+| the transport | off-thread, unchanged | off-thread, unchanged |
+
+The artist's hard block goes from ~2.5 s to ~0.33 s, and the second and a half that remains is
+spent with the UI at ~200 fps rather than 8.7.
+
+**What is graded, and where.** The behaviour is in `tests/blender_convert.py` — ten arms on a
+really-converted MAP022, each with its control: `sidecars=False` writes no file and hands back
+an identical document and identical sheets; a detonator in place of `write_rgb_png` never fires
+with the flag off **and must fire with it on**; `image_rgb` is served from the deposit, and a
+single changed texel takes the walk instead; the push after a compile re-derives no master, and
+**with the deposit dropped the same push must walk**, or that arm is grading a push that never
+wanted a master. The mechanism is in `tests/test_worker.py` (7 arms, plain `pytest`, no `bpy`).
+The numbers are in `tests/blender_settle_stall.py`, which grades two *structural* floors and no
+wall-clock budget — this box is shared, and a millisecond threshold on a contended machine is a
+flake that teaches nothing.
+
+**Acceptance is the artist's eye on their own painting session**, exactly as decision 14 said
+and exactly as it did not get. A green harness is not the verdict -- and this one **has** it:
+painting a real session after this landed, the artist reported *"I think this is better."*
+That is what closes decision 14's open acceptance as well as this one's.
+
+It is acceptance of a *direction*, not of the numbers. The bar the artist stated when asked
+what "better" would have to mean is **the UI thread on top** -- the emulator may lag, tighter
+updates are wanted but never at the cost of Blender's responsiveness, and the one thing that
+must not happen is being prevented from painting. Decision 16 is scoped by that sentence.
+
+**Not attempted, and named rather than rounded away.** The compile's remaining 970 ms is still
+pure Python on a worker, and the honest fix for that is a *subprocess* — `compile_off_thread`
+touches no `bpy` and imports only the stdlib, so it could run in a child process fed pickled
+plain data, and a child process has its own GIL. That is an architecture change with a 50 MB
+pickle on each leg, and it should not be started before someone measures whether 25 % of the
+main thread's Python for a second is something the artist can still feel.
+
 
 ## 5. What is not proven yet
 

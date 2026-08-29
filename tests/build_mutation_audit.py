@@ -23,6 +23,12 @@ The rules the seeds obey are the export audit's:
   Both are guarded now -- a run with no pytest summary reports
   `HARNESS_DID_NOT_RUN`, never silence.
 
+Three harnesses, because a seed is only graded by a suite that RUNS the code
+it lands in: `corpus` is the whole `dump -> build -> cmp` chain, `unit` is
+`test_build.py`, and `codec` is `test_source_art.py`, which owns the PNG
+codecs and -- since ADR-0186 Amendment 13 -- the arms that force the
+numpy-less fallback.
+
 The last four seeds are not inventions: they are the four defects the
 workspace scaffold actually shipped (schema §13), reproduced here so the
 claim "these checks would have caught them" is measured rather than asserted.
@@ -149,10 +155,53 @@ MUTATIONS = [
      "        if start < position:", "        if False:  # MUTANT", "unit"),
 
     # --- §6.5 sheets ------------------------------------------------------
+    # ADR-0186 Amendment 13 gave `png_indexed.py` numpy fast paths and a
+    # soft import, so every seed here now has to name WHICH arm it lands in.
+    # The numpy arm is the one that runs; the Python arm runs only when numpy
+    # is absent, and a seed there is caught by the one test that FORCES that
+    # (decision 53) and by nothing else. Seeding only the Python arm -- which
+    # is what this file's original nibble seed became the moment the fast path
+    # landed -- would have read CAUGHT for the wrong reason or BLIND for a
+    # reason that is not a missing check.
     ("sheet_nibble_order_flipped", PNG,
-     "    return bytes((indices[i] & 0xF) | ((indices[i + 1] & 0xF) << 4)",
-     "    return bytes((indices[i + 1] & 0xF) | ((indices[i] & 0xF) << 4)  # MUTANT",
+     "    return (v[0::2] | (v[1::2] << 4)).tobytes()",
+     "    return (v[1::2] | (v[0::2] << 4)).tobytes()  # MUTANT",
      "unit"),
+    ("sheet_nibble_order_flipped_in_the_numpyless_fallback", PNG,
+     "        return bytes((indices[i] & 0xF) | ((indices[i + 1] & 0xF) << 4)",
+     "        return bytes((indices[i + 1] & 0xF) | ((indices[i] & 0xF) << 4)"
+     "  # MUTANT",
+     "codec"),
+
+    # --- Amendment 13 decision 57: the vectorised PNG paths ---------------
+    # Every one of these is a byte-exactness defect with no exception behind
+    # it: the picture decodes, the file is well-formed, the CRC is right, and
+    # the texels are wrong. That is why they are seeded rather than argued.
+    ("sub_decode_cumsums_the_wrong_axis", PNG,
+     "numpy.cumsum(lanes, axis=0,", "numpy.cumsum(lanes, axis=1,  # MUTANT",
+     "codec"),
+    ("sub_decode_hardcodes_a_paintings_three_lanes", PNG,
+     ").reshape(-1, bpp)", ").reshape(-1, 3)  # MUTANT: blind to an index sheet",
+     "codec"),
+    ("numpy_arm_swallows_average_and_paeth", PNG,
+     "if f <= 2 and numpy is not None:", "if f <= 4 and numpy is not None:"
+     "  # MUTANT",
+     "codec"),
+    ("up_decode_reads_the_row_above_as_it_arrived", PNG,
+     "                     + numpy.frombuffer(bytes(prev), dtype=numpy.uint8)",
+     "                     + numpy.frombuffer(  # MUTANT: filtered, not"
+     " reconstructed\n"
+     "                         bytes(raw[at - stride:at]), dtype=numpy.uint8)",
+     "codec"),
+    ("sub_encode_differences_one_byte_back_not_one_pixel", PNG,
+     "[numpy.zeros((height, 3), dtype=numpy.uint8), arr[:, :-3]], axis=1)",
+     "[numpy.zeros((height, 1), dtype=numpy.uint8), arr[:, :-1]], axis=1)"
+     "  # MUTANT",
+     "codec"),
+    ("numpy_pack_trusts_the_caller_instead_of_masking", PNG,
+     "v = numpy.frombuffer(indices, dtype=numpy.uint8) & 0xF",
+     "v = numpy.frombuffer(indices, dtype=numpy.uint8)  # MUTANT",
+     "codec"),
 
     # --- §10.4 polygon capacity (decision 28) ------------------------------
     # All three are "unit": the corpus maxima sit UNDER every bound, so a seed
@@ -290,7 +339,12 @@ MUTATIONS = [
 
 HARNESS = {"corpus": ["tests/build_corpus.py", "--limit", LIMIT],
            "unit": ["-m", "pytest", "-q", "-p", "no:cacheprovider",
-                    "--color=no", "tests/test_build.py"]}
+                    "--color=no", "tests/test_build.py"],
+           # The PNG codecs' own arms live in `test_source_art.py`, not
+           # `test_build.py` -- the Painting's codec was added there and
+           # ADR-0186 Amendment 13's numpy fast paths are graded beside it.
+           "codec": ["-m", "pytest", "-q", "-p", "no:cacheprovider",
+                     "--color=no", "tests/test_source_art.py"]}
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -318,7 +372,7 @@ def run(which, cwd):
 
 def failures(out, which):
     """The named checks that are red -- the unit a seed is graded in."""
-    if which == "unit":
+    if which in ("unit", "codec"):
         if not re.search(r"\d+ (passed|failed|error)", out):
             # A run that never happened must never read as clean.
             return ["HARNESS_DID_NOT_RUN"]
@@ -352,7 +406,8 @@ def main():
         m = re.search(r"warned=(\d+)", clean)
         EXPECTED_WARNED = int(m.group(1)) if m else -1
         base = {"corpus": failures(clean, "corpus")}
-        base["unit"] = failures(run("unit", scratch(tmp)), "unit")
+        for which in ("unit", "codec"):
+            base[which] = failures(run(which, scratch(tmp)), which)
         for which, red in base.items():
             print(f"BASELINE {which}: {red or 'clean'}"
                   + (f" (warned={EXPECTED_WARNED})" if which == "corpus" else ""),

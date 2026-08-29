@@ -54,6 +54,7 @@ from collections import Counter
 from pathlib import Path
 
 import bpy
+import numpy
 from bpy.props import BoolProperty, StringProperty
 from bpy.types import Operator
 
@@ -72,9 +73,6 @@ GROWTH_AXIS_MAX = 18
 # example {255, 127, 0}, which is FF FE, a shipped OUT-OF-GRID binding.
 SENTINEL_BINDING = {"x": 255, "z": 127, "level": 1}
 
-TILE_IMPORTED = "imported"             # tile-object kinds (`exmateria_map/tile`)
-TILE_DRIFT = "drift"
-TILE_GROWTH = "growth"
 # §5.1.3 / decision 23: only these three may be declared on a DRIFT record.
 DRIFT_FIELDS = ("height", "slope_height", "slope_type")
 
@@ -136,12 +134,21 @@ def marker_collection(ob):
 
 
 def flagged(ob, flag):
-    """The objects of the marker's collection carrying `exmateria_map/<flag>`."""
+    """Objects UNDER the marker's collection carrying `exmateria_map/<flag>`.
+
+    `all_objects`, not `objects` (ADR-0187 decision 13): the direct-members
+    read lost a tile the artist dragged into a sub-collection, silently and
+    with no message.  That was latent while the scene held a handful of drift
+    handles; the grid arrives as hundreds of tile objects at once, which the
+    artist will organise, so the loss goes from latent to routine.  The nested
+    `terrain` collection the importer now makes is itself a sub-collection, so
+    this read is what keeps the grid in the document at all.
+    """
     col = marker_collection(ob)
     if col is None:
         return []
     key = f"exmateria_map/{flag}"
-    return [o for o in col.objects if key in o]
+    return [o for o in col.all_objects if key in o]
 
 
 def section(ob, name, default=None):
@@ -405,14 +412,48 @@ def divergence(me, rep):
 # §2 / §6 / §7 — `terrain` and the grid extent.
 # ---------------------------------------------------------------------------
 
-def tile_record(ob, rep):
+def pre_growth_extent(ob):
+    """The BASE map's own extent -- the boundary `build._classify_terrain`
+    classifies a record against (schema §7.2), or `None`.
+
+    Read off `base.terrain_tiles`, which ADR-0187 decision 1 carries straight
+    from the base map's `0x68` chunk.  **Not** from `terrain_grid`: that field
+    is the *target* extent and grows the moment the artist types (decision 16),
+    so a grown document that was saved and reopened would report its grown edge
+    as the base's and then refuse every record its own growth made legal.
+    Decision 3 names `size_x_shadow`/`size_z_shadow`, and that is the fallback
+    here -- it is the same number for an ungrown document and the only one
+    available to a scene with no carried grid.
+    """
+    base = section(ob, "base") or {}
+    rows = base.get("terrain_tiles") or []
+    if rows:
+        return (max(int(r[0]) for r in rows) + 1,
+                max(int(r[1]) for r in rows) + 1)
+    g = flagged(ob, "grid")
+    if not g:
+        return None
+    sx, sz = g[0].get("size_x_shadow"), g[0].get("size_z_shadow")
+    if not isinstance(sx, int) or not isinstance(sz, int):
+        return None
+    return sx, sz
+
+
+def tile_record(ob, rep, pre_extent=None, drift=frozenset()):
     """One flagged tile object -> its record, or None when it declares nothing.
 
     A declared field is one whose `<field>_declared` twin is set (§1, §6.3) --
-    NOT one whose value is merely present.  Growth seeds a tile's values from a
-    neighbour and the drift checker shows the base's, both undeclared; "an
-    absent field is not zero" (schema §7.2) is what makes the two states
-    different things."""
+    NOT one whose value is merely present.  Since ADR-0187 decision 3 every
+    tile carries the base's twenty values, all of them undeclared, so "the
+    value is there" stopped being able to mean anything at all.
+
+    The tile's CLASS is derived, never read off a stored flag (decision 3): a
+    tile inside `pre_extent` that `drift` does not name is a **carried tile**
+    and may declare nothing, one that `drift` names may declare
+    `DRIFT_FIELDS`, and one outside `pre_extent` is growth-created and may
+    declare the lot.  That is `build._classify_terrain`'s rule, and mirroring
+    it here is decision 12 -- before it, export wrote documents `build` then
+    refused one record at a time."""
     where = f"tile object {ob.name!r}"
     rec = {}
     for key, lo, hi in (("x", 0, 255), ("z", 0, 127), ("level", 0, 1)):
@@ -422,10 +463,19 @@ def tile_record(ob, rep):
             return None
         rep.ranged(where, key, val, lo, hi)
         rec[key] = val
-    kind = ob.get("exmateria_map/tile", TILE_IMPORTED)
+    x, z, level = rec["x"], rec["z"], rec["level"]
+    where = f"{where} ({x}, {z}, L{level})"
     declared = [k for k in TILE_PAYLOAD_FIELDS
                 if bool(ob.get(k + "_declared")) and k in ob.keys()]
-    if kind == TILE_DRIFT:
+    pre_growth = (pre_extent is not None
+                  and x < pre_extent[0] and z < pre_extent[1])
+    is_drift = pre_growth and (x, z) in drift
+    if declared and pre_growth and not is_drift:
+        rep.refuse(f"{where}: that tile is still the base's -- it is inside "
+                   f"the pre-growth {pre_extent[0]}x{pre_extent[1]} extent and "
+                   f"the drift checker does not name it (decisions 3, 11, 12); "
+                   f"it declares {', '.join(sorted(declared))}")
+    if is_drift:
         # §5.1.3 / decision 23 -- on a tile the drift checker named, the pin
         # bytes stay unreachable.  A growth-created tile may declare the lot.
         for k in declared:
@@ -436,7 +486,7 @@ def tile_record(ob, rep):
         val = ob[k]
         if isinstance(val, (bool, float)):
             val = int(val)
-        if kind == TILE_DRIFT and k in DRIFT_RANGES:
+        if is_drift and k in DRIFT_RANGES:
             rep.ranged(where, k, val, *DRIFT_RANGES[k])
         rec[k] = val
     # §7.4: {x, z, level} plus nothing declared is not a record at all.
@@ -447,7 +497,14 @@ def export_terrain(ob, rep):
     """Level-0 records from the flagged tile objects + level-1 records from the
     marker's carried section.  `null` when nothing is declared — never `[]`
     (§2)."""
-    recs = [r for r in (tile_record(t, rep) for t in flagged(ob, "tile")) if r]
+    # The classification is computed ONCE and handed down, exactly as
+    # `build._classify_terrain` computes it once per document (decision 12).
+    # `authoring` imports this module, so the reverse import is local.
+    from .authoring import drifted
+    pre_extent = pre_growth_extent(ob)
+    drift = frozenset(drifted(ob))
+    recs = [r for r in (tile_record(t, rep, pre_extent, drift)
+                        for t in flagged(ob, "tile")) if r]
     carried = section(ob, "terrain") or []
     level1 = [r for r in carried if r.get("level", 0) == 1]
     recs.sort(key=lambda r: (r["z"], r["x"]))
@@ -576,16 +633,20 @@ def image_indices(img):
     R holds the exact 0..15 index per pixel (import writes it that way, and
     0..15 is exact in float32).  PNG row 0 is the TOP scanline and Blender's
     pixel row 0 is the BOTTOM, so rows flip on the way out — the inverse of
-    import's `_index_image`."""
+    import's `_index_image`.
+
+    MAIN THREAD, and one of the three hard blocks ADR-0186 Amendment 13
+    decision 55 ranks above the worker: `push_gather` calls it once per sheet
+    and five of them cost 102 ms of a 235 ms block.  The per-texel walk it
+    replaces was 20.4 ms a sheet; this is 0.35 ms.  Byte-identical because
+    `round()` and `numpy.rint` are the same rounding (both round half to
+    even) and the mask is the same mask — and because R holds 0..15, which is
+    exact in float32, the rounding never actually has a tie to break."""
     w, h = img.size
-    buf = array.array("f", bytes(4 * w * h * 4))
+    buf = numpy.empty(w * h * 4, dtype=numpy.float32)
     img.pixels.foreach_get(buf)
-    out = bytearray(w * h)
-    for y in range(h):
-        src, row = (h - 1 - y) * w, y * w
-        for x in range(w):
-            out[row + x] = int(round(buf[(src + x) * 4])) & 0xF
-    return bytes(out)
+    return (numpy.rint(buf.reshape(h, w, 4)[:, :, 0]).astype(numpy.uint8)
+            & 0xF)[::-1].tobytes()
 
 
 def set_image_indices(img, indices):
@@ -601,16 +662,21 @@ def set_image_indices(img, indices):
     re-pack moves every island, and the compiled **Sheet** is carried through
     that same blit rather than left picturing a layout the mesh no longer
     uses.
+
+    MAIN THREAD, and the other half of Amendment 13 decision 55: it is ~25 ms
+    of `land_compile`'s 74 ms block, and 1.0 ms after.  The row flip is a
+    `[::-1]` view rather than a loop, which is what keeps it the visible
+    inverse of `image_indices` above.  `reshape` also gives the size mismatch
+    a name: the loop it replaces would quietly write a short plane and leave
+    the rest of the image holding the last compile's indices.
     """
     w, h = img.size
-    buf = array.array("f", bytes(4 * w * h * 4))
-    for y in range(h):
-        src, dst = y * w, (h - 1 - y) * w
-        for x in range(w):
-            at = (dst + x) * 4
-            buf[at] = float(indices[src + x] & 0xF)
-            buf[at + 3] = 1.0
-    img.pixels.foreach_set(buf)
+    plane = (numpy.frombuffer(indices, dtype=numpy.uint8) & 0xF
+             ).reshape(h, w).astype(numpy.float32)[::-1]
+    buf = numpy.zeros((h, w, 4), dtype=numpy.float32)
+    buf[:, :, 0] = plane
+    buf[:, :, 3] = 1.0
+    img.pixels.foreach_set(buf.ravel())
     img.update()
     try:
         img.pack()          # or it reloads BLANK, which is index 0 everywhere
@@ -618,30 +684,144 @@ def set_image_indices(img, indices):
         pass
 
 
-def image_rgb(img):
-    """The true-colour picture behind one image, three bytes per texel.
+#: Scanlines per band in `rgb_from_floats`.  64 rows of a 4x Painting is
+#: ~3 MB of float64, which stays in cache; the whole picture at once is
+#: 302 MB and measures six times slower for the same arithmetic.
+_BAND = 64
 
-    The inverse of `convert_op._write_art`: that buffer is TOP-scanline-first
-    like the sidecar PNG and Blender's pixel row 0 is the BOTTOM.  The image
-    is `Non-Color` and holds `byte / 255`, so a read back is the byte again --
-    the same exactness `paint.py`'s gate relies on, and the reason a painting
-    survives a save without drifting a channel.
+
+def image_floats(img):
+    """MAIN THREAD -- one image's raw float RGBA, and the size it came at.
+
+    The half of `image_rgb` that touches `bpy`, and the only half that has to
+    be on the main thread.  `foreach_get` is a C copy; splitting it out is
+    what lets the per-pixel walk below run in a worker, which at a 4x Painting
+    is the difference between a compile and a 2.2 s freeze (ADR-0186
+    Amendment 10, measured: 0.08 s at 1x, **2.20 s at 4x**).
     """
     w, h = img.size
     buf = array.array("f", bytes(4 * w * h * 4))
     img.pixels.foreach_get(buf)
-    out = bytearray(3 * w * h)
-    for y in range(h):
-        src, dst = (h - 1 - y) * w, y * w
-        for x in range(w):
-            at, j = 3 * (dst + x), (src + x) * 4
-            out[at] = int(round(buf[j] * 255.0)) & 0xFF
-            out[at + 1] = int(round(buf[j + 1] * 255.0)) & 0xFF
-            out[at + 2] = int(round(buf[j + 2] * 255.0)) & 0xFF
-    return bytes(out)
+    return buf, w, h
 
 
-def export_source_art(ob, states, base):
+def rgb_from_floats(buf, w, h):
+    """Float RGBA -> three bytes per texel, top scanline first.  No `bpy`.
+
+    The hottest thing in the addon -- 12.6 M texels at a 4x Painting, and
+    ~65 % of the compile worker before this (ADR-0186 Amendment 13).  Measured
+    in Blender on MAP022 a0 at the shipped 4x: **611 ms -> 17 ms**, and
+    byte-identical to the strided-slice walk it replaces.
+
+    The inverse of `convert_op._write_art`: that buffer is TOP-scanline-first
+    like the sidecar PNG and Blender's pixel row 0 is the BOTTOM.
+
+    **The scale is done in float64, and that is not a detail.**  The loop this
+    replaces computed `round(v * 255.0)` in Python floats, which is float64,
+    and a float32 times 255 needs at most 32 mantissa bits -- so it rounded
+    the EXACT product.  `a * 255.0` on a float32 array stays in float32 and
+    rounds the product first.  Amendment 13 verified the float32 form
+    byte-identical, and it is -- on the buffers it was measured against, which
+    hold `byte / 255`.  The Painting is a `float_buffer=True` image and a
+    brush can leave any float32 in it: over 67 M uniform-random float32
+    values the two disagree on **379**, and the adversarial case is
+    reproducible (`v = 0.0019607844` scales to 0.5000000295, which rounds to
+    1 exactly and to 0 in float32).  Amendment 15 records it as the third
+    exactness trap.
+
+    An exact tie is impossible, which is why only the product's precision
+    matters: `v * 255 = k + 0.5` needs `v` to have 510 in its denominator, and
+    510 is not a power of two.
+
+    In BANDS of 64 scanlines, which is not a memory dodge -- it is faster.  A
+    whole-picture float64 temporary at 4x is 302 MB and misses cache on every
+    pass; 64 rows stay in L2 and the same arithmetic measures 15.7 ms against
+    101.5 ms.  (The float32 whole-picture form, which is also wrong, measures
+    92.1 ms.)
+
+    `astype(uint8)` reproduces the old `& 0xFF` on every finite input,
+    negative and out-of-range included -- checked against `round(v * 255) &
+    0xFF` for values from -3921.6 to +3921.6.  A NaN or an infinity is the one
+    place they part: the old loop raised `ValueError` / `OverflowError` and
+    this returns 0, which is the better of the two but is a change.
+    """
+    a = numpy.frombuffer(buf, dtype=numpy.float32).reshape(h, w, 4)[:, :, :3]
+    out = numpy.empty((h, w, 3), dtype=numpy.uint8)
+    for y0 in range(0, h, _BAND):
+        y1 = min(y0 + _BAND, h)
+        scaled = numpy.multiply(a[y0:y1], 255.0, dtype=numpy.float64)
+        numpy.rint(scaled, out=scaled)
+        out[y0:y1] = scaled.astype(numpy.uint8)
+    # Blender's row 0 is the BOTTOM one.
+    return out[::-1].tobytes()
+
+
+#: The last masters a compile derived, by the buffer they were derived FROM.
+#: Two entries: a push assembles one painting and an export may hold the
+#: previous one still.
+_MASTERS = {}
+
+#: A cap, because one entry is 12.6 MB at N = 4 and this is a session-long
+#: dict.  Small on purpose: a miss costs the walk, which is what used to
+#: happen every time.
+_MASTERS_KEEP = 2
+
+
+def master_key(buf):
+    """What names a master: a sha256 of the FLOAT buffer it came from.
+
+    Not `zlib.crc32`, which is cheaper (14.2 ms against 24.6 ms on a 4x
+    Painting) and is what `settle_op.canvas_digest` uses.  That one is a change
+    DETECTOR, where a collision costs one skipped settle; this one keys a value
+    that goes on to name a sidecar file through `sha256(rgb)`, so a collision
+    would write one painting's bytes under another's name.  The 10 ms buys the
+    key the same strength as the identity it feeds -- `canvas_digest`'s own
+    docstring draws exactly this line.
+    """
+    return hashlib.sha256(memoryview(buf)).digest()
+
+
+def remember_master(buf_key, w, h, rgb):
+    """Deposit a master a WORKER already derived, for the export that follows.
+
+    `land_compile` calls this with the compile's own `master`.  Without it the
+    settle derives the same 12.6 M texels twice a second apart -- once on the
+    compile's thread and once inside `assemble`, on the main thread, where it
+    measured **1.2 s** of frozen Blender per settle at N = 4.
+    """
+    if len(_MASTERS) >= _MASTERS_KEEP:
+        _MASTERS.clear()
+    _MASTERS[(buf_key, w, h)] = rgb
+
+
+def forget_masters():
+    """For the harnesses, and for anything that wants the walk proved."""
+    _MASTERS.clear()
+
+
+def image_rgb(img):
+    """The true-colour picture behind one image, three bytes per texel.
+
+    Both halves, on the caller's thread -- which is every caller but the
+    compile's, whose read and whose walk happen on different ones.
+
+    **Served from `_MASTERS` when the compile already derived it.**  The key is
+    the float buffer's own sha256, so this can only answer for the exact pixels
+    it was deposited against: a reload, an undo, a stroke, another tool's write
+    all move the key and take the walk.  The read (`foreach_get`, 28 ms) and
+    the key (24.6 ms) are paid either way; what a hit skips is the 1.2 s walk.
+    """
+    buf, w, h = image_floats(img)
+    key = (master_key(buf), w, h)
+    hit = _MASTERS.get(key)
+    if hit is not None:
+        return hit
+    rgb = rgb_from_floats(buf, w, h)
+    remember_master(key[0], w, h, rgb)
+    return rgb
+
+
+def export_source_art(ob, states, base, rep=None, sidecars=True):
     """The **Painting**, written beside the document (ADR-0186 dec. 4, 5, 6).
 
     Decision 4: the compile has no inverse, so the painting cannot be
@@ -657,30 +837,80 @@ def export_source_art(ob, states, base):
     paintings share one file whatever the encoder was feeling -- the same rule
     `export_sheets` uses, where the name comes from the packed 4bpp.
 
-    Returns `(files, section)`.  Both are EMPTY on an unconverted map: the
-    section is emitted only when there is something in it, so a document that
-    never met the compile round-trips byte for byte as it always has.
+    **The SCALE is read off the picture** (Amendment 10 decision 43), never
+    stored: a painting is `256k x 1024k` for k in `resample.SCALES`, and the
+    name carries `@Nx` for k > 1 only.  Tagging `@1x` would change every
+    existing key in this section and break the whole-document
+    `export(import(doc)) == doc` identity asserted over all 148 arrangements,
+    so bare means 1x and the suffix lands on decision 7's shape a third time:
+    *absence is the declaration*.  All of a document's paintings must AGREE on
+    k -- N belongs to the map, not to a state -- and that agreement is the
+    check, which is why no field is needed to make one.
+
+    **It REFUSES rather than dropping.**  This read
+    `!= (SHEET_W, SHEET_H): continue`, so a Painting that was not exactly
+    256x1024 left the document with nothing said.  Decision 4 makes the
+    Painting the irreplaceable half of an authored map and decision 11 exists
+    because "an artist who painted detail and got back a blur, with nothing
+    saying so, has no way to find out why".  Widening the size check was never
+    the fix.  Import takes the OPPOSITE posture on the same fact and warns --
+    "an import that lost a file must still open; it is the export that
+    refuses" (schema 7.3b).
+
+    **The hash is over the RGB, so `sidecars=False` costs the caller nothing
+    but the file.**  The section, its keys and the digests are identical
+    either way; only `files` is left empty.  A 4x Painting encodes in **0.9 s**
+    (a per-pixel Sub filter plus `zlib` level 9) and the live push throws the
+    result away, which is the whole reason the flag exists.
+
+    Returns `(files, section, digests)`.  All are EMPTY on an unconverted map:
+    the section is emitted only when there is something in it, so a document
+    that never met the compile round-trips byte for byte as it always has.
     """
+    from . import resample
     from .convert_op import source_art_name
     stem = f"{base['map']}.a{base['arrangement']}"
     files, out, by_hash, digests = {}, {}, {}, {}
+    scales = {}
     for i, st in enumerate(states):
         sheet = st.get("texture_sheet")
         if not sheet:
             continue
         img = bpy.data.images.get(source_art_name(sheet))
-        if img is None or tuple(img.size) != (SHEET_W, SHEET_H):
+        if img is None:
             continue
+        w, h = tuple(img.size)
+        n = resample.scale_of(w, h)
+        if n is None:
+            if rep is not None:
+                rep.refuse(
+                    f"painting {img.name} is {w}x{h}, which is not a legal "
+                    f"Painting: it must be 256k x 1024k for k in "
+                    f"{list(resample.SCALES)} (ADR-0186 Amendment 10 dec. 43). "
+                    "Resize it or delete it -- it will not be written")
+            continue
+        scales[img.name] = n
         rgb = image_rgb(img)
         full = hashlib.sha256(rgb).hexdigest()
         digests[sheet] = full
         digest = full[:8]
         name = by_hash.get(digest)
         if name is None:
-            name = by_hash[digest] = f"{stem}.source-{digest}.png"
-            files[name] = png_indexed.write_rgb_png(rgb, SHEET_W, SHEET_H)
+            tag = "" if n == 1 else f"@{n}x"
+            name = by_hash[digest] = f"{stem}.source-{digest}{tag}.png"
+            if sidecars:
+                files[name] = png_indexed.write_rgb_png(rgb, w, h)
             out[name] = {"states": []}
         out[name]["states"].append(i)
+    # N belongs to the MAP.  A document holding a 4x painting for one state and
+    # a 1x painting for another is incoherent, and the shrink in front of the
+    # compile would be handed two different answers to one question.
+    if rep is not None and len(set(scales.values())) > 1:
+        rep.refuse(
+            "this map's paintings disagree on scale: "
+            + ", ".join(f"{k} is {v}x" for k, v in sorted(scales.items()))
+            + ". N belongs to the map, not to a state (ADR-0186 Amendment 10 "
+              "dec. 43)")
     return files, out, digests
 
 
@@ -742,11 +972,14 @@ def majority_plte(indices, claims, clut_rows):
     return plte
 
 
-def export_sheets(ob, states, base):
+def export_sheets(ob, states, base, sidecars=True):
     """§4.5 — repack, re-hash, rename.
 
     Returns ({new sidecar name: PNG bytes}, {old name: new name},
-    {new sidecar name: the 4bpp blob}).  A sheet whose sidecar never decoded
+    {new sidecar name: the 4bpp blob}).  With `sidecars=False` the first is
+    EMPTY and the other two are unchanged -- the name is `sha256(packed)` and
+    never the PNG's, so a caller that wants the blob and the rename (the live
+    push wants exactly those) pays no encode.  A sheet whose sidecar never decoded
     has no buffer: its states keep the imported name and export writes no file
     for it, rather than inventing one.  Export writes its own files only and
     never deletes a stale sidecar.
@@ -796,9 +1029,10 @@ def export_sheets(ob, states, base):
         new = f"{stem}.sheet-{hashlib.sha256(packed).hexdigest()[:8]}.png"
         rename[old] = new
         blobs[new] = packed
-        files[new] = png_indexed.write_indexed_png(
-            indices, majority_plte(indices, claims.get(old, []), clut_rows),
-            SHEET_W, SHEET_H)
+        if sidecars:
+            files[new] = png_indexed.write_indexed_png(
+                indices, majority_plte(indices, claims.get(old, []), clut_rows),
+                SHEET_W, SHEET_H)
     return files, rename, blobs
 
 
@@ -841,13 +1075,21 @@ def readable_mesh(ob):
         bpy.ops.object.mode_set(mode="EDIT")
 
 
-def assemble(ob):
-    """`_assemble`, with the mesh made readable first. See `readable_mesh`."""
+def assemble(ob, sidecars=True):
+    """`_assemble`, with the mesh made readable first. See `readable_mesh`.
+
+    **`sidecars=False` is for a caller that wants the DOCUMENT and not the
+    files** -- the live push, which sends `rep.sheets` and `doc` and discards
+    the PNGs. It is not an optimisation flag to sprinkle: anything that writes
+    a bundle must leave it True, because `files` is what gets written and an
+    empty one writes a document whose sidecars are missing. Measured on MAP022
+    a0 at N = 4, it is 0.9 s of the push's main-thread half.
+    """
     with readable_mesh(ob):
-        return _assemble(ob)
+        return _assemble(ob, sidecars)
 
 
-def _assemble(ob):
+def _assemble(ob, sidecars=True):
     """The §2 table, end to end.  Returns (doc, sidecars, report).
 
     Refusals are collected, never raised: §9.4 evaluates them ALL first and
@@ -877,11 +1119,12 @@ def _assemble(ob):
     for entry in off_palette_list(ob):
         rep.refuse(f"off-palette colour {entry.get('color')}: "
                    f"{entry.get('count')} pixel(s), bbox {entry.get('bbox')}")
-    files, rename, rep.sheets = export_sheets(ob, states, base)
+    files, rename, rep.sheets = export_sheets(ob, states, base, sidecars)
     # BEFORE the rename: `source_art` keys its entries by STATE INDEX, and the
     # paintings are named from the sheet the marker knows, not from the hashed
     # name this export is about to give it.
-    art_files, source_art, art_digests = export_source_art(ob, states, base)
+    art_files, source_art, art_digests = export_source_art(
+        ob, states, base, rep, sidecars)
     files.update(art_files)
     # ADR-0186 Amendment 5: the Sheet is a cache and a stale one still ships
     # (decision 13), so this WARNS and never refuses.  It is free here -- the
@@ -1143,7 +1386,14 @@ class EXPORT_OT_interchange_document(Operator):
             self.report({"ERROR"}, problem)
             return {"CANCELLED"}
         with suspended():               # §6.1, as on the import side
+            # Decision 25 -- before `assemble` reads the mesh, and never
+            # inside it.  Imported here rather than at module scope because
+            # `compile_op` imports this module.
+            from .compile_op import ensure_compiled
+            compiled_notes = ensure_compiled(ob)
             doc, files, rep = assemble(ob)
+        for note in compiled_notes:
+            self.report({"INFO"}, note)
         ob["exmateria_map/last_export"] = json.dumps(rep.lines())
         # The Log carries what the artist would have READ, in order.
         # `rep.lines()` is refusals + warnings only, so on a clean export it is

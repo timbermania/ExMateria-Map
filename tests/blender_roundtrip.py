@@ -331,8 +331,269 @@ if tg:
 else:
     check("no_grid_when_absent", grid is None)
 
-l0 = [r for r in (doc.get("terrain") or []) if r.get("level", 0) == 0]
-for r in l0:
+# ============================== ADR-0187 §1: the tile's geometry (dec. 6, 7) ===
+# `build_tile` places the quad at `(height + depth) * 12` and lifts whichever
+# corners the slope type names by `slope_height * 12`.  GaneshaDx's `+1` display
+# nudge rides `delta_location.z`, NOT `co`, so `export_terrain`, the drift tests
+# and the lighting bake's BVH all still read the record's own number.
+#
+# The expectations below are transcribed from
+# `vendor/GaneshaDx/Resources/ContentDataTypes/Terrains/TerrainTile.cs:100-151`
+# and `Common/CommonLists.cs:92` in GaneshaDx's OWN vertex order, and are keyed
+# by WORLD CORNER rather than by our mesh's corner index.  That is deliberate:
+# GaneshaDx's V0..V3 walk (x, z), (x, z+1), (x+1, z+1), (x+1, z) while
+# `_plain_quad_mesh` walks (x, z), (x+1, z), (x+1, z+1), (x, z+1), so a lift
+# table transcribed straight across without swapping 1 and 3 MIRRORS every
+# incline -- and would still satisfy any check that only asked "did some corner
+# move".  Keying on world position is what makes that failure visible.
+GDX_LIFT = {
+    0:   (),            # Flat
+    133: (1, 2),        # InclineNorth
+    82:  (2, 3),        # InclineEast
+    37:  (0, 3),        # InclineSouth
+    88:  (0, 1),        # InclineWest
+    65:  (2,),          # ConvexNortheast
+    17:  (3,),          # ConvexSoutheast
+    20:  (0,),          # ConvexSouthwest
+    68:  (1,),          # ConvexNorthwest
+    150: (1, 2, 3),     # ConcaveNortheast
+    102: (0, 2, 3),     # ConcaveSoutheast
+    105: (0, 1, 3),     # ConcaveSouthwest
+    153: (0, 1, 2),     # ConcaveNorthwest
+}
+#: GaneshaDx vertex index -> (dx, dz) in tile units.
+GDX_CORNER = {0: (0, 0), 1: (0, 1), 2: (1, 1), 3: (1, 0)}
+
+
+def raw_fields(b):
+    """The four fields the geometry needs, straight off the 8 bytes.
+
+    Transcribed from `MeshResourceData.ProcessTerrain` -- byte 3's high three
+    bits are `depth`, its low five `slope_height` -- so this does not borrow
+    the addon's own decode."""
+    return {"height": b[2], "depth": b[3] >> 5,
+            "slope_height": b[3] & 0x1F, "slope_type": b[4]}
+
+
+def corner_heights(ob):
+    """{(dx, dz): world Z} for one tile object, read off the mesh."""
+    x, z = ob["x"], ob["z"]
+    out = {}
+    for v in ob.data.vertices:
+        dx = round((v.co[0] - x * mod.TILE_UNITS) / mod.TILE_UNITS)
+        dz = round((v.co[1] - z * mod.TILE_UNITS) / mod.TILE_UNITS)
+        out[(dx, dz)] = v.co[2]
+    return out
+
+
+def expected_heights(x, z, b):
+    f = raw_fields(b)
+    floor = (f["height"] + f["depth"]) * mod.HEIGHT_STEP
+    lift = f["slope_height"] * mod.HEIGHT_STEP
+    named = GDX_LIFT.get(f["slope_type"], ())      # an unlisted byte is Flat
+    return {GDX_CORNER[i]: floor + (lift if i in named else 0.0)
+            for i in range(4)}
+
+
+_geo_col = bpy.data.collections.new("adr0187_geometry")
+bpy.context.scene.collection.children.link(_geo_col)
+# One synthetic tile per slope byte, plus the flat/depth cases.  The corpus
+# only ships 8 of the 13 slope types on MAP001 a0, and a table is wrong in the
+# rows nobody looked at.
+_cases = [("flat", [0, 0, 5, 0, 0, 0, 0, 0]),
+          ("depth", [0, 0, 5, (3 << 5) | 0, 0, 0, 0, 0]),
+          ("depth_and_slope", [0, 0, 5, (2 << 5) | 4, 133, 0, 0, 0])]
+_cases += [(f"slope_{_b}", [0, 0, 7, (0 << 5) | 3, _b, 0, 0, 0])
+           for _b in sorted(GDX_LIFT)]
+# A slope byte no map uses: GaneshaDx falls back to Flat rather than throwing.
+_cases.append(("slope_unknown", [0, 0, 7, (0 << 5) | 3, 199, 0, 0, 0]))
+# Far outside any legal 18x18 grid, so these synthetic tiles cannot be mistaken
+# for the fixture's own by the checks that follow.
+for _i, (_label, _bytes) in enumerate(_cases):
+    _e = [200 + _i, 200, 0] + _bytes
+    _t = mod.build_tile(_e, _geo_col)
+    _want = expected_heights(200 + _i, 200, _bytes)
+    _got = corner_heights(_t)
+    check(f"adr0187_tile_geometry_{_label}",
+          all(abs(_got.get(k, 1e9) - v) < 1e-4 for k, v in _want.items()),
+          f"want {_want}, got {_got}")
+    # Decision 7: the +1 is a DISPLAY fact and lives nowhere near `co`.
+    check(f"adr0187_tile_nudge_{_label}",
+          abs(_t.delta_location[2] - 1.0) < 1e-6,
+          f"delta_location.z = {_t.delta_location[2]}")
+
+# The seed that proves the corner map is actually under test.  Copying
+# GaneshaDx's vertex indices onto OUR corner order without swapping 1 and 3
+# lifts a DIFFERENT pair of world corners -- the same COUNT of corners, at the
+# same height, mirrored about Z.  Assert the two readings disagree, or the
+# checks above would pass against either table.
+OUR_CORNER = {0: (0, 0), 1: (1, 0), 2: (1, 1), 3: (0, 1)}
+_mirrored = [b for b, lifts in GDX_LIFT.items()
+             if {GDX_CORNER[i] for i in lifts} != {OUR_CORNER[i] for i in lifts}]
+check("adr0187_geometry_seed_catches_a_mirrored_table",
+      len(_mirrored) == 8 and 133 in _mirrored and 82 in _mirrored,
+      f"only {len(_mirrored)} of the 13 slope bytes can tell the swapped and "
+      f"unswapped corner maps apart: {_mirrored}")
+for _o in list(_geo_col.objects):
+    bpy.data.objects.remove(_o, do_unlink=True)
+bpy.data.collections.remove(_geo_col)
+
+# ==================== ADR-0187 §1: one object per carried slot (dec. 3, 4, 5) ==
+# The tiles come from `base.terrain_tiles` now, not from `doc["terrain"]`.  An
+# untouched document declares NO record (decision 22) and still shows the whole
+# grid, which is the entire point of the ADR.
+LEVEL1_DEFAULT = [0, 0, 0, 0, 0, 0, 1, 0]
+_carried = doc["base"].get("terrain_tiles") or []
+check("adr0187_fixture_carries_the_grid",
+      len(_carried) == 2 * tg["size_x"] * tg["size_z"] and len(_carried) > 100,
+      f"{len(_carried)} carried rows; the checks below would be vacuous")
+
+_want_l0 = [e for e in _carried if e[2] == 0]
+_missing = [e[:3] for e in _want_l0
+            if bpy.data.objects.get(f"tile_{e[0]}_{e[1]}_L0") is None]
+check("adr0187_every_level_0_slot_has_an_object", not _missing,
+      f"{len(_missing)} level-0 slots have no tile object: {_missing[:5]}")
+
+# Decision 5: a level-1 object wherever the slot is not the format's default.
+# NOT `selectable`, which would hide the 977 corpus slots that are unselectable
+# and carry a real height -- a byte that is not the default is a byte someone
+# put there.
+_l1_real = [e for e in _carried if e[2] == 1 and e[3:] != LEVEL1_DEFAULT]
+_l1_default = [e for e in _carried if e[2] == 1 and e[3:] == LEVEL1_DEFAULT]
+check("adr0187_level_1_seed_has_both_populations",
+      len(_l1_real) > 0 and len(_l1_default) > 0,
+      f"{len(_l1_real)} non-default and {len(_l1_default)} default level-1 "
+      f"slots; the predicate below cannot be told from `always` or `never`")
+check("adr0187_level_1_object_where_the_slot_is_not_default",
+      all(bpy.data.objects.get(f"tile_{e[0]}_{e[1]}_L1") is not None
+          for e in _l1_real),
+      f"a non-default level-1 slot got no object: "
+      f"{[e[:3] for e in _l1_real if bpy.data.objects.get(f'tile_{e[0]}_{e[1]}_L1') is None][:5]}")
+check("adr0187_no_level_1_object_on_a_default_slot",
+      all(bpy.data.objects.get(f"tile_{e[0]}_{e[1]}_L1") is None
+          for e in _l1_default),
+      f"a default level-1 slot got an object: "
+      f"{[e[:3] for e in _l1_default if bpy.data.objects.get(f'tile_{e[0]}_{e[1]}_L1') is not None][:5]}")
+
+# The carried tile's geometry is the BASE's, and it declares nothing.
+_carried_ok = True
+_carried_detail = ""
+_declared_keys = {(r["x"], r["z"], r.get("level", 0))
+                  for r in (doc.get("terrain") or [])}
+for _e in _want_l0:
+    if (_e[0], _e[1], 0) in _declared_keys:
+        continue                    # a tile the document declares is not carried
+    _t = bpy.data.objects.get(f"tile_{_e[0]}_{_e[1]}_L0")
+    if _t is None:
+        continue
+    _w = expected_heights(_e[0], _e[1], _e[3:])
+    _g = corner_heights(_t)
+    if any(abs(_g.get(k, 1e9) - v) > 1e-4 for k, v in _w.items()):
+        _carried_ok, _carried_detail = False, f"tile {_e[:3]}: want {_w}, got {_g}"
+        break
+    if any(bool(_t.get(f + "_declared")) for f in mod.TILE_PAYLOAD_FIELDS):
+        _carried_ok = False
+        _carried_detail = (f"tile {_e[:3]} declares a field; a carried tile is "
+                           f"the base's and decision 22 makes that every tile")
+        break
+check("adr0187_carried_tiles_draw_the_base_and_declare_nothing",
+      _carried_ok, _carried_detail)
+
+# A carried tile SHOWS all twenty payload values -- read-only (decision 11),
+# but visible, which is what the sidebar draws as text.
+_t00 = bpy.data.objects.get("tile_0_0_L0")
+_e00 = next(e for e in _want_l0 if (e[0], e[1]) == (0, 0))
+check("adr0187_carried_tile_shows_every_payload_field",
+      _t00 is not None
+      and all(f in _t00.keys() for f in mod.TILE_PAYLOAD_FIELDS)
+      and _t00["surface_type"] == _e00[3] & 0x3F
+      and _t00["height"] == _e00[5],
+      "a carried tile hides the values the panel has to show")
+
+# ---- ADR-0187 decision 10: GaneshaDx's GetVertexColor, ported --------------
+# Transcribed from `TerrainTile.cs:164-201`, NOT read back off the addon: a
+# grey ramp by the VERTEX's own height (so a slope ramps across the tile), a
+# chequer on `(IndexX + IndexZ) % 2`, and `R += 32` on impassable or
+# unselectable.  The tab / hover / selection branches are Blender's job and
+# are deliberately not ported.
+def gdx_vertex_color(ix, iz, vertex_z, impassable, unselectable):
+    base = int(vertex_z / 12) * 7 + 16 + (0 if (ix + iz) % 2 == 0 else 8)
+    r, g, b = base + 16, base + 16, base
+    if impassable or unselectable:
+        r += 32
+    return (min(255, max(0, r)), min(255, max(0, g)), min(255, max(0, b)))
+
+
+def tile_colors(ob):
+    """The tile's colour attribute, read back as bytes, keyed by vertex."""
+    attr = ob.data.color_attributes.get(mod.TILE_COLOR_ATTR) \
+        if hasattr(mod, "TILE_COLOR_ATTR") else None
+    if attr is None:
+        return None
+    out = []
+    for i, v in enumerate(ob.data.vertices):
+        c = attr.data[i].color_srgb if attr.data_type == "BYTE_COLOR" \
+            else attr.data[i].color
+        out.append((round(c[0] * 255), round(c[1] * 255), round(c[2] * 255),
+                    round(v.co[2])))
+    return out
+
+
+_col_tiles = [o for o in bpy.data.objects
+              if o.name.startswith("tile_") and "exmateria_map/tile" in o]
+_col_bad = []
+_col_seen = set()
+_col_bumped = 0
+for _ct in _col_tiles:
+    _got = tile_colors(_ct)
+    if _got is None:
+        _col_bad.append((_ct.name, "no colour attribute"))
+        continue
+    if _ct.get("impassable") or _ct.get("unselectable"):
+        _col_bumped += 1
+    for _r, _g, _b, _vz in _got:
+        _want = gdx_vertex_color(_ct["x"], _ct["z"], _vz,
+                                 _ct.get("impassable"), _ct.get("unselectable"))
+        _col_seen.add((_r, _g, _b))
+        if (_r, _g, _b) != _want and len(_col_bad) < 6:
+            _col_bad.append((_ct.name, _vz, (_r, _g, _b), _want))
+check("adr0187_every_tile_carries_a_colour_attribute",
+      _col_tiles and all(tile_colors(_o) is not None for _o in _col_tiles),
+      f"{sum(1 for _o in _col_tiles if tile_colors(_o) is None)} of "
+      f"{len(_col_tiles)} tiles have no colour attribute")
+check("adr0187_tile_colour_is_ganeshadx_per_vertex", not _col_bad,
+      str(_col_bad[:4]))
+check("adr0187_tile_colour_arm_is_not_vacuous",
+      len(_col_seen) > 4 and _col_bumped > 0,
+      f"{len(_col_seen)} distinct colours over {len(_col_tiles)} tiles, "
+      f"{_col_bumped} of them impassable/unselectable -- a constant would pass")
+# One material, shared, and it READS the attribute: a per-tile copy would put
+# hundreds of materials in the file and a hardcoded colour would pass the
+# attribute checks above while showing the artist flat grey.
+_col_mats = {_o.data.materials[0] for _o in _col_tiles if _o.data.materials}
+check("adr0187_one_shared_tile_material", len(_col_mats) == 1,
+      f"{len(_col_mats)} distinct materials over {len(_col_tiles)} tiles")
+_col_mat = next(iter(_col_mats), None)
+_col_attr_nodes = [] if _col_mat is None else \
+    [n for n in _col_mat.node_tree.nodes if n.bl_idname == "ShaderNodeVertexColor"]
+check("adr0187_tile_material_reads_the_attribute",
+      len(_col_attr_nodes) == 1
+      and _col_attr_nodes[0].layer_name == mod.TILE_COLOR_ATTR,
+      str([(n.bl_idname, getattr(n, "layer_name", None))
+           for n in (_col_mat.node_tree.nodes if _col_mat else [])]))
+check("adr0187_tile_material_is_unlit",
+      _col_mat is not None
+      and any(n.bl_idname == "ShaderNodeEmission" for n in _col_mat.node_tree.nodes)
+      and not any(n.bl_idname == "ShaderNodeBsdfPrincipled"
+                  for n in _col_mat.node_tree.nodes),
+      "the grid is a display overlay; Blender's lighting must not touch it")
+
+# ---- decision 4: a DECLARED record lands on the object that is already there
+# The fixture declares one level-0 record.  Import must mark those fields
+# declared on the tile the carried grid already built, or an authored fix would
+# not survive a save-and-reopen -- and `export_terrain` reads declarations off
+# the objects and nowhere else.
+for r in [x for x in (doc.get("terrain") or []) if x.get("level", 0) == 0]:
     tob = bpy.data.objects.get(f"tile_{r['x']}_{r['z']}_L{r['level']}")
     if tob is None:
         check(f"tile_{r['x']}_{r['z']}", False, "missing tile object")
@@ -344,28 +605,25 @@ for r in l0:
     for k, want in r.items():
         if k in ("x", "z", "level"):
             continue
-        if k not in tob:
-            check(f"tile_declared_{r['x']}_{r['z']}", False, f"missing declared field {k}")
+        if not bool(tob.get(k + "_declared")):
+            check(f"tile_declared_{r['x']}_{r['z']}", False,
+                  f"declared field {k} did not reach the object")
             ok = False
             break
         if tob[k] != want or tob[f"{k}_shadow"] != want:
             ok = False
-    # absent field is NOT zero: an undeclared payload field has no property
+    # A field the record does not name stays UNDECLARED -- "an absent field is
+    # not zero".  It still carries the base's value; what it must not carry is
+    # the declaration.
     for k in mod.TILE_PAYLOAD_FIELDS:
         if k in r:
             continue
-        if k in tob:
-            check(f"tile_absent_{r['x']}_{r['z']}", False, f"undeclared field {k} has a property")
+        if bool(tob.get(k + "_declared")):
+            check(f"tile_absent_{r['x']}_{r['z']}", False,
+                  f"undeclared field {k} came back declared")
             ok = False
             break
     check(f"tile_{r['x']}_{r['z']}_props", ok)
-    # Z = height * 12, locked
-    h = r.get("height", 0) * mod.HEIGHT_STEP
-    check(f"tile_{r['x']}_{r['z']}_z", all(v.co.z == h for v in tob.data.vertices))
-lvl1 = [r for r in (doc.get("terrain") or []) if r.get("level", 0) != 0]
-for r in lvl1:
-    check(f"tile_lvl{r['level']}_absent_{r['x']}_{r['z']}",
-          bpy.data.objects.get(f"tile_{r['x']}_{r['z']}_L{r['level']}") is None)
 
 # materials (import-v1 §4)
 check("two_slots", len(me.materials) == 2, f"slots={len(me.materials)}")
@@ -1219,11 +1477,15 @@ check("export_clean_no_refusals", not _rep.refusals, str(_rep.refusals[:4]))
 check("export_clean_no_divergence",
       not _rep.divergence and _rep.new_faces == 0,
       f"{dict(_rep.divergence)} new={_rep.new_faces}")
-# `terrain` is null on a dump document and a LIST here: the fixture declares
-# one level-0 record, so the tile-object leg is exercised, not vacuous.
+# ADR-0187 decision 22: an untouched document declares NO terrain, and since
+# decision 3 it shows the whole grid anyway.  The tile-object export leg is not
+# vacuous for that -- it is exercised where a declaration is LEGAL, by
+# `drift_fix_reaches_the_document` (a drift-named tile) and
+# `growth_declared_field_reaches_the_document` (a growth-created one).  Those
+# are the only two classes `build` accepts a record for, so testing the leg on
+# a carried tile only ever tested a document `build` rejects.
 check("export_terrain_from_tile_objects",
-      _doc["terrain"] == doc["terrain"] and isinstance(_doc["terrain"], list)
-      and len(_doc["terrain"]) == 1, str(_doc["terrain"]))
+      _doc["terrain"] is None and doc["terrain"] is None, str(_doc["terrain"]))
 check("export_grid_from_grid_object",
       _doc["base"]["terrain_grid"] == {"size_x": 10, "size_z": 13},
       str(_doc["base"]["terrain_grid"]))
@@ -1476,21 +1738,119 @@ check("export_growth_reaches_document",
       str(_gr_doc["base"]["terrain_grid"]))
 _grid["size_x"] = 10
 
-# ---- §5.1.3 the drift record's pin bytes (decision 23) --------------------
+# ---- ADR-0187 decision 12: export mirrors `build`'s classification --------
+# `tile_record` enforced decision 23's three-field limit only when a STORED
+# kind flag read "drift", and nothing mirrored `_classify_terrain`'s pre-growth
+# refusal at all -- so export and `build` disagreed about what was legal, and
+# the addon would happily write a document `build` rejects one record at a
+# time.  Decision 3 deletes the stored kind, so the class is DERIVED here the
+# way `build` derives it: inside the base map's own extent and not named by the
+# drift checker is a CARRIED tile, and a carried tile declares nothing.
+#
+# The drift and growth arms of the same rule are exercised where those classes
+# actually exist -- `drift_pin_byte_still_refuses` and
+# `growth_declared_field_reaches_the_document` -- because a class cannot be
+# faked here by writing a property: it is recomputed from the mesh every time.
 _tile = exp.flagged(obx, "tile")[0]
 check("export_tile_object_is_flagged",
-      _tile.get("exmateria_map/tile") == "imported",
-      str(_tile.get("exmateria_map/tile")))
-check("export_imported_tile_may_declare_anything",
-      not refusals_mentioning(exp.assemble(obx)[2], "drift record"),
-      "an IMPORTED tile was held to the drift rule")
-_tile["exmateria_map/tile"] = "drift"
+      "exmateria_map/tile" in _tile.keys(),
+      f"{_tile.name} carries no tile flag")
+check("adr0187_export_clean_before_the_carried_seed",
+      not exp.assemble(obx)[2].refusals,
+      f"the seed below could not be told from a standing refusal: "
+      f"{exp.assemble(obx)[2].refusals[:3]}")
+_tile["height_declared"] = True
 _r = exp.assemble(obx)[2]
-check("export_refuses_drift_pin_byte",
-      bool(refusals_mentioning(_r, "drift record", "surface_type")),
-      f"a drift record declaring surface_type passed: {_r.refusals[:3]}")
-_tile["exmateria_map/tile"] = "imported"
-check("export_drift_refusal_clears", not exp.assemble(obx)[2].refusals)
+check("adr0187_export_refuses_a_declaration_on_a_carried_tile",
+      bool(refusals_mentioning(_r, "still the base's")),
+      f"a carried tile declared a field and export passed it on to a `build` "
+      f"that refuses it: {_r.refusals[:3]}")
+check("adr0187_carried_refusal_names_the_tile",
+      any(f"({_tile['x']}, {_tile['z']}, L{_tile['level']})" in _x
+          for _x in _r.refusals),
+      str(_r.refusals[:3]))
+_tile["height_declared"] = False
+check("adr0187_carried_refusal_clears", not exp.assemble(obx)[2].refusals,
+      str(exp.assemble(obx)[2].refusals[:3]))
+
+# ---- ADR-0187 decision 13: the tiles are a NESTED collection --------------
+# Two claims, and the second is a bug that predates the grid: `flagged()` read
+# `col.objects`, which is the collection's DIRECT members only, so a tile the
+# artist dragged into a sub-collection left the document with no message.  With
+# 260 tile objects arriving at once the artist will organise them, so the
+# silent loss goes from latent to routine.  The toggle decision 13 asks for is
+# the nested collection's own visibility -- Blender's, not ours.
+# The expected population is recomputed from the carried rows, not read back
+# off `flagged()` -- which is the thing under test.
+_want_tiles = len([e for e in (doc["base"].get("terrain_tiles") or [])
+                   if e[2] == 0 or list(e[3:11]) != LEVEL1_DEFAULT])
+_terr = next((c for c in exp.marker_collection(obx).children
+              if c.get("exmateria_map/terrain") is not None), None)
+check("adr0187_tiles_live_in_a_nested_collection", _terr is not None,
+      "the marker collection has no addon-owned child collection: "
+      + str([c.name for c in exp.marker_collection(obx).children]))
+check("adr0187_the_nested_collection_holds_the_tiles",
+      _terr is not None
+      and len([o for o in _terr.objects if "exmateria_map/tile" in o]) == _want_tiles,
+      f"{0 if _terr is None else len(_terr.objects)} objects in the child "
+      f"collection, {_want_tiles} carried slots want an object")
+check("adr0187_the_marker_stays_a_direct_member",
+      exp.marker_collection(obx).objects.get(obx.name) is obx,
+      "the marker moved out of its own collection, so `marker_collection` "
+      "would resolve somewhere else")
+
+# ...and it arrives CLOSED.  Reported from use: 260 tiles land on top of the
+# map, and the thing the artist opened a map to look at is under them.  The
+# grid is still "shown" in the sense ADR-0187 means -- it exists, it is one
+# toggle away, and the toggle is Blender's own.  The EYE, not the checkbox:
+# `exclude` takes the collection out of the view layer's depsgraph, which is a
+# different claim than "I am not looking at this right now".
+_terr_lc = mod._layer_collection(bpy.context.view_layer, _terr) if _terr else None
+check("adr0187_the_grid_has_a_layer_collection",
+      _terr_lc is not None,
+      "the nested collection has no handle in the view layer, so nothing "
+      "below can be read as hidden-or-not")
+check("adr0187_the_grid_is_hidden_after_import",
+      _terr_lc is not None and _terr_lc.hide_viewport,
+      "the terrain collection's eye is open on arrival")
+check("adr0187_the_grid_is_hidden_not_excluded",
+      _terr_lc is not None and not _terr_lc.exclude,
+      "the grid was EXCLUDED from the view layer rather than hidden")
+check("adr0187_a_hidden_grid_still_reaches_the_document",
+      len(exp.flagged(obx, "tile")) == _want_tiles,
+      f"{len(exp.flagged(obx, 'tile'))} tiles reach the export with the "
+      f"collection hidden, {_want_tiles} expected -- hiding must be a display "
+      f"fact and nothing else")
+
+# The recursion, proven two levels deep: a one-level special case would pass a
+# `children` loop and still lose this tile.
+_deep = bpy.data.collections.new("adr0187_deep")
+(_terr or exp.marker_collection(obx)).children.link(_deep)
+_moved = exp.flagged(obx, "tile")[0]
+for _c in list(_moved.users_collection):
+    _c.objects.unlink(_moved)
+_deep.objects.link(_moved)
+check("adr0187_moved_tile_is_not_a_direct_member",
+      exp.marker_collection(obx).objects.get(_moved.name) is None,
+      "the seed did not actually move the tile, so the two checks below "
+      "cannot fail")
+check("adr0187_flagged_finds_a_tile_two_collections_down",
+      _moved in exp.flagged(obx, "tile"),
+      f"{_moved.name} dropped out of the document when it was dragged into a "
+      f"sub-collection")
+# ...and the consequence at the document seam: a refusal that must fire cannot
+# fire on a tile export cannot see.
+_moved["height_declared"] = True
+check("adr0187_a_tile_in_a_sub_collection_still_reaches_the_document",
+      bool(refusals_mentioning(exp.assemble(obx)[2], "still the base's")),
+      "a declaring carried tile in a sub-collection was exported in silence")
+_moved["height_declared"] = False
+for _c in list(_moved.users_collection):
+    _c.objects.unlink(_moved)
+(_terr or exp.marker_collection(obx)).objects.link(_moved)
+bpy.data.collections.remove(_deep)
+check("adr0187_nesting_arms_restored", not exp.assemble(obx)[2].refusals,
+      str(exp.assemble(obx)[2].refusals[:3]))
 
 # ---- §3.6 / §4.4 the sticky off-palette list ------------------------------
 obx["exmateria_map/off_palette"] = json.dumps(
@@ -1830,6 +2190,12 @@ clear_scene()
 run_import(staged)
 obg = bpy.data.objects.get(name)
 _g = exp.flagged(obg, "grid")[0]
+# ADR-0187 decision 3: the pre-growth extent already carries an object per
+# tile, so growth's baseline is the whole grid rather than the fixture's single
+# declared record.  What growth adds is still only what is OUTSIDE that extent.
+_g_before = len(exp.flagged(obg, "tile"))
+check("adr0187_growth_baseline_is_the_whole_grid", _g_before >= 130,
+      f"{_g_before} tile objects before growth")
 check("growth_widget_seeded_from_import",
       (_g.exmateria_map_size_x, _g.exmateria_map_size_z) == (10, 13),
       f"{_g.exmateria_map_size_x}x{_g.exmateria_map_size_z}")
@@ -1839,7 +2205,8 @@ check("growth_preview_zero_on_untouched",
       f"-- the pre-growth extent is the `_shadow` twin, not zero")
 _res = bpy.ops.exmateria_map.apply_growth()
 check("growth_apply_on_untouched_creates_nothing",
-      len(exp.flagged(obg, "tile")) == 1, str(len(exp.flagged(obg, "tile"))))
+      len(exp.flagged(obg, "tile")) == _g_before,
+      str(len(exp.flagged(obg, "tile"))))
 
 # Typing the field grows the DOCUMENT's extent; the button only makes handles.
 _g.exmateria_map_size_x = 12
@@ -1851,7 +2218,8 @@ check("growth_field_reaches_the_document",
 check("growth_field_resized_the_footprint",
       abs(max(v.co[0] for v in _g.data.vertices) - 12 * 28) < 1e-3,
       str(max(v.co[0] for v in _g.data.vertices)))
-check("growth_field_created_no_objects", len(exp.flagged(obg, "tile")) == 1,
+check("growth_field_created_no_objects",
+      len(exp.flagged(obg, "tile")) == _g_before,
       "typing the extent created tile objects; §7.1 says it must not")
 _pv = au.growth_preview(obg)
 check("growth_preview_counts_the_new_column", _pv["created"] == 2 * 13,
@@ -1863,12 +2231,54 @@ check("growth_preview_pin_number_is_na", _pv["externally_pinned"] is None,
 _res = bpy.ops.exmateria_map.apply_growth()
 check("growth_apply_finished", _res == {"FINISHED"}, str(_res))
 check("growth_apply_created_the_new_column",
-      len(exp.flagged(obg, "tile")) == 1 + 2 * 13,
+      len(exp.flagged(obg, "tile")) == _g_before + 2 * 13,
       str(len(exp.flagged(obg, "tile"))))
 check("growth_apply_is_idempotent",
       bpy.ops.exmateria_map.apply_growth() == {"FINISHED"}
-      and len(exp.flagged(obg, "tile")) == 1 + 2 * 13,
+      and len(exp.flagged(obg, "tile")) == _g_before + 2 * 13,
       "a second apply created more handles")
+# ADR-0187 site 9: the growth SEED read the same unfiltered set `sync_drift`
+# did.  §7.2 seeds a new handle from "an existing record's values when there is
+# one"; the code took `next(iter(_tile_objects(ob)))`, which was that only
+# while a handful of declaring objects existed.  With the grid shown it is an
+# arbitrary CARRIED tile -- here (0, 0), whose bytes are the base map's -- so
+# every new handle arrives wearing another tile's height and surface type.
+_seeded = [t for t in exp.flagged(obg, "tile")
+           if t["x"] >= 10 or t["z"] >= 13]
+_zero = bpy.data.objects["tile_0_0_L0"]
+check("adr0187_growth_seed_arm_is_not_vacuous",
+      (_zero.get("height"), _zero.get("surface_type")) != (0, 3)
+      and _zero.get("height") != 0,
+      f"tile (0,0) already looks like the default seed "
+      f"(height={_zero.get('height')}), so the check below cannot fail")
+check("adr0187_growth_seeds_the_default_not_a_carried_neighbour",
+      all(t.get("height") == 0 and t.get("impassable") == 1
+          and all(t.get(_f) == 0 for _f in au.TILE_PAYLOAD_FIELDS
+                  if _f not in ("height", "impassable"))
+          for t in _seeded),
+      f"{len(_seeded)} new handles; the first reads "
+      + str({_f: _seeded[0].get(_f) for _f in au.TILE_PAYLOAD_FIELDS}
+            if _seeded else {}))
+
+# A growth handle is a tile of the same grid, so it wears decision 10's colour
+# and decision 10's one shared material.  Left grey it would read as a class of
+# its own, which is a distinction the ADR does not make.
+_gm = {_o.data.materials[0] for _o in _seeded if _o.data.materials}
+check("adr0187_growth_handles_share_the_tile_material",
+      _gm == {bpy.data.materials.get(mod.TILE_MATERIAL)},
+      str([_m.name for _m in _gm]))
+_g_col_bad = [(_o.name, _c[:3],
+               gdx_vertex_color(_o["x"], _o["z"], _c[3],
+                                _o.get("impassable"), _o.get("unselectable")))
+              for _o in _seeded for _c in (tile_colors(_o) or [])
+              if _c[:3] != gdx_vertex_color(_o["x"], _o["z"], _c[3],
+                                            _o.get("impassable"),
+                                            _o.get("unselectable"))]
+check("adr0187_growth_handles_are_coloured_the_same_way",
+      _seeded and all(tile_colors(_o) is not None for _o in _seeded)
+      and not _g_col_bad,
+      str(_g_col_bad[:3]) or "a growth handle carries no colour attribute")
+
 # Decision 20: growth writes NOTHING.  26 handles, none declared, so the
 # document's `terrain` is exactly the record it arrived with.
 _gd, _, _grep = exp.assemble(obg)
@@ -1877,9 +2287,25 @@ check("growth_handles_export_no_record", _gd["terrain"] == doc["terrain"],
 check("growth_export_has_no_refusals", not _grep.refusals, str(_grep.refusals[:3]))
 # ... and a DECLARED field on one of them does reach the document, or the
 # handles are decoration.
+# The growth arm of ADR-0187 decision 12's rule: a tile OUTSIDE the base map's
+# own extent is growth-created, and growth may declare the lot -- decision 23's
+# three-field limit is the drift class's, not everyone's.
+_pre = exp.pre_growth_extent(obg)
+check("adr0187_pre_growth_extent_is_the_base_maps",
+      _pre == (10, 13),
+      f"the pre-growth boundary reads {_pre}; it must be the BASE map's own "
+      f"extent, carried in `base.terrain_tiles`, not the grown target extent")
 _new = [t for t in exp.flagged(obg, "tile")
-        if t.get("exmateria_map/tile") == "growth"][0]
+        if t["x"] >= _pre[0] or t["z"] >= _pre[1]][0]
 au.declare(_new, "height", 7)
+_gnr = exp.assemble(obg)[2]
+check("adr0187_growth_tile_may_declare_anything",
+      not _gnr.refusals, str(_gnr.refusals[:3]))
+au.declare(_new, "surface_type", 5)
+check("adr0187_growth_tile_may_declare_a_pin_byte",
+      not exp.assemble(obg)[2].refusals,
+      str(exp.assemble(obg)[2].refusals[:3]))
+au.undeclare(_new, "surface_type")
 _gd2 = exp.assemble(obg)[0]
 _rec = [r for r in _gd2["terrain"]
         if (r["x"], r["z"]) == (_new["x"], _new["z"])]
@@ -1890,6 +2316,188 @@ check("growth_declared_field_reaches_the_document",
 au.undeclare(_new, "height")
 check("growth_undeclare_drops_the_record",
       exp.assemble(obg)[0]["terrain"] == doc["terrain"])
+
+# ADR-0187 decision 13, on the GROWTH path: a handle the button creates is a
+# tile of the same grid, so it belongs in the same nested `terrain` collection
+# the import built.  Linked into the marker collection beside the marker
+# instead, the collection visibility that IS decision 13's toggle cannot hide
+# it -- and decision 14's "one toggle covers both levels" quietly becomes one
+# toggle covering most tiles, which is the failure nobody reports because the
+# grid still mostly disappears.
+_gterr = next((c for c in exp.marker_collection(obg).children
+               if c.get("exmateria_map/terrain") is not None), None)
+check("adr0187_growth_arm_is_not_vacuous",
+      _gterr is not None and len(_seeded) == 2 * 13,
+      f"{len(_seeded)} growth handles, nested collection "
+      f"{None if _gterr is None else _gterr.name}")
+_g_outside = [_o.name for _o in _seeded
+              if _gterr is None or _gterr.objects.get(_o.name) is not _o]
+check("adr0187_growth_handles_join_the_nested_collection",
+      not _g_outside,
+      f"{len(_g_outside)} growth handles are outside the `terrain` "
+      f"collection, so the toggle cannot hide them: {_g_outside[:3]}")
+check("adr0187_growth_handles_are_not_direct_members_of_the_marker",
+      not [_o for _o in _seeded
+           if exp.marker_collection(obg).objects.get(_o.name) is _o],
+      "a growth handle is a direct member of the marker collection")
+
+# §7.2's seed is "an existing RECORD's values", and a record is what a tile
+# DECLARES.  `src` is the first tile carrying any declared field -- typically a
+# drift tile, whose other nineteen values are still the base map's bytes -- and
+# copying every key of `src` dresses each new handle in the base map after all,
+# by a different route.  Seed it here from a CARRIED tile, which is the same
+# shape and the one the fixture can build: only `height` is a record.
+au.declare(_zero, "height", 7)
+_g.exmateria_map_size_x = 13
+_res = bpy.ops.exmateria_map.apply_growth()
+_seeded2 = [t for t in exp.flagged(obg, "tile") if t["x"] == 12]
+check("adr0187_growth_seed_source_arm_is_not_vacuous",
+      _res == {"FINISHED"} and len(_seeded2) == 13
+      and _zero.get("surface_type") not in (0, None),
+      f"{len(_seeded2)} handles in the new column; the source tile reads "
+      f"surface_type={_zero.get('surface_type')}, so an undeclared copy "
+      f"would be invisible here")
+check("adr0187_growth_seed_takes_the_sources_declared_field",
+      all(t.get("height") == 7 for t in _seeded2),
+      str([t.get("height") for t in _seeded2[:4]]))
+_undecl = [(t.name, _f, t.get(_f)) for t in _seeded2
+           for _f in au.TILE_PAYLOAD_FIELDS
+           if _f != "height"
+           and t.get(_f) != (1 if _f == "impassable" else 0)]
+check("adr0187_growth_seed_defaults_what_the_source_did_not_declare",
+      not _undecl,
+      f"{len(_undecl)} field(s) copied off an undeclared value -- the base "
+      f"map's own bytes, reaching the new handle through the source tile: "
+      + str(_undecl[:3]))
+au.undeclare(_zero, "height")
+check("adr0187_growth_seed_arms_restored", not exp.assemble(obg)[2].refusals,
+      str(exp.assemble(obg)[2].refusals[:3]))
+
+# ---- ADR-0187 decision 11: the sidebar is READ-ONLY on a carried tile ------
+# `_tile` drew a declare-checkbox per payload field for anything carrying the
+# tile flag.  That was 20 checkboxes on objects that barely existed; with the
+# grid shown it is 20 checkboxes on every one of 260 tiles, and each of them
+# leads straight to `build` refusing with *"that tile is still the base's"*.
+# The values still SHOW -- read-only is not blank.
+#
+# Graded by what `draw` EMITS, onto a recording layout: a structural read of
+# the method would pass a panel that emits the checkboxes anyway.
+def _terrain_panel(tile_ob):
+    _sink, _drawn_ops, _drawn_labels = [], [], []
+
+    class _TL(_FakeLayout):
+        def label(self, text="", icon=None, **kw):
+            _drawn_labels.append(text)
+            _sink.append(icon)
+            return self
+
+        def operator(self, bl_idname, text="", icon=None, **kw):
+            class _Op:
+                pass
+            _drawn_ops.append(bl_idname)
+            _sink.append(icon)
+            return _Op()
+
+    _tl = _TL(_sink)
+    _cls = bpy.types.MAP_PT_terrain
+    _cls.draw(_panel_shim(_cls, _tl),
+              type("_Ctx", (), {"object": tile_ob, "scene": bpy.context.scene})())
+    return _drawn_ops, _drawn_labels, _sink
+
+
+_declare_id = au.MAP_OT_declare_field.bl_idname
+_carried_tile = next(t for t in exp.flagged(obg, "tile")
+                     if t["x"] < _pre[0] and t["z"] < _pre[1]
+                     and not any(au.is_declared(t, _f)
+                                 for _f in au.TILE_PAYLOAD_FIELDS))
+_c_ops, _c_labels, _c_icons = _terrain_panel(_carried_tile)
+check("adr0187_sidebar_offers_no_checkbox_on_a_carried_tile",
+      _c_ops.count(_declare_id) == 0,
+      f"{_c_ops.count(_declare_id)} declare-field checkboxes on a carried "
+      f"tile; every one of them leads to a `build` refusal")
+check("adr0187_sidebar_still_shows_every_payload_value",
+      all(any(_f + " = " in _t for _t in _c_labels)
+          for _f in au.TILE_PAYLOAD_FIELDS),
+      f"read-only became blank: {_c_labels[:4]}")
+check("adr0187_sidebar_says_the_tile_is_the_base_maps",
+      any("carried" in _t for _t in _c_labels),
+      f"the panel never names the class, so the missing checkboxes read as a "
+      f"bug: {_c_labels[:3]}")
+check("adr0187_sidebar_icons_valid_on_a_carried_tile",
+      all(_i is None or _i in bpy.types.UILayout.bl_rna.functions["prop"]
+          .parameters["icon"].enum_items for _i in _c_icons),
+      str(_c_icons))
+# ...and the one box that survives: a field the carried tile ALREADY declares.
+# That state is reachable -- a drift fix stays declared when the drift clears
+# (decision 4) -- and with no box the artist's only exit from decision 12's
+# refusal is a re-import that throws the rest of their work away.
+au.declare(_carried_tile, "height", 4)
+_w_ops, _w_labels, _ = _terrain_panel(_carried_tile)
+check("adr0187_a_carried_tile_can_still_WITHDRAW_a_declaration",
+      _w_ops.count(_declare_id) == 1,
+      f"{_w_ops.count(_declare_id)} checkboxes on a carried tile declaring one "
+      f"field; the artist must be able to take it back, and only that")
+au.undeclare(_carried_tile, "height")
+check("adr0187_withdrawing_restores_the_read_only_panel",
+      _terrain_panel(_carried_tile)[0].count(_declare_id) == 0,
+      "the box outlived the declaration it was there to withdraw")
+
+# The contrast arm: without it, a panel that emits nothing at all passes above.
+_g_ops, _g_labels, _ = _terrain_panel(_new)
+check("adr0187_sidebar_is_writable_on_a_growth_tile",
+      _g_ops.count(_declare_id) == len(au.TILE_PAYLOAD_FIELDS),
+      f"{_g_ops.count(_declare_id)} checkboxes on a growth tile, want "
+      f"{len(au.TILE_PAYLOAD_FIELDS)}")
+
+# ---- the class has to SURVIVE a save and a reopen --------------------------
+# Decision 3 deletes the stored kind as `build`'s authority, but the addon
+# still stamps one, and `build_terrain` stamped `imported` on EVERY object it
+# made -- including a tile rebuilt from a declared record OUTSIDE the base
+# map's extent, which is growth-created.  Reopen a grown document and the
+# sidebar would call that tile carried and read-only while `tile_record`
+# classified the same tile as growth and accepted all twenty fields.  Panel and
+# export disagreeing about one tile is the defect; agreeing is the check.
+au.declare(_new, "height", 7)
+_reopen_key = (_new["x"], _new["z"], _new["level"])
+_rdoc, _rfiles, _rrep = exp.assemble(obg)
+_RDIR = os.path.join(os.path.dirname(JSON), "reopen_out")
+os.makedirs(_RDIR, exist_ok=True)
+for _f in os.listdir(_RDIR):
+    os.unlink(os.path.join(_RDIR, _f))
+exp.write_bundle(_rdoc, _rfiles, _RDIR)
+check("adr0187_grown_document_reexports_the_growth_record",
+      not _rrep.refusals
+      and any((r["x"], r["z"]) == _reopen_key[:2] for r in _rdoc["terrain"]),
+      f"the seed never reached the document: {_rrep.refusals[:3]} "
+      f"{_rdoc['terrain']}")
+_rres = run_import(os.path.join(_RDIR, f"{name}.json"))
+check("adr0187_grown_document_reimports", _rres == {"FINISHED"}, str(_rres))
+_rob = bpy.data.objects.get(
+    f"tile_{_reopen_key[0]}_{_reopen_key[1]}_L{_reopen_key[2]}")
+check("adr0187_reopened_growth_tile_exists", _rob is not None,
+      "the declared record beyond the base extent rebuilt no object")
+check("adr0187_reopened_growth_tile_is_stamped_growth",
+      _rob is not None and _rob.get("exmateria_map/tile") == au.TILE_GROWTH,
+      f"stamped {None if _rob is None else _rob.get('exmateria_map/tile')!r}; "
+      f"the sidebar reads this and would call it carried and read-only")
+check("adr0187_reopened_growth_tile_is_writable_in_the_sidebar",
+      _rob is not None
+      and _terrain_panel(_rob)[0].count(_declare_id)
+      == len(au.TILE_PAYLOAD_FIELDS),
+      "the panel and `tile_record` disagree about this tile's class")
+# ...and the general form of the same rule, over every tile in the scene: the
+# flag the panel reads must say what `tile_record` derives.
+_rmark = bpy.data.objects.get(name)
+_rpre = exp.pre_growth_extent(_rmark)
+_rdrift = frozenset(au.drifted(_rmark))
+_class_bad = []
+for _t in exp.flagged(_rmark, "tile"):
+    _pre_growth = _t["x"] < _rpre[0] and _t["z"] < _rpre[1]
+    _stored_growth = _t.get("exmateria_map/tile") == au.TILE_GROWTH
+    if _stored_growth == _pre_growth and len(_class_bad) < 5:
+        _class_bad.append((_t.name, _t.get("exmateria_map/tile"), _rpre))
+check("adr0187_the_stamped_class_agrees_with_the_derived_one",
+      not _class_bad, str(_class_bad[:4]))
 
 # ---- §6 the drift checker --------------------------------------------------
 # MAP001.a0's two shipped polygons are both VERTICAL, so nothing covers a tile
@@ -1920,9 +2528,18 @@ check("drift_variant_covers_the_tile",
       f"must agree with dump's, or every tile reads as drifted on import")
 # Decision 22: an untouched document has no drift BY CONSTRUCTION.
 check("drift_zero_on_import", not au.drifted(obd), str(au.drifted(obd)))
+# ADR-0187 decision 3: the drift checker no longer CREATES anything.  Every
+# tile of the extent already has an object, so what must be zero on import is
+# the number of tiles MARKED as drifted -- not the number of tile objects,
+# which is now the whole grid.
+_all_tiles_before = len(exp.flagged(obd, "tile"))
+check("adr0187_drift_variant_has_the_whole_grid",
+      _all_tiles_before >= 130,
+      f"only {_all_tiles_before} tile objects; the shadowing trap below cannot "
+      f"bite unless the grid is actually present, so this check is what stops "
+      f"the trap test passing vacuously")
 check("drift_no_handles_on_import",
-      [t for t in exp.flagged(obd, "tile")
-       if t.get("exmateria_map/tile") == "drift"] == [])
+      [t for t in exp.flagged(obd, "tile") if bool(t.get("exmateria_map/drift"))] == [])
 check("drift_count_reported", obd.get("exmateria_map/drift_count") == 0,
       str(obd.get("exmateria_map/drift_count")))
 
@@ -1937,12 +2554,22 @@ _fverts = {obd.data.loops[li].vertex_index
 for _vi in _fverts:
     obd.data.vertices[_vi].co[2] = 36.0
 _n, _fixed = au.sync_drift(obd)
+# THE trap ADR-0187's Consequences names.  `sync_drift` used to subtract "every
+# tile object" from the drifted set under a comment saying it meant "every tile
+# that declares something".  Those were the same set only because ~0 tile
+# objects existed; with decision 3 they are the whole grid, and the checker
+# would report zero drift FOREVER while printing that the document already
+# declares the tiles -- green, silent and false.
 check("drift_seen_after_the_floor_moves", _n == 1,
-      f"a floor moved a whole step and the checker saw {_n} drifted tiles")
-_handles = [t for t in exp.flagged(obd, "tile")
-            if t.get("exmateria_map/tile") == "drift"]
-check("drift_handle_created", len(_handles) == 1, str(len(_handles)))
-_h = _handles[0]
+      f"a floor moved a whole step and the checker saw {_n} drifted tiles "
+      f"with {_all_tiles_before} tile objects present")
+_handles = [t for t in exp.flagged(obd, "tile") if bool(t.get("exmateria_map/drift"))]
+check("drift_marks_the_tile_already_there", len(_handles) == 1, str(len(_handles)))
+check("drift_creates_no_object",
+      len(exp.flagged(obd, "tile")) == _all_tiles_before,
+      f"drift changed the object count from {_all_tiles_before} to "
+      f"{len(exp.flagged(obd, 'tile'))}; decision 3 says it marks, never creates")
+_h = _handles[0] if _handles else bpy.data.objects["tile_0_0_L0"]
 check("drift_handle_names_the_tile",
       (_h["x"], _h["z"], _h["level"]) == (0, 0, 0), str(dict(_h)))
 check("drift_handle_shows_the_base_value",
@@ -1952,14 +2579,26 @@ check("drift_handle_declares_nothing_yet",
       not any(au.is_declared(_h, f) for f in au.DRIFT_FIELDS)
       and exp.assemble(obd)[0]["terrain"] is None,
       "a fresh handle already declared a field; §7.4 says `terrain` stays null")
-check("drift_handle_sits_at_the_floor",
-      abs(_h.data.vertices[0].co[2] - 36.0) < 1e-3,
-      str(_h.data.vertices[0].co[2]))
+# Decision 8: the tile shows the RECORD, the mesh shows itself, and the gap
+# between them IS the drift.  Pinning the tile to the live floor would hide the
+# record's number and show the artist their own mesh twice.
+# Decision 11's third class: a drifted tile is writable, but only over
+# decision 23's three fields.
+_d_ops, _d_labels, _ = _terrain_panel(_h)
+check("adr0187_sidebar_is_the_three_fields_on_a_drifted_tile",
+      _d_ops.count(_declare_id) == len(au.DRIFT_FIELDS),
+      f"{_d_ops.count(_declare_id)} checkboxes on a drifted tile, want "
+      f"{len(au.DRIFT_FIELDS)}")
+check("drift_tile_stays_at_the_record_height",
+      abs(_h.data.vertices[0].co[2] - 24.0) < 1e-3,
+      f"the tile moved to {_h.data.vertices[0].co[2]}; it must stay at the "
+      f"record's 24 while the floor sits at 36")
 check("drift_sync_is_idempotent",
       au.sync_drift(obd) == (1, 0)
       and len([t for t in exp.flagged(obd, "tile")
-               if t.get("exmateria_map/tile") == "drift"]) == 1,
-      "a second sync duplicated the handle")
+               if bool(t.get("exmateria_map/drift"))]) == 1
+      and len(exp.flagged(obd, "tile")) == _all_tiles_before,
+      "a second sync duplicated the mark or an object")
 
 # Decision 23: only the three.  The declared fix reaches the document.
 au.declare(_h, "height", 3)
@@ -1978,6 +2617,13 @@ check("drift_pin_byte_still_refuses",
       bool(refusals_mentioning(exp.assemble(obd)[2], "drift record",
                                "surface_type")),
       "a drift handle declaring a pin byte passed")
+# And the drifted tile is still the ONE object, so the record it exports is one
+# record -- which is what makes decision 3's collapse safe. The double-record
+# hazard the old `shadowed` set guarded against cannot arise any more.
+check("adr0187_a_drifted_tile_exports_one_record",
+      len([r for r in (exp.assemble(obd)[0]["terrain"] or [])
+           if (r["x"], r["z"], r["level"]) == (0, 0, 0)]) == 1,
+      str(exp.assemble(obd)[0]["terrain"]))
 au.undeclare(_h, "surface_type")
 
 # Drift CLEARING deletes the quad, and the record drops from the next export.
@@ -1985,11 +2631,34 @@ for _vi in _fverts:
     obd.data.vertices[_vi].co[2] = 24.0
 _n, _fixed = au.sync_drift(obd)
 check("drift_cleared_when_the_floor_returns", _n == 0, str(_n))
-check("drift_handle_deleted",
-      [t for t in exp.flagged(obd, "tile")
-       if t.get("exmateria_map/tile") == "drift"] == [])
-check("drift_record_drops_from_the_export",
-      exp.assemble(obd)[0]["terrain"] is None,
+# Decision 4: the object is NEVER deleted -- an authored fix lives on it, so
+# deleting one destroys the artist's work.  Clearing drift unmarks it.
+check("drift_unmarked_when_it_clears",
+      [t for t in exp.flagged(obd, "tile") if bool(t.get("exmateria_map/drift"))] == [])
+check("drift_clearing_deletes_no_object",
+      len(exp.flagged(obd, "tile")) == _all_tiles_before,
+      f"clearing drift left {len(exp.flagged(obd, 'tile'))} of "
+      f"{_all_tiles_before} tile objects")
+# Decision 4 is why this is not "the record drops": the object survives the
+# drift clearing and so does the fix declared on it, because deleting either
+# would throw away the artist's work without saying so.  What the artist gets
+# instead is decision 12's refusal -- the tile is carried again, its
+# declaration is no longer legal, and export says so rather than writing a
+# document `build` would reject one record at a time.
+_ddd, _, _ddrep = exp.assemble(obd)
+check("drift_fix_survives_the_drift_clearing",
+      au.is_declared(_h, "height")
+      and _ddd["terrain"] == [{"x": 0, "z": 0, "level": 0, "height": 3}],
+      f"the declaration was silently withdrawn: {_ddd['terrain']}")
+check("drift_fix_is_refused_once_the_tile_is_carried_again",
+      bool(refusals_mentioning(_ddrep, "still the base's", "(0, 0, L0)")),
+      f"a fix on a tile that is no longer drifted exported clean: "
+      f"{_ddrep.refusals[:3]}")
+# ... and withdrawing it is what makes the document legal again.
+au.undeclare(_h, "height")
+check("drift_record_drops_when_the_fix_is_withdrawn",
+      exp.assemble(obd)[0]["terrain"] is None
+      and not exp.assemble(obd)[2].refusals,
       str(exp.assemble(obd)[0]["terrain"]))
 
 # §6.5: no grid, no overlay -- and the checker must not throw on the way past.
@@ -3282,6 +3951,8 @@ _PANEL_SOURCES = {
     "MAP_PT_terrain":           ("authoring.py", "MAP_PT_terrain"),
     "MAP_PT_lighting_bake":     ("lighting_bake.py", "MAP_PT_lighting_bake"),
     "MAP_PT_live_push":         ("live_link_ui.py", "MAP_PT_live_push"),
+    "MAP_PT_live_camera":       ("live_link_ui.py", "MAP_PT_live_camera"),
+    "MAP_PT_live_isolate":      ("live_link_ui.py", "MAP_PT_live_isolate"),
 }
 
 
@@ -3293,7 +3964,11 @@ for _tag, _rel, _cls, _fn in (
         ("export", "export_document.py", "EXPORT_OT_interchange_document",
          "execute"),
         ("bundle", "gns_bundle.py", "EXPORT_OT_bundle", "execute"),
-        ("push", "live_link_ui.py", "MAP_OT_live_push", "execute"),
+        # `push_report`, not `MAP_OT_live_push.execute`: the push's report is
+        # landed by a plain function now, because a BACKGROUND push (the
+        # settle's) lands its report long after the operator returned. The
+        # chain from the operator to it is asserted below.
+        ("push", "live_link_ui.py", None, "push_report"),
         ("lamp_authority", "lighting_bake.py", None, "_authority_update")):
     try:
         check(f"{_tag}_records_an_outcome_in_the_log",
@@ -3315,20 +3990,32 @@ except Exception as e:
 # that a run's output is CONSOLE output; the panel is controls only (graded
 # above, on the rendered rows), so both halves of the replacement have to be
 # real or the rows were simply lost.
+#
+# The three anchors moved when the push was split so the settle could run its
+# transport off the main thread: the limit is stated by `_transport`, the
+# report is landed by `push_report`, and `MAP_OT_live_push.execute` is a
+# four-line call into `push_now`. So the LINK is asserted too -- an `execute`
+# that stopped going through `push_now` would satisfy the other two arms while
+# reaching none of that code.
 try:
-    _pexec = _tree_func("live_link_ui.py", "execute", "MAP_OT_live_push")
-    _pnames = [getattr(n.func, "id", None) or getattr(n.func, "attr", None)
-               for n in _ast.walk(_pexec) if isinstance(n, _ast.Call)]
+    def _called_in(fn, cls=None):
+        return {getattr(n.func, "id", None) or getattr(n.func, "attr", None)
+                for n in _ast.walk(_tree_func("live_link_ui.py", fn, cls))
+                if isinstance(n, _ast.Call)}
+
     check("the_push_operator_still_states_the_limit",
-          "unpushed_lines" in _pnames,
-          "MAP_OT_live_push no longer calls unpushed_lines -- deleting `What a "
+          "unpushed_lines" in _called_in("_transport"),
+          "the push no longer calls unpushed_lines -- deleting `What a "
           "push carries` would then have deleted the LIMIT as well as the panel")
-    _fin = next(n for n in _ast.walk(_pexec)
-                if isinstance(n, _ast.FunctionDef) and n.name == "finish")
+    check("the_push_operator_reaches_the_push",
+          "push_now" in _called_in("execute", "MAP_OT_live_push")
+          and {"push_gather", "push_transport", "push_report"}
+          <= _called_in("push_now"),
+          "MAP_OT_live_push.execute no longer routes through push_now, or "
+          "push_now no longer runs all three halves")
     check("the_push_prints_what_it_stores",
-          bool([n for n in _ast.walk(_fin) if isinstance(n, _ast.Call)
-                and getattr(n.func, "id", None) == "print"]),
-          "finish() records to the Log but prints nothing -- the panel rows "
+          "print" in _called_in("push_report"),
+          "push_report records to the Log but prints nothing -- the panel rows "
           "were deleted TO the console, so the console has to receive them")
 except Exception as e:
     check("the_push_operator_still_states_the_limit", False, repr(e))
@@ -3387,10 +4074,20 @@ _HOMES = {
     # editor,       bl_order within that editor
     "MAP_PT_paint":             ("IMAGE_EDITOR", 0),
     "MAP_PT_live_push":         ("VIEW_3D", 0),
-    "MAP_PT_preview":           ("VIEW_3D", 1),
-    "MAP_PT_paint_view":        ("VIEW_3D", 2),
-    "MAP_PT_terrain":           ("VIEW_3D", 3),
-    "MAP_PT_lighting_bake":     ("VIEW_3D", 4),
+    # Camera sits with Push and not at the end: both are the live link, and the
+    # artist presses them in one breath -- Push sends the map, Match camera
+    # aims at it.  Everything below shifted by one to keep the permutation
+    # arm's 0..N-1, which is the arm that refuses a second panel at order 1.
+    "MAP_PT_live_camera":       ("VIEW_3D", 1),
+    # Isolate joins them for the same reason, one panel further down: aim the
+    # camera, hide the units, look at the map -- one breath (decision 13).
+    # Everything below shifted by one again, which the permutation arm's
+    # 0..N-1 is what forces to be done rather than left to drift.
+    "MAP_PT_live_isolate":      ("VIEW_3D", 2),
+    "MAP_PT_preview":           ("VIEW_3D", 3),
+    "MAP_PT_paint_view":        ("VIEW_3D", 4),
+    "MAP_PT_terrain":           ("VIEW_3D", 5),
+    "MAP_PT_lighting_bake":     ("VIEW_3D", 6),
 }
 # The deletion, as its own arm.  A table entry going missing is otherwise
 # indistinguishable from a table entry never written, and these two leaving is

@@ -37,7 +37,8 @@ AUTHOR = "addons/exmateria_map/authoring.py"
 PAINT = "addons/exmateria_map/paint.py"
 LIGHTING = "addons/exmateria_map/lighting_bake.py"
 LIVELINK = "addons/exmateria_map/live_link.py"
-BLENDER = sys.argv[1] if len(sys.argv) > 1 else "blender"
+BLENDER = (sys.argv[1] if len(sys.argv) > 1
+           and not sys.argv[1].startswith("-") else "blender")
 
 # (label, file, anchor, replacement, harness)  -- the anchor must appear ONCE.
 MUTATIONS = [
@@ -48,9 +49,8 @@ MUTATIONS = [
      "        va[i].value = NEW_FACE_VISIBLE_ANGLES",
      "        pass  # MUTANT: no stamp", "rt"),
     ("sentinel_is_ff_fe", EXPORT,
-     'SENTINEL_BINDING = {"x": 255, "z": 127, "level": 1}\n\nTILE_IMPORTED',
-     'SENTINEL_BINDING = {"x": 255, "z": 127, "level": 0}  # MUTANT\n\n'
-     'TILE_IMPORTED', "rt"),
+     'SENTINEL_BINDING = {"x": 255, "z": 127, "level": 1}',
+     'SENTINEL_BINDING = {"x": 255, "z": 127, "level": 0}  # MUTANT', "rt"),
     ("grid_taken_from_marker", EXPORT,
      '    base["terrain_grid"] = export_grid(ob, rep)',
      '    export_grid(ob, rep)  # MUTANT: keep the marker snapshot', "rt"),
@@ -108,9 +108,36 @@ MUTATIONS = [
      "        low = min(v[2] for v in ring)",
      "        low = max(v[2] for v in ring)  # MUTANT",
      "corpus"),   # the fixture's one floor quad is FLAT, so min == max
-    ("drift_never_deletes_a_handle", AUTHOR,
-     "            bpy.data.objects.remove(o, do_unlink=True)   # drift cleared",
-     "            pass  # MUTANT: a cleared drift keeps its quad", "rt"),
+    # ADR-0187 decision 3 turned this leg from "delete the quad" into "unmark
+    # the tile", so the anchor moved with it.  The defect it seeds is the same
+    # one: a tile that stopped drifting still says it is drifting.
+    ("drift_never_unmarks_a_cleared_tile", AUTHOR,
+     '        o["exmateria_map/drift"] = False       # drift cleared: unmark, keep',
+     "        pass  # MUTANT: a cleared drift stays marked", "rt"),
+    # ADR-0187 decision 12: export mirrors `build`'s pre-growth refusal.  It is
+    # the rule that keeps a shown-but-carried tile from writing a document
+    # `build` rejects one record at a time, and it had no seed.
+    ("carried_tile_may_declare", EXPORT,
+     "    if declared and pre_growth and not is_drift:",
+     "    if False:  # MUTANT: a carried tile declares what it likes", "rt"),
+    # ADR-0187 decision 13, and the ask that closed it: the grid arrives with
+    # its eye shut.  Only a layer-collection read can see this -- the objects,
+    # the document and `flagged()` are all identical either way.
+    ("grid_arrives_visible", IMPORT,
+     "    hide_terrain(collection)",
+     "    pass  # MUTANT: 260 tiles land on top of the map", "rt"),
+    # ...and the growth handles join the same collection, or the toggle covers
+    # most tiles rather than the grid.
+    ("growth_escapes_the_toggle", AUTHOR,
+     "        col = _terrain_collection(marker_collection(ob))",
+     "        col = marker_collection(ob)  # MUTANT: outside the toggle", "rt"),
+    # §7.2's seed is an existing RECORD's values, and a record is what a tile
+    # declares.  Every tile carries all twenty since decision 3, so the whole
+    # key set is the base map's bytes wearing another tile's name.
+    ("growth_seed_copies_undeclared_values", AUTHOR,
+     "                    if src is not None and is_declared(src, f):",
+     "                    if src is not None and f in src.keys():  # MUTANT",
+     "rt"),
     ("drift_floor_threshold_ignored", AUTHOR,
      "        if _newell_up(ring) < FLOOR_COS:",
      "        if False:  # MUTANT: every polygon is a floor", "corpus"),
@@ -385,13 +412,31 @@ def check_seeds():
     return 1 if bad else 0
 
 
+def selected():
+    """`--only <substr>[,<substr>...]` narrows the run to the matching seeds.
+
+    The full audit is one Blender run per seed and the harness baselines on top
+    of that, which is not a loop anyone iterates in.  A new seed still has to
+    be proven non-blind the moment it is written, and that proof is one seed.
+    Whatever is committed is run whole.
+    """
+    if "--only" not in sys.argv:
+        return MUTATIONS
+    want = sys.argv[sys.argv.index("--only") + 1].split(",")
+    return [m for m in MUTATIONS if any(w in m[0] for w in want)]
+
+
 def main():
     if "--check-seeds" in sys.argv:
         sys.exit(check_seeds())
 
+    chosen = selected()
+    if not chosen:
+        print("FAIL: --only matched no seed")
+        sys.exit(1)
     with tempfile.TemporaryDirectory(prefix="exmateria-mutate-") as tmp:
         base = {}
-        for which in HARNESS:
+        for which in sorted({m[4] for m in chosen}):
             base[which] = failures(run(which, scratch(tmp)), which)
             print(f"BASELINE {which}: {base[which] or 'clean'}", flush=True)
             if base[which]:
@@ -400,7 +445,7 @@ def main():
                 sys.exit(1)
 
         blind = []
-        for label, rel, old, new, which in MUTATIONS:
+        for label, rel, old, new, which in chosen:
             dst = scratch(tmp)
             f = dst / rel
             s = f.read_text()
@@ -417,7 +462,7 @@ def main():
             if not caught:
                 blind.append(label)
 
-    print(f"\n{len(MUTATIONS) - len(blind)}/{len(MUTATIONS)} seeds caught; "
+    print(f"\n{len(chosen) - len(blind)}/{len(chosen)} seeds caught; "
           f"blind: {blind or 'none'}")
     print("PASS" if not blind else "FAIL")
     sys.exit(1 if blind else 0)

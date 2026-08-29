@@ -104,6 +104,7 @@ is not the one `dump` came from").
 | `terrain_source` | string or `null` | the resource whose `0x68` chunk `dump` read the grid from; `null` when the arrangement has no valid terrain chunk (6 of 196 arrangements) | decision 21; `schema` for the pick rule (§7.3) | `"MAP001.9"` |
 | `terrain_digest` | string or `null` | digest of that chunk's 4,098-byte payload (first 2 B + both 2,048-B levels) | decision 21 | — |
 | `terrain_grid` | `{"size_x": u8, "size_z": u8}` or `null` | the grid extent: the chunk's first two bytes, and — after growth — the **writable target extent** (decision 10, 16: the grown extent the document authorises) | decision 10, 21 | `{"size_x": 10, "size_z": 13}` |
+| `terrain_tiles` | array of `[x, z, level, b0, b1, b2, b3, b4, b5, b6, b7]` | derived, information-bearing: **every slot of both levels** of the base's `0x68` chunk, raw and undecoded, in slot order (level 0's `size_z * size_x`, then level 1's). Level 1 begins at a fixed 2,048-byte stride, not packed after level 0. Carried so the addon can *draw* the terrain grid without the document declaring a record (ADR-0187 decision 1); `[]` when the arrangement has no valid terrain chunk. `dump` computes it; `build` ignores it | ADR-0187 decision 1, 2 | `[0, 0, 0, 3, 0, 2, 0, 0, 0, 32, 0]` |
 | `floor_steps` | array of `[x, z, step, slope_height, slope_type]` | derived, information-bearing: one row per occupied tile whose floor `step` is the base mesh's `round(−max(ys) / 12)`; carried so the addon's drift panel (decision 15, 23) can show all three base values. `dump` computes it; `build` ignores it | decision 15, 23 | `[0, 0, 2, 0, 0]` |
 
 ## 5. `polygons`
@@ -351,10 +352,12 @@ An **absent field is not zero** — it carries or defaults per the record's clas
 |---|---|---|
 | **Drift-named tile** — inside the pre-growth extent, named by the drift warning (decisions 12, 15) | only `height`, `slope_height`, `slope_type` may be declared; any other declared payload field refuses (decision 23: the pin bytes stay unreachable) | carry from the base |
 | **Growth-created tile** — outside the pre-growth extent, inside the document's `terrain_grid` extent | the whole record may be declared (decisions 10, 11) | level default: level 0 → height 0, impassable; level 1 → `00 00 00 00 00 00 01 00` (height 0, unselectable) — but decision 20 narrows this: growth writes nothing new, the bytes past the old edge become live as they stand, and `build` stamps a default only into a slot that already holds it (a no-op) |
-| **Any other pre-growth tile** | refused — "that tile is still the base's" (decisions 3, 11, 12) | — |
+| **Carried tile** — any other pre-growth tile (ADR-0187 decision 15) | refused — "that tile is still the base's" (decisions 3, 11, 12) | carry from the base, and since ADR-0187 the addon *draws* them from `base.terrain_tiles` |
 | **Outside the document's extent** | refused — "there is no byte to write it to" (decision 11) | — |
 
-Example record (the plain tile at `(0,0)` of `MAP001.a0`, raw `03 00 02 00 00 00 20 00`):
+Example record — the shape only. The plain tile at `(0,0)` of `MAP001.a0` (raw
+`03 00 02 00 00 00 20 00`) is a **carried** tile, so this record is *illegal* and
+`build` refuses it; a legal one names a drift-named or growth-created tile:
 
 ```json
 {"x": 0, "z": 0, "level": 0, "surface_type": 3, "height": 2, "unknown_6c": 1}
@@ -391,7 +394,7 @@ which half survives on which path; this section is the Painting's schema.
 | *key* | string | a bare sidecar file name in the document's directory (§1) |
 | `states` | array of int | the `map_states` indices this painting is the source for, ascending |
 
-Four properties, each a decision rather than a convenience:
+Five properties, each a decision rather than a convenience:
 
 - **It is absent, not empty, on an unconverted map.** ADR-0186 decision 7's shape:
   *the presence of `source_art` is the declaration*, so a document that never met
@@ -412,10 +415,35 @@ Four properties, each a decision rather than a convenience:
   palette; that is the whole point of the path it belongs to. The two sidecar kinds
   share a directory and a `.png` suffix, so each reader refuses the other's colour
   type outright (`png_indexed.read_rgb_png` / `read_indexed_png`).
+- **The Painting's SCALE is derived from its dimensions, never stored.** ADR-0186
+  Amendment 10 decision 43. A painting is `256k × 1024k` for k ∈ {1, 2, 4, 8}; the
+  compile shrinks it to the Sheet's 256×1024 by box average before quantising, so
+  `k = 1` is the Painting as it has always been. A `scale` field would be the
+  redundant, driftable copy §3 refuses for the polygon counts — the PNG already
+  carries its own width and height. **All of one document's paintings must agree on
+  k**: N belongs to the map, not to a state, and a document holding a 4× painting
+  for one state and a 1× painting for another is incoherent. That agreement IS the
+  check, which is why no field is needed to make one.
 
 The file name's hash is over the RGB bytes, not over the PNG, so two identical
 paintings share one file whatever the encoder chose — the same rule the sheets use,
 where the name comes from the packed 4bpp rather than from the image.
+
+The name also carries **`@Nx` for k > 1 only** —
+`MAP022.a0.source-0ea1b3c7@4x.png`. Tagging `@1x` would change every existing key in
+this section and break the whole-document `export(import(doc)) == doc` identity
+asserted over all 148 arrangements, so bare means 1× and the suffix lands on
+ADR-0186 decision 7's shape a third time: *absence is the declaration*. Like the
+hash beside it, the suffix is a **label and not the truth** — `_build_source_art`
+opens the PNG and checks the real dimensions rather than trusting the name.
+
+**Export refuses; import warns and degrades.** A Painting whose dimensions are not a
+legal `256k × 1024k`, or which disagrees with the document's other paintings, is
+refused **by name** on export — never skipped silently, because decision 4 makes the
+Painting the irreplaceable half of an authored map and §10's posture is to refuse
+and say so. On import it warns, is skipped, and that state previews through the
+CLUT: *"an import that lost a file must still open; it is the export that refuses"*
+(`_build_source_art`).
 
 ## 8. `carry`
 

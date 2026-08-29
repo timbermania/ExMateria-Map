@@ -1011,6 +1011,17 @@ class _PaintPanel:
         # disc laid it out, press it once and every chart owns its own texels.
         from .convert_op import MAP_OT_convert_manifold
         layout.operator(MAP_OT_convert_manifold.bl_idname, icon="MOD_UVPROJECT")
+        # Canvas (High / Native), ADR-0186 Amendment 10 decision 40.  Drawn
+        # only when there is something to switch BETWEEN: at N = 1 every pixel
+        # is already a texel, so the control is ABSENT rather than
+        # present-and-inert -- decision 40 says so, and an inert control on the
+        # only path most maps ever take is a question the artist has to answer
+        # for nothing.  N is read off the Painting's own dimensions (decision
+        # 43); there is no stored scale to disagree with them.
+        if painting is not None:
+            from . import resample
+            if (resample.scale_of(*painting.size) or 1) > 1:
+                layout.prop(ob, "exmateria_map_canvas", expand=True)
         # The button fills the Image Editors that exist; it opens none (see
         # `show_in_image_editors`).  So when there are none, say where the
         # sheet went and how to look at it -- HERE and not only in the
@@ -1055,6 +1066,14 @@ class _PaintPanel:
                 layout.label(text=said, icon={
                     "stale": "FILE_REFRESH", "fresh": "CHECKMARK",
                     "never": "INFO"}.get(state_of, "QUESTION"))
+            # The scale, beside the two buttons that act on the compile,
+            # because that is where the artist is when they decide the
+            # Painting has not got enough pixels in it.  A NUMBER and not a
+            # dropdown: reported from use.  It stores nothing -- the value is
+            # read off the Painting's own dimensions and assigning to it
+            # rescales the picture (decision 43, and
+            # `convert_op.painting_scale_get`).
+            layout.prop(ob, "exmateria_map_painting_scale")
             col = layout.column(align=True)
             col.operator(MAP_OT_recalculate_palettes.bl_idname,
                          icon="COLORSET_10_VEC")
@@ -1194,9 +1213,9 @@ class MAP_PT_paint_view(_PaintPanel, Panel):
     would make a two-case panel a four-case one.
     """
     bl_space_type = "VIEW_3D"
-    # Renumbered again when `What a push carries` was deleted; the
-    # remaining five keep their relative order.
-    bl_order = 2
+    # Renumbered again when `Isolate` joined Push and Camera at the top
+    # (decision 13); the relative order below them is unchanged.
+    bl_order = 4
     says_where_the_sheet_went = True
 
 

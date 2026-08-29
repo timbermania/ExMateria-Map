@@ -63,19 +63,27 @@ globals resolve to the bases below. See `../../docs/live-link-v1.md` §2.
 
 from __future__ import annotations
 
+import hashlib
 import struct
+from pathlib import Path
 from typing import NamedTuple
 
 # The document's palette entries are hex colours plus an STP mask, and turning
 # those into BGR555 words is `build`'s arithmetic. It is imported rather than
 # repeated: a CLUT that reached RAM through different packing than the one that
 # reaches the disc would make this loupe lie in the one way it exists to stop.
+# `mapfile` comes along for the animation chunks (decision 11): the `0x6c`
+# instruction table this module erases and re-installs is decoded ONCE, by the
+# reader `dump` and `build` already use, so the live link cannot come to a
+# different reading of a record than the disc writer does.
 # Both spellings are needed -- the addon imports this module as a package
 # member, the tests and the CLI tools import it as a top-level module.
 try:                                     # pragma: no cover - import shape only
     from ._vendor.exmateria_map.document import clut_from_json
+    from ._vendor.exmateria_map import mapfile as _mapfile
 except ImportError:                      # pragma: no cover
     from _vendor.exmateria_map.document import clut_from_json
+    from _vendor.exmateria_map import mapfile as _mapfile
 
 # --- the document's four polygon buckets, in disc order (schema §3) ---------
 BUCKETS = ("textured_triangle", "textured_quad",
@@ -770,7 +778,8 @@ def plan_packets_document(client, descriptor: Descriptor,
 # is generic transport with no FFT knowledge, it must be edited in its own
 # worktree, and an addon an artist installs cannot pip-install anything.
 
-import urllib.error      # noqa: E402  -- kept beside the transport it serves
+import contextlib        # noqa: E402  -- kept beside the transport it serves
+import urllib.error      # noqa: E402
 import urllib.request    # noqa: E402
 
 DEFAULT_HOST = "localhost"
@@ -1142,6 +1151,49 @@ class RamClient:
     def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
         self.host, self.port = host, port
         self.base = f"http://{host}:{port}/api/v1/cpu/ram/raw"
+        self._held = None            # the image a `hold()` is answering from
+        self._holding = 0            # `hold()` depth
+
+    @contextlib.contextmanager
+    def hold(self):
+        """Fetch main RAM once for the length of a push, and answer from it.
+
+        The endpoint cannot help: stock's GET always returns the whole 2 MB and
+        the `offset`/`size` parameters exist on the POST only
+        (`web-server.cc:118-122`), so a push moved roughly 40 MB to write tens
+        of kilobytes -- the descriptor read, the packet fields, the per-bucket
+        before-images and the self-check, each one a fresh 2 MB
+        (ADR-0186 Amendment 7, decision 32).
+
+        A **scope**, not a cache with a lifetime, for two reasons and both are
+        correctness rather than taste:
+
+        * The console is RUNNING. An image held past the push it was fetched
+          for would answer the next push's descriptor read with the last
+          push's RAM.
+        * A write DROPS it rather than updating it. Decision 32 says the
+          self-check is not traded away for speed, and a write-through image
+          would make it compare the plan against the plan -- passing against an
+          engine that took none of it. `selfcheck` runs BEFORE the writes, so
+          it costs nothing to keep honest: all of its reads share the one
+          image, and the first `_post` ends that image's life.
+        """
+        self._holding += 1
+        try:
+            yield self
+        finally:
+            self._holding -= 1
+            if not self._holding:
+                self._held = None
+
+    def _ram(self) -> bytes:
+        """Main RAM -- from the held image when a `hold()` is open."""
+        if self._held is not None:
+            return self._held
+        got = self._get()
+        if self._holding:
+            self._held = got
+        return got
 
     # -- transport, isolated so the tests can drive a byte array
     def _get(self) -> bytes:
@@ -1188,6 +1240,21 @@ class RamClient:
         o = address - RAM_BASE
         if o < 0 or o + length > RAM_BYTES:
             raise LiveLinkError(f"0x{address:08X}+{length} is outside main RAM")
+        return self._ram()[o:o + length]
+
+    def read_live(self, address: int, length: int) -> bytes:
+        """`length` bytes fetched from the CONSOLE, ignoring any held image.
+
+        `read` above answers from `hold()`'s image, which is what makes a push
+        one GET instead of twenty. A **readback** cannot use it: sampling one
+        image five times is five copies of one instant, so every row reads
+        still and a healthy animation install is reported as *not added*
+        (`readback_animation`). This is the one read in the module that has to
+        cost a fetch, and it neither reads nor populates the held image.
+        """
+        o = address - RAM_BASE
+        if o < 0 or o + length > RAM_BYTES:
+            raise LiveLinkError(f"0x{address:08X}+{length} is outside main RAM")
         return self._get()[o:o + length]
 
     def write(self, writes: list[tuple[int, bytes]]) -> int:
@@ -1200,7 +1267,7 @@ class RamClient:
         """
         if not writes:
             return 0
-        image = self._get()
+        image = self._ram()
         changed = 0
         for address, data in writes:
             o = address - RAM_BASE
@@ -1208,6 +1275,9 @@ class RamClient:
                            if a != b)
         for address, data in cluster_writes(writes, image):
             self._post(address - RAM_BASE, data)
+        # The console has moved on from the image these writes were planned
+        # against, and the next read must be able to say so -- see `hold()`.
+        self._held = None
         return changed
 
 
@@ -1857,8 +1927,25 @@ def packet_witnesses(client, descriptor: Descriptor,
 #: This block matched the live VRAM CLUT block **0 of 512 bytes different**,
 #: and differs from `MAP022.9`'s own 0x44 chunk by 35 bytes over rows 0, 7, 8,
 #: 10, 13 and 14 -- which is why no disc resource matches all 16 live rows.
-#: Those six are the palette ANIMATION's work; the chunk that drives it
-#: (`mapfile.PALETTE_ANIM_PTR`, 0x70) still has no reader.
+#:
+#: **Corrected 2026-08-27 (decision 11).** Only rows 13, 14 and 15 of those six
+#: are the animation. `MAP022.9`'s 0x6c table carries exactly three palette
+#: records and they name 13/14/15 and nothing else, and a 2.5 s readback finds
+#: those three moving and the other thirteen still. Whatever moved rows 0, 7, 8
+#: and 10 off the disc's bytes did it ONCE and is unidentified. `0x70` HAS a
+#: reader now (#624): `mapfile.read_palette_animation` for the frames and
+#: `read_animation_instructions` for the table saying which rows they drive.
+#:
+#: **This is block 0 of FOURTEEN**, not a 512-byte block. The engine's loader
+#: addresses it as `CLUT_BLOCK + block*512` and `clut_view_strip_init`
+#: (`0x80093048`) initialises 14 of them; `flush_clut_view_strip`
+#: (`0x80092F98`) uploads all 7,168 bytes as one 256x14 rectangle at VRAM
+#: (0, 494), gated on the dirty flag `DAT_800995EC`. Measured [LIVE]: blocks
+#: 1-13 against VRAM rows 495-507 are 0 of 512 bytes different each, and VRAM
+#: (0, 480) -- the line the polygons sample -- is 0 of 512 against block 0.
+#: Nothing here writes past block 0, and `clut_rows` refuses a row >= 16, but a
+#: future caller that takes `CLUT_BLOCK + n` for a row offset would land in
+#: another block rather than off the end of anything.
 CLUT_BLOCK = 0x800E4EA4
 CLUT_ROWS = 16
 CLUT_ENTRIES = 16
@@ -1871,11 +1958,20 @@ CLUT_BLOCK_BYTES = CLUT_ROWS * CLUT_ROW_BYTES
 #: above is the sink and this is not.
 #:
 #: It was first recorded here as an "inert twin", and that was wrong about WHAT
-#: it is while right about what it does. It is not a stale duplicate: the
-#: palette-animation routine at `0x8009269C` / `0x800926AC` (one function,
-#: `ra = 0x80092794`) writes each animated frame into **both** blocks, entry by
-#: entry -- this one at `+0x10`, `CLUT_BLOCK` at `+0x00` of the same loop body.
-#: Confirmed by watchpoint, 20 and 60 hits, single writer each.
+#: it is while right about what it does. It is not a stale duplicate: each
+#: animated entry is written into **both** blocks, entry by entry -- this one at
+#: `+0x10`, `CLUT_BLOCK` at `+0x00` of the same loop body. Confirmed by
+#: watchpoint, 20 and 60 hits, single writer each.
+#:
+#: **Corrected 2026-08-27 (decision 11): that loop body is NOT the animation.**
+#: It is `clut_strip_load_base` (`0x80092620`), a shared CLUT loader taking
+#: (source, block, row), and it has exactly two callers -- both inside
+#: `color_field_dispatch` (`0x800926D8`), the `{33}` Color Field opcode
+#: handler, which CONTEXT.md classifies as a MODULATOR. `ra = 0x80092794` is
+#: the instruction after that function's single-row `jal`, so the watchpoint
+#: found the HELPER, one frame below whoever called it. The animation is one of
+#: `color_field_dispatch`'s 24 call sites and has not been identified. Every
+#: byte measurement above stands; the name attached to them did not.
 #:
 #: Why a push here is still ineffective: nothing re-uploads a STATIC row from
 #: either block after map load. `CLUT_BLOCK` reaches VRAM continuously, so a
@@ -1892,6 +1988,14 @@ CLUT_BLOCK_INERT_TWIN = CLUT_BLOCK_BASE_COPY
 #: Rows the engine repaints on its own, measured by writing all 16 and reading
 #: back. Used ONLY to keep the pre-write check from refusing on them (they
 #: legitimately differ between a RAM read and a VRAM read taken moments apart).
+#:
+#: Independently confirmed since (#624): `MAP022.9`'s 0x6c palette records name
+#: 13/14/15 and no others, so the set is now DERIVABLE from the map. It is left
+#: as a measured constant on purpose -- decision 3 wants the push to report what
+#: did not hold, never to predict it -- but the old reason for that rule ("the
+#: period is unknown") is retired: the period is byte 17 of the record, and the
+#: slowest palette record in the corpus is 30 ticks, so a 0.6 s dwell cannot
+#: miss one. See decision 11.
 #: Decision 3: the push does not PREDICT which rows will not hold -- it writes,
 #: reads back, and names whatever did not. This list is what the check
 #: tolerates, never what the report is built from.
@@ -1947,9 +2051,15 @@ def plan_palettes(palettes) -> list[tuple[int, bytes]]:
 
     **This sink is correct on 42 resources of 169 and inert on the other 127**,
     and that is the whole shape of this leg. `CLUT_BLOCK` reaches VRAM because
-    the palette ANIMATION re-uploads it, entry by entry, every frame -- so on a
-    map whose `0x70` chunk carries an animation a write here is durable and
-    wins over anything written to VRAM directly. On a map without one, nothing
+    a map that animates runs the path that sets the dirty flag `DAT_800995EC`,
+    and `flush_clut_view_strip` uploads the RAM block whenever that flag is set
+    -- so on a map whose `0x70` chunk carries an animation a write here is
+    durable and wins over anything written to VRAM directly. (The entry-by-entry
+    writes are `clut_strip_load_base`, into main RAM; the RAM-to-VRAM upload is
+    the flush. Stating it as "the animation re-uploads it" folded two functions
+    into one and is corrected under decision 11 -- the net 42/127 behaviour is
+    unchanged, but the split is a property of the FLAG being set, which is why
+    the 127 have a candidate remedy and not just a limitation.) On a map without one, nothing
     re-uploads the block after map load and a write here is byte-perfect and
     invisible. Measured [LIVE] 2026-08-27 on Orbonne (`MAP062.8`, no
     animation): this block matched the document 0 of 512 bytes off while all
@@ -2035,8 +2145,1176 @@ def check_clut_block(ram: bytes, vram_clut: bytes) -> None:
             "reach the screen. Refusing rather than writing there")
 
 
+# ---------------------------------------------------------------------------
+# The animation table (decision 11)
+# ---------------------------------------------------------------------------
+# A swap writes a new map's geometry, packets, sheet and palettes into slots
+# the host map was using. What it does NOT displace is the host's `0x6c`
+# instruction table, which the engine keeps walking every frame -- so a correct
+# push gets repainted 4.49 times a second by a map that was supposed to be
+# gone. That is the reported "one chunk got the blue water palette and it's
+# animated", and the unit of the fix is the TABLE, not the palettes: 60 of the
+# corpus's 110 tables drive CLUT rows and 94 drive TEXTURE regions, and
+# Gariland's own eight texture records point at `x = 839..923`, inside the four
+# VRAM pages a swap has just uploaded a sheet to.
+
+
+#: The **live** `0x6c` instruction table -- 32 records of 20 bytes, in disc
+#: layout, at a fixed engine address. Confirmed two ways:
+#:
+#: - offline, against `reference-assets/thief_whats_this.sstate`: these 640
+#:   bytes are `MAP022.9`'s `0x6c` chunk, differing only at the four runtime
+#:   bytes of its three running palette records;
+#: - live [LIVE] 2026-08-27, by a one-byte reversible poke with the record's
+#:   own siblings as the control -- zeroing record 0 took row 13 from 4.49
+#:   steps a second to 0.00 while rows 14 and 15 stayed at 4.5.
+#:
+#: The poke is what earns the address. A SECOND structure at `0x800F6DC4` (24
+#: byte stride) repeats each record's leading 8 bytes, and inspection cannot
+#: tell the two apart -- three sessions have landed on the wrong side of that.
+#: Hence `check_animation_table` below: the address is never trusted for being
+#: written down.
+ANIM_TABLE = 0x80121D7C
+ANIM_TABLE_BYTES = _mapfile.ANIM_INSTRUCTION_BYTES          # 640
+
+#: The loaded `0x70` frames, 512 B, byte-identical to the disc's chunk in a
+#: running battle (verified against the savestate). The animation reads its
+#: colours from here, so installing a pushed map's animation is these bytes
+#: plus the records above.
+ANIM_FRAMES = 0x800F687C
+ANIM_FRAMES_BYTES = _mapfile.PALETTE_ANIM_BYTES             # 512
+
+#: The bytes of a RUNNING palette record that the engine owns: a frame cursor
+#: and a tick counter, not the map's data. `MAP022.9`'s records read
+#: `04 .. 00 .. 00 00` on the disc and `81 .. 02 .. 09 01` in a battle, at
+#: exactly these four offsets and nowhere else in all 640 bytes.
+ANIM_RUNTIME_BYTES = (14, 16, 18, 19)
+
+#: Byte 19 is the one the ENGINE needs set for a record to run, and the disc
+#: ships it CLEAR on 127 of the corpus's 128 palette records. The loader arms
+#: the records at map load; a map does not author this.
+#:
+#: Measured [LIVE] 2026-08-28 on a running Gariland battle, with the record's
+#: own siblings as the control. The table held `MAP022.9`'s three palette
+#: records byte-for-byte off the disc -- the state a verbatim install leaves --
+#: and rows 13, 14 and 15 were **still**. Writing byte 19 = 1 into record 0
+#: alone started row 13 and left 14 and 15 at zero; putting the record back
+#: stopped it again. Byte 14 (`0x81`) and byte 16 (`0x02`) alone did nothing,
+#: so the engine initialises the rest from the record it is handed.
+#:
+#: This is the case decision 11's behavioural readback exists for, and it is
+#: the case a byte readback would have passed: the chunk really was at the
+#: address, byte-perfect, and nothing read it.
+ANIM_RUN_FLAG_BYTE = 19
+ANIM_RUN_FLAG = 1
+
+
+def mask_animation_runtime(table: bytes) -> bytes:
+    """`table` with every palette record's runtime bytes zeroed.
+
+    What makes a live table comparable with a disc chunk. Applied to the
+    PALETTE records only, and that is not a judgement call: `is_palette` is
+    decided by bytes 0-7, which this never touches, so the two sides either
+    agree on which records are palette records or they have already differed
+    somewhere the mask cannot hide.
+    """
+    if len(table) < ANIM_TABLE_BYTES:
+        raise LiveLinkError(
+            f"an animation table is {ANIM_TABLE_BYTES} bytes and this is "
+            f"{len(table)}")
+    out = bytearray(table[:ANIM_TABLE_BYTES])
+    for r in _mapfile.read_animation_instructions(_anim_resource(out)) or ():
+        if not r.is_palette:
+            continue
+        for byte in ANIM_RUNTIME_BYTES:
+            out[r.index * _mapfile.ANIM_INSTRUCTION_STRIDE + byte] = 0
+    return bytes(out)
+
+
+def _anim_resource(table: bytes) -> bytes:
+    """`table` wrapped in the smallest resource `mapfile` will read it out of.
+
+    The decode is `mapfile`'s and stays `mapfile`'s: a second reader of these
+    records in the live link is a second chance to disagree with the disc
+    writer about what a record IS, which is the whole class of bug the
+    vendored package exists to prevent.
+    """
+    head = bytearray(_mapfile.HEADER_BYTES)
+    head[_mapfile.ANIM_INSTRUCTION_PTR:_mapfile.ANIM_INSTRUCTION_PTR + 4] = \
+        _mapfile.HEADER_BYTES.to_bytes(4, "little")
+    return bytes(head) + bytes(table)
+
+
+def read_animation_table(table: bytes):
+    """The live 640 bytes as `mapfile.AnimInstruction` records."""
+    return _mapfile.read_animation_instructions(_anim_resource(table))
+
+
+def animation_tables(map_dir) -> dict[str, bytes]:
+    """Every `0x6c` chunk in the extracted disc tree, by resource name.
+
+    The candidate set for the content guard. 110 of the corpus's 1,575
+    resources carry one; the scan reads a 196-byte header and 640 bytes per
+    file and costs ~20 ms over the whole tree, which is why the guard can run
+    on every press rather than being something the artist opts into.
+    """
+    out = {}
+    if map_dir is None:
+        return out
+    for path in sorted(map_dir.glob("MAP*.*")):
+        if path.suffix == ".GNS":
+            continue
+        try:
+            size = path.stat().st_size
+            with path.open("rb") as f:
+                head = f.read(_mapfile.HEADER_BYTES)
+                if len(head) < _mapfile.HEADER_BYTES:
+                    continue
+                at = struct.unpack_from(
+                    "<I", head, _mapfile.ANIM_INSTRUCTION_PTR)[0]
+                if at <= 0 or at + ANIM_TABLE_BYTES > size:
+                    continue
+                f.seek(at)
+                chunk = f.read(ANIM_TABLE_BYTES)
+        except OSError:                  # a tree we cannot read is no tree
+            continue
+        if len(chunk) == ANIM_TABLE_BYTES:
+            out[path.name] = chunk
+    return out
+
+
+def check_animation_table(live: bytes, candidates: dict) -> list[str]:
+    """Refuse unless the live table is some map's, and name which.
+
+    Decision 5's locate-by-verify, at the address decision 11 writes 640 bytes
+    to. The address was confirmed on ONE battle; writing there on any other is
+    a bet, and `0x800F6DC4` is standing right next to it wearing the same
+    leading eight bytes per record.
+
+    It also closes the case that cannot be ruled out: if anything other than a
+    map ever holds records there, it matches nothing, and the push stops
+    instead of erasing it.
+
+    **An empty candidate set is a refusal, not a pass.** Decision 11's
+    degradation rule says a missing disc tree costs the install and not the
+    removal; that cannot be honoured without contradicting part 2, because a
+    candidate set of nothing verifies nothing and the erase's only proof that
+    it is writing to a map's table is this match. Amended in
+    `docs/live-link-v1.md` -- the animation leg degrades as a unit, and the
+    rest of the push is unaffected either way.
+    """
+    if not candidates:
+        raise LiveLinkError(
+            "the animation table is guarded by CONTENT, and there is nothing "
+            "to compare it against: no extracted disc tree was found, so the "
+            f"640 bytes at 0x{ANIM_TABLE:08X} cannot be confirmed to be a "
+            "map's. Refusing to erase them")
+    want = mask_animation_runtime(live)
+    stride = _mapfile.ANIM_INSTRUCTION_STRIDE
+    slots = range(0, ANIM_TABLE_BYTES, stride)
+    live_slots = [want[o:o + stride] for o in slots]
+    empty = bytes(stride)
+    if all(s == empty for s in live_slots):
+        raise LiveLinkError(
+            f"every slot of the table at 0x{ANIM_TABLE:08X} is empty, so the "
+            "loaded map has no animation to remove and there is nothing to "
+            "confirm it against -- an empty table is compatible with every "
+            f"one of the {len(candidates)} on the disc, which is not a match. "
+            "Nothing erased (#659)")
+    matched = []
+    for name, table in sorted(candidates.items()):
+        masked = mask_animation_runtime(table)
+        if all(mine == empty or mine == masked[o:o + stride]
+               for mine, o in zip(live_slots, slots)):
+            matched.append(name)
+    if not matched:
+        raise LiveLinkError(
+            f"the 640 bytes at 0x{ANIM_TABLE:08X} match none of the "
+            f"{len(candidates)} animation tables in the extracted disc tree, "
+            "so they are not a loaded map's instruction records. Refusing to "
+            "erase them -- this is either a different build of the game, or "
+            "the table has moved, or something that is not a map writes here")
+    return matched
+
+
+def animation_rows(records) -> list[int]:
+    """The CLUT rows a `0x6c` table animates, in table order.
+
+    This is the **expected** side of the behavioural readback: the set of rows
+    that move after a push has to equal the set the pushed map's own table
+    names. It is read from the map rather than predicted, which is decision 3's
+    rule, and it is what makes the empty case correct rather than special --
+    `MAP002.9` carries no `0x6c` at all, so it names nothing, so *nothing
+    moves* is the whole assertion for that push.
+
+    `None` (the resource carries no table) yields `[]` rather than raising: a
+    map without an animation is the common map, not a malformed one.
+    """
+    return [r.clut_row for r in records or ()
+            if r.is_palette and r.frame_count and r.clut_row is not None]
+
+
+def moved_clut_rows(*samples: bytes) -> list[int]:
+    """Which CLUT rows are not constant across two or more samples of
+    `CLUT_BLOCK`.
+
+    The **measured** side of the readback. A byte readback is not sufficient on
+    its own here and the reason is on the record: `check_clut_block` passed on
+    Orbonne with both sides holding Orbonne's palettes while the write went
+    nowhere. Bytes prove the values are at an address, never that anything
+    reads it -- so what the animation leg is graded by is a row MOVING, which
+    only a second sample can see.
+
+    **Variadic on purpose, and two is the minimum rather than the number.** A
+    cycle may repeat a frame -- `MAP022.9`'s frame 3 is byte-identical to its
+    frame 1 -- so a pair of samples that straddles two steps reads a running
+    row as still, and the readback would call a healthy install *not added*.
+    The dwell is wall-clock over HTTP against an emulator whose speed is not
+    ours, so which frames a pair lands on is not this code's to choose:
+    sampling across the dwell rather than only at its ends is what removes the
+    coincidence. One sample is refused, because a single sample reports
+    *nothing moved* for every map -- a clean bill nothing measured.
+    """
+    if len(samples) < 2:
+        raise LiveLinkError(
+            f"the readback compares samples of `CLUT_BLOCK` over a dwell and "
+            f"got {len(samples)}; one sample can only ever report that nothing "
+            "moved")
+    for i, s in enumerate(samples):
+        if len(s) < CLUT_BLOCK_BYTES:
+            raise LiveLinkError(
+                f"the readback needs {CLUT_BLOCK_BYTES} bytes per sample and "
+                f"sample {i} is {len(s)}")
+    out = []
+    for row in range(CLUT_ROWS):
+        o = row * CLUT_ROW_BYTES
+        seen = {s[o:o + CLUT_ROW_BYTES] for s in samples}
+        if len(seen) > 1:
+            out.append(row)
+    return out
+
+
+#: How many times the readback samples `CLUT_BLOCK` across the dwell. Two is
+#: the minimum and not the number: a cycle may repeat a frame (`MAP022.9`'s
+#: frame 3 is its frame 1), so a pair at the ends of the dwell can land on two
+#: identical frames of a row that never stopped moving. Five is four intervals,
+#: which cannot all coincide with a repeat.
+ANIM_READBACK_SAMPLES = 5
+
+
+def readback_animation(client, expected, dwell: float,
+                       samples: int = ANIM_READBACK_SAMPLES,
+                       sleep=None) -> tuple[bool, list[str]]:
+    """Watch `CLUT_BLOCK` across the dwell and grade it against `expected`.
+
+    The push's own goal, measured rather than asserted: **the set of rows that
+    move equals the set the pushed map's table names**. `check_clut_block`
+    passed on Orbonne with both sides holding Orbonne's palettes while the
+    write went nowhere -- bytes prove the values are at an address, never that
+    anything reads them -- so this is the check the animation leg is graded by.
+
+    Every sample is a fresh fetch (`read_live`). A push holds one image of main
+    RAM for its whole length, and answering a readback from it would compare an
+    instant with itself.
+    """
+    if sleep is None:                    # imported here: the core is stdlib-
+        import time                      # only and nothing else needs a clock
+        sleep = time.sleep
+    if not hasattr(client, "read_live"):
+        raise LiveLinkError(
+            "the animation readback needs a client that can re-read the "
+            "console; this one can only answer from the push's held image, "
+            "and an instant compared with itself never moves")
+    got = []
+    for i in range(samples):
+        if i:
+            sleep(dwell / (samples - 1))
+        got.append(client.read_live(CLUT_BLOCK, CLUT_BLOCK_BYTES))
+    return check_animation_readback(moved_clut_rows(*got), expected)
+
+
+def check_animation_readback(moved, expected) -> tuple[bool, list[str]]:
+    """Grade one animation push: **the rows that move must be the rows the
+    pushed map names.**
+
+    Phrased as the goal rather than as two separate checks, because the goal is
+    the artist's own sentence -- *"the total removal of the old map, and adding
+    the new map"* (decision 10, amended) -- and each direction of a mismatch is
+    one half of it failing:
+
+    - a row still moving that the pushed map does not name is **the old map not
+      removed**: the erase missed it, or something re-installed it;
+    - a row the pushed map names that did not move is **the new map not
+      added**: the install did not land, or the frames it points at are absent.
+
+    Both are reported when both hold. A swap between two animating maps fails
+    in both directions in one press, and a report that stopped at the first
+    would send the next reader looking for one defect where there are two.
+
+    Returns `(ok, lines)` -- `diagnose_selfcheck`'s shape -- because the write
+    has already happened by the time this runs. Decision 3: the push writes,
+    reads back, and NAMES what did not hold; it does not predict.
+    """
+    moved, expected = sorted(set(moved)), sorted(set(expected))
+    stale = [r for r in moved if r not in expected]
+    absent = [r for r in expected if r not in moved]
+    if not stale and not absent:
+        if not expected:
+            return True, ["animation: nothing moves, and the pushed map names "
+                          "no animated rows -- removal confirmed by the "
+                          "picture, not by the write"]
+        return True, [f"animation: CLUT row(s) {_rows(expected)} move and no "
+                      f"others do, which is exactly what this map's own table "
+                      f"names"]
+    lines = []
+    if stale:
+        lines.append(
+            f"animation NOT fully removed: CLUT row(s) {_rows(stale)} are "
+            f"still moving and this map does not animate them -- that is the "
+            f"replaced map's table still running, which is what repaints a "
+            f"correct push 4.49 times a second")
+    if absent:
+        lines.append(
+            f"animation NOT added: this map animates CLUT row(s) "
+            f"{_rows(absent)} and they did not move over the dwell -- the "
+            f"instruction records or the frames did not reach the engine")
+    return False, lines
+
+
+def _rows(rows) -> str:
+    return ", ".join(str(r) for r in rows)
+
+
+#: Fields per second. The `0x6c` records count in fields, not frames -- byte 17
+#: reading 12 is the ~0.213 s per step measured live, which is 12/60.
+ANIM_TICKS_PER_SECOND = 60
+
+#: The dwell a `duration = 0` palette record gets instead of none. #654: the
+#: field is undecoded -- it may mean *every tick* or *inert* -- and a dwell
+#: sized from it computes to zero, which is a readback that watches for no time
+#: and reports *not added* about every row.
+#:
+#: The corpus does not reach this: both of its `duration = 0` palette records
+#: (`MAP053.8`, `MAP053.22`) carry `frame_count = 0` too, so they animate
+#: nothing and name no row. So this stands behind an authored or foreign table,
+#: and it is **reported as an assumption** rather than hidden. 30 ticks is the
+#: corpus's own slowest palette step, so an undecoded duration is watched for
+#: at least as long as the slowest animation anyone has measured.
+ANIM_DWELL_FLOOR_TICKS = 30
+
+
+def base_animation(map_dir, document: dict, resource: str):
+    """The pushed map's `0x6c` records and `0x70` frames, off the disc tree.
+
+    Returns `(records, frames, source)`. `records` and `frames` are `None`
+    when the resource carries no animation, which is the common map.
+
+    **Read from the base rather than the document, on purpose.** Schema §8 puts
+    both chunks on the *carried from base* side, so `dump` never writes them
+    and `build` copies them verbatim. Putting them in the document would make
+    them look authorable when nothing in the preview can show an animation, and
+    would put `build` in the business of writing bytes it currently copies --
+    on the one leg whose entire value is byte-exactness over 1,575 files. The
+    shape does not foreclose it: if animation ever becomes authorable, this
+    reads the document instead and nothing else changes.
+
+    **The document's own pin is what makes the read verifiable.** `CONTEXT.md`,
+    *Base map*: a document "is a diff against it, never a replacement... and
+    pins the one it expects by a sha256 per resource." A tree that is not this
+    document's own is a tree whose records mean something else.
+
+    The frames may live on a **sibling resource of the same map** --
+    `MAP053.19` and `MAP061.10` each declare a palette animation with a null
+    `0x70` pointer and keep their frames on `.8`. That is the same sharing
+    `palettes` and `light_rig` already do across a state group, and a reader
+    that assumed the two chunks travel together would refuse two perfectly
+    ordinary maps. The sibling is usually **not** in `base.resources` (MAP053
+    a1 pins one resource), so it is not itself pinned, and `source` says where
+    the frames came from rather than reporting them in the same words.
+    """
+    if map_dir is None or not Path(str(map_dir)).is_dir():
+        raise LiveLinkError(
+            "the animation lives in the map's base resource and there is no "
+            "extracted disc tree to read it from. The push is not refused over "
+            "it -- the erase is a separate act with a separate guard")
+    map_dir = Path(str(map_dir))
+    pins = {e.get("name"): e.get("sha256")
+            for e in (document.get("base") or {}).get("resources") or ()}
+    if resource not in pins:
+        raise LiveLinkError(
+            f"this document does not pin a resource named {resource}, so "
+            f"there is nothing to verify a read of it against. It pins "
+            f"{len(pins)}: {', '.join(sorted(pins)[:6])}"
+            + (" ..." if len(pins) > 6 else ""))
+    data = _read_pinned(map_dir, resource, pins[resource])
+
+    records = _mapfile.read_animation_instructions(data)
+    frames = _mapfile.read_palette_animation(data)
+    if records is None:
+        return None, None, resource
+    if frames is not None:
+        return records, frames, resource
+
+    wants = any(r.is_palette and r.frame_count for r in records)
+    if not wants:
+        return records, None, resource
+    stem = resource.split(".")[0]
+    for sibling in sorted(map_dir.glob(f"{stem}.*")):
+        if sibling.suffix == ".GNS" or sibling.name == resource:
+            continue
+        blob = sibling.read_bytes()
+        found = _mapfile.read_palette_animation(blob)
+        if found is None:
+            continue
+        if sibling.name in pins:
+            _read_pinned(map_dir, sibling.name, pins[sibling.name])
+            return records, found, f"{resource} (frames from {sibling.name})"
+        return records, found, (
+            f"{resource} (frames from {sibling.name}, which this document "
+            f"does not pin)")
+    raise LiveLinkError(
+        f"{resource} declares a palette animation and carries no `0x70` frame "
+        f"chunk, and no other resource of {stem} carries one either")
+
+
+def _read_pinned(map_dir, resource: str, want: str) -> bytes:
+    path = map_dir / resource
+    if not path.is_file():
+        raise LiveLinkError(
+            f"the extracted disc tree at {map_dir} holds no {resource}, and "
+            "the animation is read from the base resource")
+    data = path.read_bytes()
+    got = hashlib.sha256(data).hexdigest()
+    if got != want:
+        raise LiveLinkError(
+            f"{resource} in {map_dir} is not the resource this document was "
+            f"dumped from: it pins sha256 {want[:16]}... and the file is "
+            f"{got[:16]}.... Its animation records would not be this map's")
+    return data
+
+
+def confirm_animation_erased(client) -> tuple[bool, list[str]]:
+    """Read the table back and confirm no TEXTURE record survived the erase.
+
+    The texture half of decision 11, and it is graded by **bytes**, in
+    different words from the palette half on purpose. Decision 10's rule: *a
+    weaker check reported in the same words as the strong one is worse than no
+    check* -- the artist reads "confirmed" and believes the thing that was not
+    proved. What was proved here is that the records are gone from RAM, not
+    that the screen stopped moving: the corpus's slowest record is 240 ticks,
+    4.00 s, and that is not time to spend inside a button press.
+
+    Palette records are not counted. Nothing installs a texture record, so
+    every surviving one is the replaced map's; the palette records in the table
+    at this point are the pushed map's own, just written.
+    """
+    table = client.read_live(ANIM_TABLE, ANIM_TABLE_BYTES)
+    left = [r for r in read_animation_table(table) or ()
+            if any(r.raw) and not r.is_palette]
+    if not left:
+        return True, ["animation: no texture record left in the table -- "
+                      f"{ANIM_TABLE_BYTES} bytes read back at "
+                      f"0x{ANIM_TABLE:08X}. This is a BYTE confirmation, not a "
+                      "picture: the slowest texture record in the corpus is "
+                      "4.00s per step and that is not time to spend inside a "
+                      "press, so what is proved is that the records are gone, "
+                      "not that the sheet stopped being shuffled"]
+    where = ", ".join(f"({r.x}, {r.y})" for r in left[:4])
+    return False, [
+        f"animation: {len(left)} texture record(s) survived the erase, at "
+        f"{where}{' ...' if len(left) > 4 else ''} -- byte-read back from "
+        f"0x{ANIM_TABLE:08X}. Those are the replaced map's, and they scroll "
+        "rectangles inside the sheet this push just uploaded"]
+
+
+def animation_report(records, source: str) -> list[str]:
+    """Part 5: what the **edit** path says about the map's own animation.
+
+    The rule is one line -- *neutralise foreign animation; never neutralise a
+    map's own.* On `Push to PCSX` the animation belongs to the document's own
+    map: `build` will carry `0x6c` and `0x70` to the disc verbatim, and
+    freezing it would show the artist a picture the shipped map can never
+    produce, which is the loupe lying in exactly the way the shared palette
+    packing exists to prevent.
+
+    So the edit path explains rather than acts. This reporting half is needed
+    on the *Replace* path anyway (decision 4), so it is cheaper than saying
+    nothing, not dearer.
+    """
+    rows = animation_rows(records)
+    if not rows:
+        return [f"animation: {source} declares no animated CLUT row, so every "
+                "palette this push writes is the one the battle shows"]
+    step = animation_dwell(records)
+    return [
+        f"animation: {source} animates CLUT row(s) {_rows(rows)} and the "
+        f"battle repaints them every {step:.2f}s from the map's own `0x70` "
+        "frames. Those colours are in this document and on the disc; the push "
+        "writes them and the engine cycles them, which is what the shipped map "
+        "does. They are NOT frozen -- only a Replace erases an animation, and "
+        "only because it is the map being replaced's"]
+
+
+def plan_erase_animation() -> list[tuple[int, bytes]]:
+    """Part 1: zero the host map's whole instruction table.
+
+    640 bytes at the address `check_animation_table` has just confirmed. An
+    all-zero record is **the corpus's own encoding for no animation** -- 21 of
+    `MAP022.9`'s 32 slots ship that way and the engine already walks all 32
+    every frame -- so this writes what the disc writes rather than disabling a
+    feature it has to know how to switch off. Measured [LIVE] 2026-08-27:
+    zeroing record 0 took CLUT row 13 from 4.49 steps a second to 0.00 while
+    its two siblings stayed at 4.5, which is a control the poke gets for free.
+
+    **The whole table, not the palette records.** 60 of the corpus's tables
+    drive CLUT rows and 94 drive TEXTURE regions, and Gariland's own eight
+    texture records point at `x = 839..928`, inside the four VRAM pages a swap
+    has just uploaded a foreign sheet to. A fix scoped to palettes leaves them
+    shuffling rectangles inside the new sheet, to be reported later in words
+    that sound unrelated to this bug.
+    """
+    return [(ANIM_TABLE, bytes(ANIM_TABLE_BYTES))]
+
+
+#: The console's frame buffer, in 16-bit pixels. A `0x6c` record names an
+#: absolute rectangle in it; ~84 records in the corpus name one that does not
+#: fit, at `x` 3,840 / 61,440 / 61,680 and `y` 3,840 / 4,080 / 61,440 / 65,520.
+#: Those are *absent* records rather than corrupt files -- schema §10.3's
+#: terrain rule applied here -- and they are refused rather than written.
+VRAM_WIDTH = 1024
+VRAM_HEIGHT = 512
+
+
+def _fits_in_vram(r) -> bool:
+    return (0 <= r.x and r.x + r.width <= VRAM_WIDTH
+            and 0 <= r.y and r.y + r.height <= VRAM_HEIGHT)
+
+
+def plan_install_animation(records, frames) -> tuple[list, list[str]]:
+    """Parts 3 and 4: install the pushed map's PALETTE animation, and name
+    everything left behind.
+
+    `records` and `frames` are the pushed map's own `0x6c` and `0x70` chunks,
+    read from its BASE resource on the extracted disc tree -- the interchange
+    document carries neither (schema §8 puts both on the *carried from base*
+    side), and putting them in the document would make them look authorable
+    when nothing in the preview can show an animation.
+
+    Three things are deliberately not written:
+
+    - **texture records** (#653). A palette record needs no translation: the
+      CLUT line is `y = 480` on every map, forced by the packet encoding that
+      gave `0x7800` on 385 of 385 polygons. A texture record is absolute VRAM
+      against its own map's sheet base, and that base is assigned by the
+      loader -- it is in neither the document nor the base resource, and it is
+      not a constant (479 of 577 sit at `x >= 768`, 80 at `x = 0`, 18
+      elsewhere). Rebasing by the dominant value would be right for most and
+      silently wrong for ~98 with nothing to say which.
+    - **records that do not fit in VRAM**, which `is_palette` does not screen
+      for: it asks where a record points, not whether the place exists.
+    - **empty slots**, which the erase has already left as zeros -- the shape
+      the disc itself ships for "no animation".
+
+    Returns `(writes, notes)`. The notes are decision 4's rule: name what was
+    skipped, never drop it silently.
+    """
+    records = list(records or ())
+    live = [r for r in records if any(r.raw)]
+    palette = [r for r in live if r.is_palette and _fits_in_vram(r)]
+    notes = []
+
+    if not live:
+        return [], ["animation: this map carries no animation table, so there "
+                    "is no animation to install -- the readback expects "
+                    "nothing to move"]
+    if palette and not frames:
+        raise LiveLinkError(
+            f"this map's animation names {len(palette)} CLUT row(s) and its "
+            "`0x70` frame chunk was not found. Installing the records without "
+            "the frames would point the engine at the REPLACED map's colours, "
+            "cycling on this map's rows -- which is the bug with an extra step")
+
+    stride = _mapfile.ANIM_INSTRUCTION_STRIDE
+    writes = [(ANIM_TABLE + r.index * stride, _armed(r.raw)) for r in palette]
+    if writes:
+        writes.append((ANIM_FRAMES, _pack_frames(frames)))
+
+    texture = [r for r in live if not r.is_palette]
+    if texture:
+        notes.append(
+            f"animation: {len(texture)} texture record(s) erased and NOT "
+            "installed -- a texture record is absolute VRAM against its own "
+            "map's sheet base, and that base is the loader's, in neither the "
+            "document nor the base resource (#653). The sheet itself IS "
+            "pushed; what is not is the animation that scrolls it")
+    for r in live:
+        if r.is_palette and not _fits_in_vram(r):
+            notes.append(
+                f"animation: record {r.index} names ({r.x}, {r.y}) "
+                f"{r.width}x{r.height}, which is outside the console's "
+                f"{VRAM_WIDTH}x{VRAM_HEIGHT} frame buffer -- an absent record, "
+                "refused rather than written")
+    if palette:
+        notes.append(
+            f"animation: installed {len(palette)} palette record(s) driving "
+            f"CLUT row(s) {_rows(animation_rows(palette))}, and the 16 frames "
+            "they read")
+    return writes, notes
+
+
+def _armed(raw: bytes) -> bytes:
+    """A disc record with the engine's run flag set -- the one byte the LOADER
+    owns. Everything the map declares is carried verbatim; see
+    `ANIM_RUN_FLAG_BYTE` for the measurement that put it here."""
+    out = bytearray(raw)
+    out[ANIM_RUN_FLAG_BYTE] = ANIM_RUN_FLAG
+    return bytes(out)
+
+
+def _pack_frames(frames) -> bytes:
+    """The `0x70` chunk as bytes, from `mapfile.read_palette_animation`'s
+    16 x 16 BGR555 words -- blank frames included, because a frame's index is
+    what a record refers to."""
+    packed = b"".join(int(w).to_bytes(2, "little")
+                      for frame in frames for w in frame)
+    if len(packed) != ANIM_FRAMES_BYTES:
+        raise LiveLinkError(
+            f"the `0x70` frame chunk is {ANIM_FRAMES_BYTES} bytes -- "
+            f"{_mapfile.PALETTE_ANIM_FRAMES} frames of {CLUT_ENTRIES} words -- "
+            f"and this packs to {len(packed)}")
+    return packed
+
+
+def animation_dwell(records) -> float:
+    """Seconds the readback must watch for, for the rows THIS map animates.
+
+    One step of the slowest palette record -- `max(duration)/60` -- which is
+    <= 0.5 s on every map in the corpus and 0.2 s on Gariland.
+
+    **Palette records only.** The corpus's slowest record is 240 ticks, or
+    4.00 s, and it is a TEXTURE record; that is not time to spend inside a
+    button press, which is why decision 11's texture half is byte-confirmed
+    and reported in different words. A dwell that took the whole table's
+    maximum would make every press with a texture animation in it feel hung.
+
+    `0.0` when the map animates no CLUT row -- there is nothing to wait for,
+    and the readback still runs: two samples, expecting no movement.
+    """
+    durations = [r.duration or ANIM_DWELL_FLOOR_TICKS
+                 for r in records or ()
+                 if r.is_palette and r.frame_count and r.clut_row is not None]
+    return max(durations) / ANIM_TICKS_PER_SECOND if durations else 0.0
+
+
+# --- the sinks a pose is written to ----------------------------------------
+# Every one of these was read out of `reference-assets/thief_whats_this.sstate`
+# and is asserted against it in `tests/test_live_link.py`, rather than being
+# carried in prose. Two of them are corrections to labels that were about to be
+# built on: the scratch struct's angle offsets are mislabelled (its yaw is at
+# `+0x7C`, the slot called roll), and `camera_current_w` (`0x801B8B04`) is NOT
+# the zoom -- it reads 0 in a running battle, because the whole
+# `saved`/`start`/`current` block is an idle effect save/restore slot.
+
+#: The camera's optical centre -- the world point it is aimed at. Three s32,
+#: 20.12 fixed point, so `raw / 4096` is FFT world units.
+WORK_POSITION = 0x800E4E74
+
+#: `work_rotation` -- pitch, yaw, roll as three `short`s, 4096 = 360 degrees.
+WORK_ROTATION = 0x800A7784
+
+#: The live zoom, three s32 at 4096 = 1.0x. Mirrored at scratch `+0x80`.
+SPRITE_SCALE = 0x800C7CA0
+
+#: The engine's composed view rotation, nine `short`s at 4096 = 1.0 -- read by
+#: BOTH the map affine transform and `project_all_unit_sprites`. A push does
+#: not write here; the engine rebuilds it every frame from `work_rotation`,
+#: which is what makes reading it back a BEHAVIOURAL check on a pose write.
+CAMERA_VIEW_MATRIX = 0x80098A24
+
+#: `camera_tracked_target`, three s32: the GTE translation's other half, where
+#: `TR = camera_tracked_target - R*work_position`. It reads `{256, 160, 640}`.
+CAMERA_TRACKED_TARGET = 0x800A77B0
+
+#: The VERTICAL DATUM: the `160` of that triple, the reason `work_position`
+#: projects to screen y=160 on a 240-line frame instead of the midpoint 120.
+#: FFT frames the action two thirds down, leaving headroom -- so a pose sync
+#: that is right in every other respect still leaves the two views 40 world
+#: units, 1.43 tiles, apart vertically, which is the artist's reported symptom.
+#: It is the engine's own named word, not a constant anyone fitted.
+CAMERA_VERTICAL_DATUM = CAMERA_TRACKED_TARGET + 4
+
+#: Where a sync puts it: the middle of the frame, so the optical centre and the
+#: screen centre coincide. The correction lives in the ENGINE rather than in an
+#: offset applied here, so it scales with zoom for free and there is no
+#: hand-tuned 40 to keep right. Costs: the emulator's framing is then not
+#: authentic, and `smooth_track_camera_target` (`FUN_8008B6E4`) maintains this
+#: word per frame, so it may not stick.
+SCREEN_CENTRE_DATUM = 120
+
+
+# --- the camera scratch struct, the OTHER candidate sink --------------------
+# The per-vsync ticker `camera_per_vsync_ticker` (`FUN_801439C0`) reads this
+# struct through a pointer cell and latches it into the GTE block. Decision 12
+# names it the LEADING candidate for a live write, on the strength of its
+# position being byte-identical to `work_position` in the battle savestate.
+#
+# Two things read since say the ranking is the other way round, and both come
+# out of the RE record decision 12 itself cites:
+#
+# * The copy runs `work_position` -> scratch -> GTE, not the reverse. F14 has
+#   it statically at `0x80143AC8/0x80143B24` and validated it live: *"a
+#   `work_position` poke sticks and re-projects; the handoff had it
+#   backwards"*. Byte-identity is what a copy in EITHER direction looks like,
+#   so the savestate cannot rank them and the disassembly can.
+# * F14's own rig note is blunter: *"Camera-scratch pokes do NOT stick"* -- an
+#   interpolator re-drives `+0x68` every frame back to the keyframe target.
+#   That was measured on a cinematic, where an interpolator is running; a
+#   battle idle may differ, which is exactly what the live A/B is for.
+#
+# So both sinks are planned and named, and `work_position` is the default.
+#
+# The angle offsets are NOT mislabelled. Decision 12 reads `[302, 0, 4608]`
+# there and concludes the yaw sits in the slot labelled roll; that reading is
+# at a TWO-byte stride. The fields are four bytes apart -- `renames_high.tsv`
+# gives the aliases itself, `camera_scratch_pitch` at `0x80057790` and `_yaw`
+# at `0x80057794` -- and at four bytes the struct reads `[302, 4608, 0]`,
+# agreeing with `work_rotation` word for word.
+
+#: The pointer cell the ticker dereferences once per vsync.
+SCRATCH_STRUCT_PTR = 0x80165F9C
+
+#: What it holds. Confirmed by content against the savestate, not by the label.
+SCRATCH_STRUCT = 0x8005771C
+
+SCRATCH_POSITION = SCRATCH_STRUCT + 0x68        # 3 x s32, mirrors work_position
+SCRATCH_ANGLES = SCRATCH_STRUCT + 0x74          # 3 x s32 slots, pitch/yaw/roll
+SCRATCH_ZOOM = SCRATCH_STRUCT + 0x80            # s32, mirrors sprite_scale
+
+
+# --- the axis frame, spelled a second time ---------------------------------
+# ADR-0004 decision 14, `AXIS_NAME = ("x", "z", "-y")` in `import_document.py`
+# and ratified by `blender_axis_baseline.json`. It cannot be imported from
+# there -- that module needs `bpy`, and imports THIS one -- so it is spelled
+# again, and `tests/test_live_link.py` reads the same ratified baseline to keep
+# the two from drifting. det = +1: it is a rotation, not a mirror.
+
+#: How FFT world axes are named in Blender. Documentation for the pair below.
+BLENDER_FROM_FFT = ("x", "z", "-y")
+
+#: The scale is 1:1. `TILE_UNITS = 28` -- the addon imports geometry at FFT
+#: WORLD scale, so one Blender unit is one FFT world unit and there is no
+#: factor to invent. `godot-learning`'s `GODOT_CAMERA_SIZE = 12.6` is in a
+#: space where 1 unit is 1 TILE, so it is off by 28x used here.
+POSITION_FRACTION = 4096            # s32 20.12
+
+
+def blender_from_fft(v) -> tuple:
+    return (v[0], v[2], -v[1])
+
+
+def fft_from_blender(v) -> tuple:
+    return (v[0], -v[2], v[1])
+
+
+def camera_position(pivot) -> tuple:
+    """A Blender view pivot as the three raw words `work_position` holds.
+
+    The pivot is the OPTICAL CENTRE -- the world point the camera is aimed at,
+    not the camera's own location. FFT has no separate eye position: the
+    projection is orthographic, so a pose is a centre, an orientation and a
+    scale, and there is nothing to place an eye at.
+    """
+    return tuple(round(c * POSITION_FRACTION) for c in fft_from_blender(pivot))
+
+
+# --- decision 12: the camera ------------------------------------------------
+# The engine's camera is orthographic and its rotation is
+# `R = Rx(pitch)*Ry(yaw)*Rz(roll)` -- right-handed elementary rotations with
+# POSITIVE signs, on PSX world axes (X lateral, Y DOWN, Z depth). That was
+# fitted to 65 live samples off a cinematic (F4 in
+# `camera_framing_pivot_decode.md`) and confirmed again against a battle
+# savestate; `tests/test_live_link.py` asserts both the winner and the rivals
+# against that savestate on every commit, because a fit written into prose
+# grades nothing.
+#
+# Angles are the engine's: signed, 4096 = 360 degrees, and stored UNWRAPPED --
+# a battle holds yaw 4608 = 4096 + 512 = 405 degrees, and consumers mask
+# `& 0xfff` themselves. Nothing here normalises on the artist's behalf.
+
+import math                                                # noqa: E402
+
+#: One full turn in the engine's angle units.
+ANGLE_UNITS = 4096
+
+
+def _radians(units: int | float) -> float:
+    return units * 2.0 * math.pi / ANGLE_UNITS
+
+
+Mat3 = tuple
+
+
+def rotation_x(units: int | float) -> Mat3:
+    """Right-handed rotation about X (the lateral axis) -- the camera's pitch."""
+    c, s = math.cos(_radians(units)), math.sin(_radians(units))
+    return ((1.0, 0.0, 0.0), (0.0, c, -s), (0.0, s, c))
+
+
+def rotation_y(units: int | float) -> Mat3:
+    """Right-handed rotation about Y (down) -- the camera's yaw."""
+    c, s = math.cos(_radians(units)), math.sin(_radians(units))
+    return ((c, 0.0, s), (0.0, 1.0, 0.0), (-s, 0.0, c))
+
+
+def rotation_z(units: int | float) -> Mat3:
+    """Right-handed rotation about Z (depth) -- the camera's roll.
+
+    FFT has this axis and has never used it: fixed 0, no control, and roll was
+    0 in all 65 of F4's samples and in the battle savestate. `Rz`'s PLACEMENT
+    in the composition is therefore assumed, never confirmed -- which is why
+    decision 12 clamps a pushed roll to zero rather than driving it.
+    """
+    c, s = math.cos(_radians(units)), math.sin(_radians(units))
+    return ((c, -s, 0.0), (s, c, 0.0), (0.0, 0.0, 1.0))
+
+
+def mat3_multiply(a: Mat3, b: Mat3) -> Mat3:
+    return tuple(tuple(sum(a[i][k] * b[k][j] for k in range(3))
+                       for j in range(3)) for i in range(3))
+
+
+# --- the zoom, which is a dial ---------------------------------------------
+# The emulator's frame is a fixed 256x240; a Blender viewport is whatever shape
+# the artist dragged it to. The two can therefore agree on at most one axis,
+# and rather than pick one, the push derives a zoom from the view distance and
+# multiplies it by a factor in the panel: *"just make the center axis align and
+# we can dial in a zoom in the UI"*.
+#
+# That is not a convenience. It removes the one CONTESTED number in the camera
+# model from the design: the horizontal store-to-pixel factor is unsettled in
+# the RE record -- F15 measured `screen_x ~= view_x` at 1:1, F20's
+# decomposition implies a factor of two, and F19's whole finding was godot's
+# horizontal coming out compressed 0.82x. Under a dial nothing here depends on
+# which of them is right. Pixel aspect is likewise not corrected anywhere:
+# *"if we want a PAR-less comparison we can watch the VRAM viewer"*.
+
+#: The engine's own 1.0x. `sprite_scale` is three s32 at 4096 = 1.0.
+ZOOM_ONE = 4096
+
+#: The Blender view distance at which the dial, at rest, emits 1.0x.
+#:
+#: A STARTING POINT, not a measurement. It is about twelve tiles' worth of
+#: world units, which is roughly what a 240-line frame holds at F15's 20 px per
+#: tile -- but the exact relation between a Blender view distance and an
+#: on-screen extent depends on the viewport's own lens, and the FFT side of it
+#: is the contested factor above. Calibrating this belongs to the dial, which
+#: is why this number is allowed to be approximate and the dial is not.
+ZOOM_REFERENCE_DISTANCE = 336.0
+
+#: Bounds on the emitted scale. These are NOT the game's envelope -- decision 1
+#: pushes a pose faithfully, and the pad's 0xC00-0x1000 is the very thing that
+#: makes a map uninspectable. They exist because Blender hands over a view
+#: distance of 0 when an orbit is driven all the way in, and a scale of 0
+#: collapses the map to a point, which an artist reads as a broken sync.
+ZOOM_RAW_MIN = 1
+ZOOM_RAW_MAX = 1 << 20              # 256x, far outside anything reachable
+
+
+def camera_zoom(view_distance: float, dial: float = 1.0) -> int:
+    """A Blender view distance as the raw word `sprite_scale` holds.
+
+    Inverse, because that is what the artist feels: half the distance is twice
+    the picture. `dial` multiplies the result rather than replacing it, so
+    zooming in Blender still moves the emulator after the dial is turned.
+    """
+    if view_distance <= 0.0:
+        return ZOOM_RAW_MAX
+    raw = round(ZOOM_ONE * dial * ZOOM_REFERENCE_DISTANCE / view_distance)
+    return max(ZOOM_RAW_MIN, min(ZOOM_RAW_MAX, raw))
+
+
+#: Blender view space to FFT screen space. Blender's view is +X right, +Y up,
+#: +Z toward the viewer; FFT's screen is X right, Y DOWN, Z INTO the screen. So
+#: two of the three axes are negated and nothing else changes.
+SCREEN_FROM_VIEW = ((1.0, 0.0, 0.0), (0.0, -1.0, 0.0), (0.0, 0.0, -1.0))
+
+#: FFT world to Blender world, `BLENDER_FROM_FFT` written as a matrix.
+BLENDER_FROM_FFT_MATRIX = ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, -1.0, 0.0))
+
+
+def mat3_transpose(m: Mat3) -> Mat3:
+    return tuple(tuple(m[j][i] for j in range(3)) for i in range(3))
+
+
+def _units(radians: float) -> int:
+    """A angle in the engine's units, wrapped into one turn."""
+    return round(radians * ANGLE_UNITS / (2.0 * math.pi)) % ANGLE_UNITS
+
+
+def view_rotation_to_fft(view_rotation) -> Mat3:
+    """The engine's `R` for a Blender `view_rotation`, before decomposition.
+
+    `view_rotation` is Blender's own: the rotation taking VIEW space to WORLD
+    space, three rows, whose columns are therefore the world directions of the
+    viewport's right, up and toward-the-viewer. Composed the way the spaces
+    chain -- world to view, world frame to world frame, view to screen -- this
+    is `S * view_rotation^T * B`.
+    """
+    world_to_view = mat3_transpose(tuple(tuple(float(c) for c in row)
+                                         for row in view_rotation))
+    return mat3_multiply(mat3_multiply(SCREEN_FROM_VIEW, world_to_view),
+                         BLENDER_FROM_FFT_MATRIX)
+
+
+def camera_angles(view_rotation) -> tuple:
+    """A Blender `view_rotation` as the engine's `(pitch, yaw, roll)`.
+
+    Roll comes back 0 always -- decision 12's one clamp, and the reason is that
+    `Rz`'s placement in the composition is the single part of the camera model
+    never confirmed against hardware: FFT has the axis and has never used it,
+    so roll was 0 in all 65 of F4's samples and in the battle savestate too.
+    A rolled Blender view is answered with the nearest unrolled pose.
+
+    With roll pinned at 0 the composition `Rx(p)*Ry(y)` is
+
+        [[ cy,     0,   sy  ],
+         [ sp*sy,  cp, -sp*cy],
+         [-cp*sy,  sp,  cp*cy]]
+
+    so both angles read straight off, each from a full `atan2` rather than from
+    an `asin` -- which matters, because a camera behind the map is yaw 180 and
+    an `asin` cannot say so. `R[0][1]` is the roll: it is zero exactly when the
+    viewport's right is horizontal, and it is what gets dropped.
+    """
+    r = view_rotation_to_fft(view_rotation)
+    return (_units(math.atan2(r[2][1], r[1][1])),
+            _units(math.atan2(r[0][2], r[0][0])),
+            0)
+
+
+def camera_rotation(pitch: int | float, yaw: int | float,
+                    roll: int | float = 0) -> Mat3:
+    """The engine's view rotation for a pose, at unit scale (not 4096-scaled).
+
+    The order is the whole of the finding: `Rx*Ry*Rz`, and the two arguments
+    are in the order `work_rotation` stores them. The scratch struct's labels
+    disagree -- `renames_high.tsv` calls its `+0x74/78/7C` pitch/yaw/roll while
+    the live struct holds `[302, 0, 4608]` against a camera yaw of 4608, so the
+    yaw is at `+0x7C`. Read a pose out of the scratch struct in the labelled
+    order and this returns a matrix that misses the engine's by 0.948.
+    """
+    return mat3_multiply(mat3_multiply(rotation_x(pitch), rotation_y(yaw)),
+                         rotation_z(roll))
+
+
+#: How far the engine's own composed matrix may sit from the one a pose
+#: implies. The floor is the 4096-quantization -- each entry is a product of
+#: two 12-bit fixed-point sines and the measured fit is about seven LSB -- and
+#: this is eight. A rival composition lands two orders of magnitude out, so the
+#: bar does not need to be tight to separate "landed" from "did not".
+CAMERA_MATRIX_FLOOR = 8 / 4096
+
+
+def camera_readback(stored: bytes, angles) -> tuple:
+    """Does the engine's own view matrix agree with the pose that was pushed?
+
+    `stored` is the 18 bytes at `CAMERA_VIEW_MATRIX`, read back a frame after
+    the write. This is BEHAVIOURAL and that is the whole point: the engine
+    rebuilds that matrix every frame from `work_rotation`, so agreement means
+    the write reached something the engine composes from. A byte readback of
+    the write itself would agree with a poke that nothing downstream ever read
+    -- which is exactly the failure decision 11 was reported as.
+
+    It is a REPORT, not a refusal. The fallback for a sink that does not stick
+    is to pause the emulator, and a paused emulator runs no frame in which to
+    rebuild anything.
+    """
+    want = struct.unpack("<9h", stored)
+    got = camera_rotation(*angles)
+    error = max(abs(got[i][j] - want[i * 3 + j] / 4096)
+                for i in range(3) for j in range(3))
+    return error < CAMERA_MATRIX_FLOOR, error
+
+
+def check_view_syncable(view_perspective: str) -> None:
+    """Refuse the one viewport whose pose is not what is on screen.
+
+    `RegionView3D.view_perspective` is `'ORTHO'`, `'PERSP'` or `'CAMERA'`.
+    Perspective is not refused: FFT is orthographic, so a perspective viewport
+    cannot be made to match by any arithmetic, but the panel's ortho toggle is
+    its own indicator and the addon does not reach in and change a view the
+    artist set.
+
+    Looking through a scene camera is different in kind. `view_location` and
+    `view_rotation` then describe the last FREE view rather than what is on
+    screen, so a push would sync the emulator to a viewport nobody is looking
+    at -- which presents as exactly the bug this feature exists to fix.
+    """
+    if view_perspective == "CAMERA":
+        raise LiveLinkError(
+            "the viewport is looking through a scene camera, and a scene "
+            "camera's pose is not the view's -- Blender still reports the "
+            "last free view, so a sync would push a pose you are not looking "
+            "at. Leave the camera view first.")
+
+
+# --- the pose, and the plan that writes it ---------------------------------
+
+class CameraPose(NamedTuple):
+    """One Blender viewport, in the engine's own raw words.
+
+    A value, not a write: the continuous leg compares the pose it just derived
+    against the one it last pushed and does nothing when they are equal, which
+    is what keeps an idle viewport off the wire.
+    """
+
+    position: tuple           #: 3 x s32, 20.12, -> work_position
+    angles: tuple             #: pitch, yaw, roll, 4096 = 360 -> work_rotation
+    zoom: int                 #: s32, 4096 = 1.0x -> sprite_scale
+
+
+def camera_pose(pivot, view_rotation, view_distance: float,
+                dial: float = 1.0) -> CameraPose:
+    """A Blender viewport as a pose. `bpy`-free: the caller unpacks the
+    `RegionView3D` and hands over a pivot, a rotation matrix and a distance."""
+    return CameraPose(camera_position(pivot),
+                      camera_angles(view_rotation),
+                      camera_zoom(view_distance, dial))
+
+
+#: The two candidate sinks. Which one survives a write during a running battle
+#: is the single thing decision 12 leaves open, and it is answered by an A/B --
+#: poke one, read the engine's own derived matrix at `CAMERA_VIEW_MATRIX` one
+#: frame later, poke the other, compare, with a framebuffer dump as the witness
+#: because only a render settles a rendering question.
+CAMERA_SINK_WORK = "work"
+CAMERA_SINK_SCRATCH = "scratch"
+
+#: F14 measured a `work_position` poke sticking and re-projecting, and
+#: camera-scratch pokes NOT sticking. That was on a cinematic, where an
+#: interpolator is re-driving the scratch every frame; the artist's loop is a
+#: battle idle, which is why the other plan exists rather than being deleted.
+CAMERA_SINK_DEFAULT = CAMERA_SINK_WORK
+
+
+def plan_camera(pose: CameraPose,
+                sink: str = CAMERA_SINK_DEFAULT) -> list:
+    """`(address, bytes)` for one pose, plus the framing datum.
+
+    The widths are the engine's and they differ between the sinks:
+    `work_rotation` holds three SHORTS, while the scratch struct's angles are
+    word slots four bytes apart. Getting that wrong writes a yaw eight bytes
+    past anything that reads it -- the map is still there, turned wrong -- and
+    it would answer the A/B above with a false negative.
+
+    The datum poke is in both plans because the 40-unit vertical gap is a
+    property of how FFT frames a shot, not of which sink carried the pose.
+    """
+    datum = [(CAMERA_VERTICAL_DATUM, struct.pack("<i", SCREEN_CENTRE_DATUM))]
+    if sink == CAMERA_SINK_WORK:
+        return [(WORK_POSITION, struct.pack("<3i", *pose.position)),
+                (WORK_ROTATION, struct.pack("<3h", *pose.angles)),
+                (SPRITE_SCALE, struct.pack("<3i", *([pose.zoom] * 3)))] + datum
+    if sink == CAMERA_SINK_SCRATCH:
+        return [(SCRATCH_POSITION, struct.pack("<3i", *pose.position)),
+                (SCRATCH_ANGLES, struct.pack("<3i", *pose.angles)),
+                (SCRATCH_ZOOM, struct.pack("<i", pose.zoom))] + datum
+    raise LiveLinkError(
+        f"unknown camera sink {sink!r}; it is {CAMERA_SINK_WORK!r} or "
+        f"{CAMERA_SINK_SCRATCH!r}")
+
+
 #: Document fields with no live sink, and why. Decision 4 wants these NAMED on
 #: every push rather than silently dropped.
+#: How often the continuous sync looks at the viewport, in seconds. 20 Hz is
+#: the cadence decision 12 names, and it is a LOOK, not a write -- the write
+#: happens only when the pose actually changed, which is what makes an idle
+#: Blender cost nothing.
+CAMERA_SYNC_INTERVAL = 0.05
+#: How often it looks after a write FAILED. Nothing here is worth 20 attempted
+#: connections a second to an emulator that is not running, and the artist gets
+#: the pose within two seconds of starting one.
+CAMERA_SYNC_BACKOFF = 2.0
+
+
+class CameraSyncTicker:
+    """What a continuous-sync tick DECIDES, with no `bpy` and no socket in it.
+
+    Decision 12 part 2 builds the timer on top of the button, and the timer's
+    risk is not the arithmetic -- that is the button's, and it is proven. The
+    timer's risk is cadence: pushing a viewport nobody moved, retrying a write
+    that already landed, or saying the same sentence twenty times a second.
+    Those are decisions rather than plumbing, so they live here where a plain
+    `pytest` can grade them.
+
+    Three rules, and each one is a defect it would otherwise ship:
+
+    * **Only a CHANGED pose is written.** A still viewport makes no traffic at
+      all, which is what makes decision 2's "ON by default costs nothing when
+      no emulator is running" true rather than aspirational.
+    * **A failed write is not a push.** The pose is remembered on success only,
+      so an emulator started after Blender receives the view the moment it
+      answers, with no nudge from the artist.
+    * **Only state CHANGES are reported.** The sync is meant to be invisible
+      while it works; a line per tick would bury the push reports that share
+      the console and the Log.
+
+    The readback is deliberately NOT here. It is the button's instrument -- a
+    second round trip per tick, and a line per tick in the Log, to re-answer a
+    question the artist already answered by pressing the button once.
+    """
+
+    def __init__(self, interval=CAMERA_SYNC_INTERVAL,
+                 backoff=CAMERA_SYNC_BACKOFF):
+        self._interval = interval
+        self._backoff = backoff
+        self._pushed = None      # the last pose the emulator ACKNOWLEDGED
+        self._said = None        # the state already reported, so it is not again
+        self._failing = False
+
+    def wants(self, pose) -> bool:
+        """Is this pose worth a write? Only if it is not the one that landed."""
+        return pose != self._pushed
+
+    def interval(self) -> float:
+        """Seconds until the next look. Backed off only by a FAILED write --
+        an idle reason is not the emulator's fault and must not slow it."""
+        return self._backoff if self._failing else self._interval
+
+    def succeeded(self, pose) -> list:
+        """The write landed. Returns the lines worth saying, usually none."""
+        self._pushed = pose
+        lines = []
+        if self._failing or self._said is not None:
+            lines.append("the camera sync reached the emulator again")
+        self._failing = False
+        self._said = None
+        return lines
+
+    def failed(self, error) -> list:
+        """The write did not land. The pose is NOT remembered, so the next
+        tick retries it."""
+        self._failing = True
+        return self._announce(f"the camera sync cannot reach the emulator: "
+                              f"{error}")
+
+    def idle(self, reason) -> list:
+        """Nothing to push, and not because of the emulator -- a viewport
+        looking through a scene camera, say. Reported once and at full rate."""
+        return self._announce(f"the camera sync is idle: {reason}")
+
+    def _announce(self, line) -> list:
+        if self._said == line:
+            return []
+        self._said = line
+        return [line]
+
+    def reset(self) -> None:
+        """Forget everything. The toggle going off and on again must RESEND,
+        because the battle's own camera moved while the sync was off."""
+        self.__init__(self._interval, self._backoff)
+
+
 UNPUSHED = {
     "the terrain grid": "no located sink -- the tile records themselves: "
                         "their heights, slopes and walkability. This is NOT "
@@ -2067,3 +3345,301 @@ UNPUSHED = {
 #: got a sink. The entry for the sheet said it was built "by
 #: `tools/live_push.py`'s savestate round trip"; that tool is gone, and so is
 #: the premise it rested on.
+
+
+# --- decision 13: isolating the map ----------------------------------------
+# Everything above pushes a DOCUMENT FIELD at a live sink. Nothing below does.
+# These are *isolation writes* (`CONTEXT.md`): engine state with no document
+# behind it, written to take something off the screen and restored from a value
+# saved before the write. They are deliberately outside the push's reporting.
+
+#: Head of the unit sprite display-object list. Eighteen readers, three
+#: writers, and every one of the writers is list surgery -- which is why the
+#: lever is the per-unit flags below and NOT this pointer. Nulling the head
+#: would hide the units and also blind `unit_sprite_object_find` (0x8007A6E4),
+#: which gameplay resolves ids through.
+UNIT_LIST_HEAD = 0x80098A54
+
+#: The three fields the walk reads, at the offsets the engine's OWN getter uses.
+#: `unit_sprite_object_find` does `lw node+0x0` for the next pointer and
+#: **`lbu` node+0x4** for the id -- a byte, not a word. Read as a word the
+#: Gariland list's first id is 0x0061000A; the low byte, 0x0A, is the number
+#: `{44}`/`{46}` and the `{47}` ghost gate pass around.
+UNIT_NEXT = 0x0
+UNIT_ID = 0x4
+
+#: The two halfwords `unit_sprite_object_hide` (0x8008D18C) zeroes together --
+#: `sh zero,0xa(v1)` and `sh zero,0x1d8(v1)`. `+0x1d8` is the one that matters
+#: to the picture: `unit_sprite_render_dispatch` reads it at 0x80086768 and
+#: branches to its epilogue when zero, BEFORE the `+0x298` shadow test at
+#: 0x80086ACC -- so the ground shadow follows from the same branch and
+#: `unit_shadow_disable` (0x8008C2A4) is not needed. `+0xa` is written for
+#: company, because the engine writes the pair.
+UNIT_SHOW = 0xA
+UNIT_DISPATCH = 0x1D8
+
+#: A backstop, not the mechanism -- cycle detection is by visited address,
+#: which is exact. `entd_to_roster_loader_16` loads 16 ENTD slots and `{47}`
+#: adds up to three ghosts, so a chain past 32 is not a roster.
+UNIT_WALK_CAP = 32
+
+
+class UnitNode(NamedTuple):
+    """One display object, and the two halfwords an isolate would overwrite.
+
+    `show` and `dispatch` are SAVED VALUES. Restore writes them back rather
+    than the constant `1` that `unit_sprite_object_show` writes: a unit the
+    game had legitimately hidden -- not yet revealed, erased by a `{46}`,
+    off-roster -- would be wrongly revealed by an un-isolate that copied the
+    engine's own show path.
+    """
+
+    address: int
+    id: int
+    show: int
+    dispatch: int
+
+
+class UnitWalk(NamedTuple):
+    """How far the walk got, and what it may write to.
+
+    `units` holds only nodes that were **validated** -- in main RAM, aligned,
+    and not already visited. The walk never derives a write address from a link
+    it refused, so "not in a battle" degrades to *found nothing, wrote nothing*
+    rather than to a write into garbage.
+    """
+
+    units: list
+    ended: str                 #: why the walk stopped, in the artist's words
+    complete: bool             #: reached the list's own null terminator
+
+    @property
+    def found(self) -> int:
+        return len(self.units)
+
+
+def walk_units(client) -> UnitWalk:
+    """Follow the unit list from its head, saving each node's two flags.
+
+    **One round trip.** Every `read` here is answered from a single `hold()`
+    fetch, so a battle's whole roster costs one GET -- not one per node.
+    """
+    with client.hold():
+        (head,) = struct.unpack("<I", client.read(UNIT_LIST_HEAD, 4))
+        units, seen, node = [], set(), head
+        while True:
+            if node == 0:
+                return UnitWalk(units, "the list ended", True)
+            if not (RAM_BASE <= node <= RAM_BASE + RAM_BYTES - UNIT_DISPATCH - 2):
+                return UnitWalk(units,
+                                f"the chain left main RAM at 0x{node:08X}",
+                                False)
+            if node % 4:
+                return UnitWalk(units,
+                                f"the chain hit a misaligned node at "
+                                f"0x{node:08X}", False)
+            if node in seen:
+                return UnitWalk(units,
+                                f"the chain loops back to 0x{node:08X}", False)
+            if len(units) >= UNIT_WALK_CAP:
+                return UnitWalk(units,
+                                f"the chain is longer than {UNIT_WALK_CAP} "
+                                f"nodes, which is not a roster", False)
+            seen.add(node)
+            units.append(UnitNode(
+                address=node,
+                id=client.read(node + UNIT_ID, 1)[0],
+                show=struct.unpack("<H", client.read(node + UNIT_SHOW, 2))[0],
+                dispatch=struct.unpack(
+                    "<H", client.read(node + UNIT_DISPATCH, 2))[0]))
+            (node,) = struct.unpack("<I", client.read(node + UNIT_NEXT, 4))
+
+
+def plan_hide_units(units: list) -> list[tuple[int, bytes]]:
+    """Zero both flags on every unit the walk validated.
+
+    The engine's own hide, node by node. `+0x1d8` is what takes the sprite and
+    its ground shadow off the screen; `+0xa` goes with it because
+    `unit_sprite_object_hide` writes the pair, and leaving half of it set would
+    put the two out of step with what `{44}`/`{46}` maintain.
+    """
+    return [(u.address + off, b"\x00\x00")
+            for u in units for off in (UNIT_SHOW, UNIT_DISPATCH)]
+
+
+def plan_restore_units(units: list) -> list[tuple[int, bytes]]:
+    """Put both flags back to the values the walk SAVED.
+
+    Not the constant `1` that `unit_sprite_object_show` writes. A unit the
+    battle had legitimately hidden reads 0 here, and an un-isolate that wrote
+    `1` would reveal it -- a unit not yet cued to appear, one a `{46}` erased,
+    one off the roster. The saved value is the only correct restore, and it is
+    why `UnitNode` carries the flags rather than just the address.
+    """
+    return [(u.address + off, struct.pack("<H", value))
+            for u in units
+            for off, value in ((UNIT_SHOW, u.show),
+                               (UNIT_DISPATCH, u.dispatch))]
+
+
+#: The HUD and the cursor have no flag, so they take a code poke -- the first
+#: write this addon makes to the INSTRUCTION STREAM rather than to data. It is
+#: named as its own gate kind rather than smuggled in beside the flags.
+#:
+#: `jr ra` then `nop`, over a function's first two instructions. Safe at an
+#: ENTRY and nowhere else: it returns before the prologue builds a frame, so
+#: `sp` is never touched. The technique is not new to the package --
+#: `workspace/probe496.py` already pokes `0x03e00008` and nops a guard branch.
+RETURN_STUB = struct.pack("<II", 0x03E00008, 0x00000000)
+
+#: The bottom-left HP/MP/CT readout. A confirmed function head (`addiu
+#: sp,sp,-0x248`) with NO direct `jal` caller -- it is dispatched through a
+#: pointer, which is what makes the entry poke the only practical gate rather
+#: than merely the easiest.
+HUD_RENDERER = 0x801363DC
+
+#: The on-grid knife, and **the uncertain one**. `FUN_8008924C` calls
+#: `tile_cursor_bob_render` at 0x80089294, so nulling the caller should take
+#: the whole cursor. It is a named constant because the decision record ships
+#: the uncertainty instead of asserting the address: the artist's first press
+#: resolves it, and *knife gone* / *knife there but not bobbing* / *something
+#: else vanished too* are three different answers.
+CURSOR_RENDERER = 0x8008924C
+
+#: The second candidate, and probably wrong -- `tile_cursor_bob_render` itself
+#: subtracts the table offset from the cursor sprite Y *before* `rotate_vector`,
+#: so nulling it likely leaves the knife drawn and unbobbed. One line to swap.
+CURSOR_RENDERER_FALLBACK = 0x8007E304
+
+#: There is no data switch to find. The nearest thing is `g_cursor_anim_pause`
+#: (0x800960F0) and its own label says it skips the phase/accumulator advance:
+#: it FREEZES THE BOB, it does not hide the cursor. Recorded so the next
+#: session does not re-find it and mistake it for the gate.
+CURSOR_ANIM_PAUSE = 0x800960F0
+
+#: THE CAMERA LEASH, and the reason decision 12's camera push does not stick in
+#: a battle. `FUN_8006FE58` runs every frame and integrates a signed velocity
+#: into `work_position` -- `DAT_800A1C48` into X, `DAT_800A1C4C` into Y --
+#: clamping against the map extent (`DAT_800961B4 * 28 + 14`). So the engine
+#: walks the camera back toward whatever it wants to look at, one step per
+#: frame, and a pushed pose is overwritten before the artist sees it.
+#:
+#: Measured [LIVE] 2026-08-28 against `battle_wizard_melee_777`: push
+#: `work_position` to (100, 0, 100) with the pad idle and the engine eases it
+#: back to (234.9, -18.1, 43.8) over about a second -- 191 units of drift --
+#: then holds. With this gate stubbed the same push holds at exactly
+#: (100.000, 0.000, 100.000), three pushes running, and restoring the eight
+#: bytes puts the drift straight back. That both-arms A/B is what earns the
+#: address.
+#:
+#: Unlike the other two gates this is a LEAF: 141 instructions to its first
+#: `jr ra`, with no `jal`, no `sp` adjustment and no `ra` save anywhere in
+#: between. There is no frame to half-build, so the entry poke is safer here
+#: than at a prologue -- see the code-gate entry test, which checks the two
+#: shapes separately rather than demanding `addiu sp,sp,-N` of both.
+#:
+#: NOT the leash, each cut on its own and measured with the drift unchanged:
+#: `FUN_8008B440` (0x8008B440, the countdown-gated glide -- its counter
+#: `DAT_8009616A` reads 0 for the whole pull-back), `FUN_800700BC`,
+#: `FUN_8006EF00`, `FUN_8008B30C`, `FUN_8008B2C4`. Recorded so the next session
+#: does not re-derive the writer set; it is six functions, and five of them are
+#: innocent.
+CAMERA_LEASH = 0x8006FE58
+
+#: `event_portrait_render_ft4` -- the per-frame builder of the boxed-dialogue
+#: POLY_FT4s (frame, text and speaker portrait alike). Stubbing it takes the
+#: WHOLE box off the screen, portrait included, and the cutscene keeps running:
+#: measured A/B/A against `scenario6_delita_tough_dialogue_pc334`, and three
+#: CROSS presses still advanced the scene with the gate cut.
+#:
+#: Decision 13 shipped boxed dialogue as *the one leg of the ask with no located
+#: gate*, and the three functions it named (`event_display_message_handler`
+#: 0x801308C0, `event_dialogue_tick` 0x8012F6D4, `event_text_glyph_reader`
+#: 0x8014CE80) really are the text pipeline rather than the draw. This is the
+#: draw. `dialog_box_compositor` (0x8014C18C) is NOT: it composites once at box
+#: open, so cutting it mid-dialogue changes nothing on screen -- measured, same
+#: scene, byte-identical picture.
+#:
+#: **Scoped to boxed dialogue, not to UI in general.** Cut against a battle with
+#: the action menu, the unit panel and a damage number on screen, the picture is
+#: unchanged. That is why it is a separate gate from the vitals HUD.
+#:
+#: It supersedes `research/hide_dialogue_box.py`, which hides the box by
+#: clearing CLUT 0x7C3C in a savestate: same picture, but offline and it leaves
+#: the speaker PORTRAIT drawing, because the portrait samples the unit's own SPR
+#: strip at VRAM x832 and not the box palette.
+DIALOGUE_BOX_RENDERER = 0x8012E65C
+
+
+class CodeGate(NamedTuple):
+    """A renderer to stub out, and the eight bytes that were there first.
+
+    `saved` is the only way back: unlike the unit flags there is no constant
+    that could stand in for a function's real prologue.
+    """
+
+    name: str
+    address: int
+    saved: bytes
+
+
+CODE_GATES = (("the vitals HUD", HUD_RENDERER),
+              ("the tile cursor", CURSOR_RENDERER),
+              ("the camera leash", CAMERA_LEASH),
+              ("boxed dialogue", DIALOGUE_BOX_RENDERER))
+
+
+def save_code_gates(client) -> list:
+    """Read each renderer's first eight bytes before anything overwrites them."""
+    with client.hold():
+        return [CodeGate(name, address, client.read(address, 8))
+                for name, address in CODE_GATES]
+
+
+def plan_hide_code(gates: list) -> list[tuple[int, bytes]]:
+    """Stub each renderer to an immediate return."""
+    return [(g.address, RETURN_STUB) for g in gates]
+
+
+def plan_restore_code(gates: list) -> list[tuple[int, bytes]]:
+    """Put each renderer's own prologue back."""
+    return [(g.address, g.saved) for g in gates]
+
+
+def merge_saved(saved: list, found: list) -> list:
+    """The session memory's update rule, for a press that is not the first.
+
+    Keyed on node address. A node already in the memory KEEPS its first saved
+    value -- the second walk read back what the first press wrote, and taking
+    it would save `show = 0` for the whole roster and turn Restore into a
+    no-op that leaves the battle empty. A node not in the memory is new, its
+    flags are genuinely the battle's, and it joins.
+
+    This is what makes Isolate re-pressable against a unit spawning mid-battle
+    without a ticker and without a readback.
+    """
+    out = {u.address: u for u in found}
+    out.update({u.address: u for u in saved})
+    return [out[a] for a in sorted(out)]
+
+
+def isolate_report(walk: UnitWalk, hidden: int, changed: int) -> str:
+    """One sentence, in UNITS. Decision 13's reporting rule.
+
+    Bytes changed is the mechanism's self-check and it stays available, but it
+    cannot be the report: `0 changed` already means *already isolated*, so a
+    null head reporting the same number would make one sentence mean two
+    opposite things. Units found is the second number that keeps them apart,
+    and it is what a refusal was going to protect -- recovered without one.
+    """
+    if not walk.found:
+        return ("found no units -- a null list head, which is what not being "
+                "in a battle looks like. Nothing was written")
+    if walk.complete:
+        line = f"hid {hidden} of {walk.found} units"
+    else:
+        line = (f"hid {hidden} units, then {walk.ended} -- so there may be "
+                f"more on screen than this reached")
+    if not changed:
+        line += " (already isolated; nothing needed writing)"
+    return line

@@ -15,9 +15,28 @@ TWO colour types, because a map carries two pictures:
 They share a directory and a `.png` suffix, so each reader refuses the other's
 colour type outright.  Read one as the other and every texel is wrong in a way
 nothing downstream could name.
+
+It takes a **soft** `numpy` import, and it is the ONE module in this package
+that does -- ADR-0186 **Amendment 13** decision 53.  Everywhere else numpy is
+imported bare (decision 52), because a fallback nothing ever runs is untested
+code.  This file is the exception because it is the SHARED one: the same bytes
+live in `exmateria_map/`, in `addons/exmateria_map/` and in that addon's
+`_vendor/` copy, held identical by `test_build.py` and
+`test_vendored_package.py` -- and the package ships `dependencies = []`, which
+`README.md` states as a product claim.  A bare import here would quietly make
+that claim false for anyone who pip-installs the package alone.
+
+So the fallback is REACHED rather than assumed: `test_source_art.py` sets this
+module's `numpy` to `None` and re-asserts byte identity on the same inputs,
+which is the only thing that stops decision 52's objection applying here too.
 """
 import struct
 import zlib
+
+try:
+    import numpy
+except ImportError:            # decision 53 -- see the module docstring above
+    numpy = None
 
 _SIG = b"\x89PNG\r\n\x1a\n"
 
@@ -49,7 +68,44 @@ def _unfilter(raw, stride, height, bpp):
         row = bytearray(raw[at + 1:at + 1 + stride])
         if f > 4:
             raise ValueError(f"scanline {y}: filter byte {f}")
-        if f:
+        if f <= 2 and numpy is not None:
+            # Sub and Up, vectorised (ADR-0186 Amendment 13 decision 57).
+            # Measured on a 1024x4096 painting -- the shipped N = 4 -- filter
+            # 1 throughout: 1,085 ms to unfilter, and 18.6 ms here.  The whole
+            # `read_rgb_png` including the inflate is 22.0 ms.  Byte for byte
+            # the same picture at every filter and both lane widths.
+            #
+            # ROW BY ROW, not whole-picture.  `prev` is the RECONSTRUCTED row
+            # above, and a PNG chooses its filter per SCANLINE -- so a single
+            # `cumsum` over the whole IDAT is correct only for a file that
+            # happens to use one filter throughout.  Ours do; a painting from
+            # another tool need not, and that is the file this would corrupt
+            # silently, since the CRC covers the chunk and not the picture.
+            if f == 1:
+                # Sub's left neighbour is `bpp` bytes back, so the running sum
+                # runs down the COLUMNS of a (pixels x bpp) view -- one lane
+                # per channel.  Summing wide and truncating at the end is the
+                # same answer as the loop's `& 0xFF` at every step: the low
+                # byte of a sum never depends on the carries above it.
+                lanes = numpy.frombuffer(bytes(row),
+                                         dtype=numpy.uint8).reshape(-1, bpp)
+                row = bytearray(numpy.cumsum(lanes, axis=0,
+                                             dtype=numpy.uint32)
+                                .astype(numpy.uint8).tobytes())
+            elif f == 2:
+                row = bytearray(
+                    (numpy.frombuffer(bytes(row), dtype=numpy.uint8)
+                     + numpy.frombuffer(bytes(prev), dtype=numpy.uint8)
+                     ).tobytes())
+        elif f:
+            # Filters 3 (Average) and 4 (Paeth) stay on the per-byte loop, and
+            # so does everything when numpy is absent.  Neither vectorises:
+            # Paeth picks its predictor per byte from the RECONSTRUCTION of
+            # that byte's own left neighbour, and Average's `>> 1` has the
+            # same dependency, so the row is a genuine serial recurrence.  We
+            # write neither -- but a painting may arrive from any tool, so
+            # this arm is reachable, and decision 57 grades it rather than
+            # letting it rot.
             for x in range(stride):
                 left = row[x - bpp] if x >= bpp else 0
                 up = prev[x]
@@ -134,16 +190,37 @@ def write_rgb_png(rgb, width=256, height=1024):
     """
     if len(rgb) != 3 * width * height:
         raise ValueError(f"{len(rgb)} bytes, expected {3 * width * height}")
-    raw = bytearray()
-    for y in range(height):
-        row = rgb[3 * y * width:3 * (y + 1) * width]
-        raw.append(1)                                    # filter 1 (Sub)
-        raw += bytes((row[x] - (row[x - 3] if x >= 3 else 0)) & 0xFF
-                     for x in range(len(row)))
+    if numpy is None:
+        raw = bytearray()
+        for y in range(height):
+            row = rgb[3 * y * width:3 * (y + 1) * width]
+            raw.append(1)                                # filter 1 (Sub)
+            raw += bytes((row[x] - (row[x - 3] if x >= 3 else 0)) & 0xFF
+                         for x in range(len(row)))
+        raw = bytes(raw)
+    else:
+        # The same Sub, whole-picture: every byte minus the one three back,
+        # with the first pixel of each row differenced against zero.  Filter 1
+        # is written on EVERY row here, so unlike the decode there is no
+        # per-row choice to respect and the picture can go at once.
+        #
+        # 859 ms -> 190 ms at N = 4 (decision 57).  What is left is almost
+        # entirely `zlib.compress(..., 9)`, which alone costs 166 ms on this
+        # volume: the filtering itself went 693 ms -> 24 ms, and the residue
+        # is C already.  Dropping to level 6 would buy the rest and is NOT
+        # done here -- the sidecar is the artist's own file and is written on
+        # every settle, so its size is a durable cost and the 166 ms is not.
+        arr = numpy.frombuffer(rgb, dtype=numpy.uint8).reshape(height,
+                                                               3 * width)
+        left = numpy.concatenate(
+            [numpy.zeros((height, 3), dtype=numpy.uint8), arr[:, :-3]], axis=1)
+        raw = numpy.concatenate(
+            [numpy.ones((height, 1), dtype=numpy.uint8), arr - left],
+            axis=1).tobytes()
     out = bytearray(_SIG)
     out += _chunk(b"IHDR", struct.pack(">IIBBBBB", width, height,
                                        8, 2, 0, 0, 0))
-    out += _chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+    out += _chunk(b"IDAT", zlib.compress(raw, 9))
     out += _chunk(b"IEND", b"")
     return bytes(out)
 
@@ -216,17 +293,37 @@ def write_indexed_png(indices, palette, width=256, height=1024, alpha=None):
 def pack_4bpp(indices):
     """256x1024 one-byte-per-pixel indices -> the disc's packed 131,072-byte
     4bpp sheet.  Low nibble first (schema v1 §1/§6.5:
-    `byte(v*256+u pair) = even | odd<<4`)."""
+    `byte(v*256+u pair) = even | odd<<4`).
+
+    6.3 ms -> 0.14 ms a sheet on numpy (decision 57).  Both arms mask to the
+    low nibble rather than trusting the caller: an index above 15 is a compile
+    bug, and truncating it is what the disc format does, but the two arms must
+    do it the SAME way or the fallback is a second, differently-wrong codec.
+    """
     if len(indices) % 2:
         raise ValueError("odd pixel count")
-    return bytes((indices[i] & 0xF) | ((indices[i + 1] & 0xF) << 4)
-                 for i in range(0, len(indices), 2))
+    if numpy is None:
+        return bytes((indices[i] & 0xF) | ((indices[i + 1] & 0xF) << 4)
+                     for i in range(0, len(indices), 2))
+    v = numpy.frombuffer(indices, dtype=numpy.uint8) & 0xF
+    return (v[0::2] | (v[1::2] << 4)).tobytes()
 
 
 def unpack_4bpp(packed):
-    """The inverse of `pack_4bpp`: packed 4bpp -> one index byte per pixel."""
-    out = bytearray(len(packed) * 2)
-    for i, b in enumerate(packed):
-        out[2 * i] = b & 0xF
-        out[2 * i + 1] = b >> 4
-    return bytes(out)
+    """The inverse of `pack_4bpp`: packed 4bpp -> one index byte per pixel.
+
+    6.9 ms -> 0.08 ms a sheet (decision 57), and this one is not only the
+    addon's: `dump` calls it once per resource, so over the corpus round
+    trip's 1,575 resources it is ~10.9 s of the run against ~0.13 s.
+    """
+    if numpy is None:
+        out = bytearray(len(packed) * 2)
+        for i, b in enumerate(packed):
+            out[2 * i] = b & 0xF
+            out[2 * i + 1] = b >> 4
+        return bytes(out)
+    v = numpy.frombuffer(packed, dtype=numpy.uint8)
+    out = numpy.empty(2 * len(v), dtype=numpy.uint8)
+    out[0::2] = v & 0xF
+    out[1::2] = v >> 4
+    return out.tobytes()

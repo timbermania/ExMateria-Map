@@ -236,6 +236,18 @@ explicit **apply paint** button in the N-panel. No hot timer. The mesh always
 previews the committed state: the index image is the preview source, and it
 moves only on a successful resolve.
 
+> **Amended 2026-08-27 (ADR-0186 Amendment 7, decision 28).** *"No hot timer"*
+> is scoped to **this** flow — `resolve()` on the direct-paint path — and
+> stays. It does **not** bind the converted path, where there is no `resolve()`
+> and no gate to hold pending, and where ADR-0186 Amendment 7 adds a settle
+> timer that fires the compile and the push after painting stops. ADR-0186
+> decision 18 cited this sentence when it rejected per-stroke firing; that
+> citation was over-broad, and Amendment 7 supersedes 18 on value rather than
+> on this rule. The two paths differ in exactly the way §4.1 already implies:
+> here a stroke can be **refused**, so a timer would fire refusals at an artist
+> mid-gesture; on the converted path nothing is refused and a settle can only
+> ever improve what is on screen.
+
 **4.3** — see §3.3 (the trigger set is the resolve set).
 
 **4.4 Sticky refusals.** A refusal-list entry clears only by re-painting the

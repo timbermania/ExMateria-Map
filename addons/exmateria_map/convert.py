@@ -11,6 +11,7 @@ keeps its `palette_id`; only where its texels live changes.
 
 `bpy`-free, like `charts.py`, `pack.py` and `islands.py` (ADR-0007 dec. 4).
 """
+from math import isqrt
 
 # Imported two ways, so the import has to work two ways.  Inside Blender this
 # is a submodule of the `exmateria_map` package and the import must be
@@ -22,10 +23,12 @@ try:
     from .charts import charts
     from .islands import islands
     from .pack import pack
+    from .resample import SCALES
 except ImportError:
     from charts import charts
     from islands import islands
     from pack import pack
+    from resample import SCALES
 
 __all__ = ["convert", "repack", "clut_rows", "islands", "charts"]
 
@@ -51,7 +54,7 @@ def clut_rows(palettes):
     return [[_rgb(c) for c in row["colors"]] for row in palettes]
 
 
-def convert(polygons, sheets, palettes):
+def convert(polygons, sheets, palettes, scale=1):
     """Unwrap, pack, and BAKE `polygons` into true-colour source art.
 
     `sheets` is the disc's 4bpp index plane(s), one 0..15 value per texel,
@@ -61,11 +64,24 @@ def convert(polygons, sheets, palettes):
     sequences: a map has one mesh and several map STATES, and the UVs are
     rewritten once, so every state bakes under that same unwrap.
 
+    `scale` is the Painting's N (ADR-0186 Amendment 10 decisions 34, 36).  The
+    Painting comes back `256N x 1024N`; the **Sheet does not scale** -- it is
+    the 4bpp resource the game reads -- and neither do the UVs, which address
+    the Sheet's texel space and reach the Painting through Blender's
+    normalised coordinates, so one unwrap serves both resolutions.
+
+    Each disc texel becomes an N x N block of IDENTICAL pixels.  That is not a
+    detail: the box average in front of the compile (decision 37) gives that
+    byte back, so `compile_sheet` is handed the same 256x1024 buffer at every
+    scale and decision 7's "the first compile is a no-op" survives onto the
+    spatial axis as an exact byte claim.  Amendment 10 grading criterion 2,
+    checked in `tests/test_convert.py`.
+
     Returns `(converted, art, moved)` -- copies of the polygons with `uv` and
     `texture_page` rewritten, the source art as **RGB bytes**, three per
-    texel, and the disc's own index plane carried to the new layout.  The
-    last two are the pair `CONTEXT.md` calls the **Painting** and the
-    **Sheet**, and they are in the same 256x1024 layout as each other.
+    PAINTING pixel, and the disc's own index plane carried to the new layout.
+    The last two are the pair `CONTEXT.md` calls the **Painting** and the
+    **Sheet**.
 
     The bake is what makes this the OTHER authoring path.  A texel's index is
     resolved through the CLUT row of the chart that reads it -- and a chart is
@@ -91,16 +107,29 @@ def convert(polygons, sheets, palettes):
                          f"palette set(s); a state's sheet and its CLUT are "
                          f"one pair")
 
-    art = [bytearray(3 * len(plane)) for plane in index_planes]
+    if scale not in SCALES:
+        raise ValueError(f"scale {scale!r} is not one of {SCALES}")
+    n = scale
+    paint_w = SHEET_W * n
+
+    art = [bytearray(3 * len(plane) * n * n) for plane in index_planes]
     moved = [bytearray(len(plane)) for plane in index_planes]
 
     def bake(island, src, dst, w):
         row = polygons[island["members"][0]]["palette_id"]
+        # `_replace` speaks TEXELS, on the Sheet.  The Painting is the same
+        # space N times over, so the destination is unpacked back into (x, y)
+        # here rather than `_replace` learning about a scale it has no other
+        # use for -- the Sheet carry and the UV rewrite are 1x whatever N is.
+        dy, dx = divmod(dst, SHEET_W)
         for plane, clut, out in zip(index_planes, rows, art):
+            line = bytearray(3 * w * n)
             for k in range(w):
                 r, g, b = clut[row][plane[src + k] & 0xF]
-                at = 3 * (dst + k)
-                out[at], out[at + 1], out[at + 2] = r, g, b
+                line[3 * k * n:3 * (k + 1) * n] = bytes((r, g, b)) * n
+            for by in range(n):
+                at = 3 * ((dy * n + by) * paint_w + dx * n)
+                out[at:at + 3 * w * n] = line
 
     converted = _replace(polygons, _each(bake, _carry_indices(index_planes,
                                                               moved)))
@@ -122,11 +151,17 @@ def repack(polygons, art, sheets):
     fragments, so a map that would fit under a fresh pack fails after enough
     edits, which is the worst kind of failure to diagnose.
 
-    `art` is RGB, three bytes per texel, and `sheets` is the compiled index
-    plane beside it -- the **Painting** and the **Sheet**, moved together for
-    decision 14's reason.  Either may be one picture or several, and they are
-    parallel.  Returns `(converted, art, moved)`, the same triple `convert`
+    `art` is RGB, three bytes per Painting pixel, and `sheets` is the compiled
+    index plane beside it -- the **Painting** and the **Sheet**, moved together
+    for decision 14's reason.  Either may be one picture or several, and they
+    are parallel.  Returns `(converted, art, moved)`, the same triple `convert`
     returns.
+
+    **N is DERIVED, not passed** (Amendment 10 decision 43's shape): the
+    Painting is N^2 times the Sheet's area, so the two buffers already say
+    what the scale is and there is no stored copy to drift.  Every island is
+    re-placed and none is ever resized, so at N the block that moves is N
+    times as wide and N times as tall and arrives byte for byte.
     """
     one = isinstance(art, (bytes, bytearray))
     sources = [art] if one else list(art)
@@ -136,12 +171,25 @@ def repack(polygons, art, sheets):
         raise ValueError(f"{len(sources)} painting(s) but {len(planes)} "
                          f"sheet(s); a state's Painting and its Sheet are "
                          f"one pair")
+    n2, rem = divmod(len(sources[0]), 3 * len(planes[0]))
+    n = isqrt(n2)
+    if rem or n * n != n2 or n not in SCALES:
+        raise ValueError(
+            f"{len(sources[0])} painting byte(s) over {len(planes[0])} texel(s) "
+            f"is not 3 * N^2 for any N in {SCALES}")
+    paint_w = SHEET_W * n
+
     out = [bytearray(len(a)) for a in sources]
     moved = [bytearray(len(p)) for p in planes]
 
     def blit(island, src, dst, w):
+        sy, sx = divmod(src, SHEET_W)
+        dy, dx = divmod(dst, SHEET_W)
         for original, shifted in zip(sources, out):
-            shifted[3 * dst:3 * (dst + w)] = original[3 * src:3 * (src + w)]
+            for by in range(n):
+                s = 3 * ((sy * n + by) * paint_w + sx * n)
+                d = 3 * ((dy * n + by) * paint_w + dx * n)
+                shifted[d:d + 3 * w * n] = original[s:s + 3 * w * n]
 
     replaced = _replace(polygons, _each(blit, _carry_indices(planes, moved)))
     return (replaced,

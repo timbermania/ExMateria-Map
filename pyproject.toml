@@ -16,6 +16,15 @@ requires-python = ">=3.11"
 license = { text = "GPL-3.0-or-later" }
 # Stdlib only on purpose. A Blender addon cannot pip-install, and the round-trip
 # instrument must run anywhere the corpus does. Don't add numpy, pydantic, etc.
+#
+# ADR-0186 Amendment 13 puts ONE exception behind this line, and it deliberately
+# does not spend the line: `png_indexed.py` -- the one module shared with the
+# addon and with `_vendor/` -- takes a SOFT numpy import with the pure-Python
+# loop retained and force-tested, so this list stays empty and the README's "no
+# dependencies to install" stays true. The addon's OWN modules import numpy
+# bare (decision 52); numpy is a hard dependency of Blender itself, so inside
+# Blender it is present by construction. `[dependency-groups] dev` carries it
+# for the `bpy`-free half's pytest arms.
 dependencies = []
 
 [project.scripts]
@@ -24,7 +33,11 @@ exmateria-map-dump = "exmateria_map.cli:dump_main"
 exmateria-map-build = "exmateria_map.cli:build_main"
 
 [dependency-groups]
-dev = ["pytest>=8"]
+# numpy is here and NOT in `dependencies` above, which is the whole of
+# decision 52's shape: the addon-only modules import it bare because Blender
+# ships it, and the `bpy`-free half of those transforms is graded under plain
+# `pytest`, which needs it resolved. The PACKAGE still installs with nothing.
+dev = ["pytest>=8", "numpy>=1.24"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1616,6 +1616,85 @@ def test_a_whole_plan_costs_one_get_and_one_post():
     assert (http.gets, http.posts) == (1, 1)
 
 
+class _DeafHttp(_FakeHttp):
+    """An emulator that takes a POST and does not honour it.
+
+    The one shape a cache can launder: if a read-back after a write can be
+    answered from bytes WE sent, the self-check passes on an engine that
+    never took them.
+    """
+
+    def post(self, offset, data):
+        self.posts += 1
+
+
+def test_a_push_fetches_the_consoles_RAM_once_and_holds_it():
+    """ADR-0186 Amendment 7 decision 32.  `GET /api/v1/cpu/ram/raw` always
+    returns the whole of `m_wram` -- stock's `offset`/`size` are POST-only, so
+    there is no range read to reach for -- and a push made roughly twenty of
+    them between the descriptor read, the packet fields, the per-bucket
+    before-images and the self-check.  About 40 MB moved to write tens of
+    kilobytes.
+
+    `hold()` is a scope rather than a cache with a lifetime, because the
+    console is RUNNING: an image held past the push it was fetched for would
+    answer the next push's descriptor read with the last push's RAM.
+    """
+    http = _FakeHttp()
+    client = _ram_client(http)
+
+    with client.hold():
+        for offset in (0x000, 0x400, 0x800, 0xC00):
+            client.read(live_link.RAM_BASE + offset, 4)
+
+    assert http.gets == 1
+
+
+def test_the_held_image_is_dropped_when_the_push_ENDS():
+    """Two pushes are two images.  The console runs between them."""
+    http = _FakeHttp()
+    client = _ram_client(http)
+    for _ in range(2):
+        with client.hold():
+            client.read(live_link.RAM_BASE, 4)
+            client.read(live_link.RAM_BASE + 4, 4)
+    assert http.gets == 2
+
+
+def test_a_held_image_can_never_answer_a_read_back_with_OUR_OWN_bytes():
+    """Decision 32: *"The self-check is not traded away for speed. It stays on
+    every automatic push; this decision exists so that it can."*
+
+    A write-through cache would be faster and would make the self-check a
+    tautology -- it would compare the plan against the plan.  The console here
+    accepts the POST and ignores it, which is exactly what a wrong address
+    looks like, and the read-back has to report the console's bytes.
+    """
+    http = _DeafHttp()
+    client = _ram_client(http)
+
+    with client.hold():
+        client.read(live_link.RAM_BASE, 4)          # fetches and holds
+        client.write([(live_link.RAM_BASE, b"abcd")])
+        got = client.read(live_link.RAM_BASE, 4)
+
+    assert got == bytes(4), (
+        "the read-back was answered from the held image; a self-check on this "
+        "client would pass against an engine that took none of the plan")
+    assert http.gets == 2, "a write must drop the image, not update it"
+
+
+def test_ping_asks_the_console_even_inside_a_hold():
+    """`ping` is a liveness question and a held image cannot answer one: the
+    emulator can go away mid-push, and a cached 2 MB would say it had not."""
+    http = _FakeHttp()
+    client = _ram_client(http)
+    with client.hold():
+        client.read(live_link.RAM_BASE, 4)
+        assert client.ping()
+    assert http.gets == 2
+
+
 def test_reads_come_from_the_same_window_the_writes_go_to():
     http = _FakeHttp()
     http.ram[0x400:0x408] = b"12345678"
@@ -1911,3 +1990,1095 @@ def test_missing_emulator_settings_are_named_not_created(tmp_path):
         live_link.enable_lua_editor(str(tmp_path / "nope.json"))
     assert "start it once" in str(e.value)
     assert not (tmp_path / "nope.json").exists()
+
+
+# --- decision 12: the camera model, against the battle savestate ------------
+# Decision 12 states the engine's camera is `R = Rx(pitch)*Ry(yaw)*Rz(roll)`,
+# right-handed elementary rotations with POSITIVE signs, 4096 = 360 degrees.
+# That claim was fitted twice -- to 65 live cinematic samples (F4 in
+# `camera_framing_pivot_decode.md`) and again, offline and in a BATTLE, to the
+# savestate below. Both fits then went into prose, which grades nothing.
+#
+# These are that fit as an assertion. The oracle is the savestate: the angles
+# and the matrix are both read out of a frozen running battle, and nothing in
+# `live_link` computes either one, so a composition that stops reproducing the
+# engine's own matrix has nowhere to hide.
+#
+# The rivals are asserted too. A fit that only checks the winner cannot report
+# that the winner stopped winning -- and one of the rivals here is the trap
+# decision 12 names: `renames_high.tsv` mislabels the scratch struct's angle
+# offsets, so composing from the LABELLED order (yaw at `+0x78`, roll at
+# `+0x7C`) is a plausible wrong move that a winner-only test would pass.
+
+#: `work_rotation` -- pitch, yaw, roll as three `short`s, 4096 = 360 degrees.
+#: Yaw is stored UNWRAPPED: this battle holds 4608 = 4096 + 512 = 405 degrees.
+CAMERA_ANGLES_AT = 0x800A7784
+
+#: `camera_view_matrix` -- the engine's own composed R, nine `short`s at
+#: 4096 = 1.0, read by both the map affine transform and the sprite projector.
+CAMERA_MATRIX_AT = 0x80098A24
+
+#: The composition has to land within the 4096-quantization floor, not exactly:
+#: each entry is a product of two 12-bit fixed-point sines. The measured fit is
+#: 0.00172 -- about seven LSB -- and this bar is eight.
+MATRIX_FLOOR = 8 / 4096
+
+
+def _matrix_error(got, want) -> float:
+    """Largest entry-wise gap between a composed R and the engine's stored one.
+
+    `want` is the raw 4096-scaled `short`s straight out of RAM.
+    """
+    return max(abs(got[i][j] - want[i * 3 + j] / 4096)
+               for i in range(3) for j in range(3))
+
+
+@live_ram
+def test_the_battle_camera_is_Rx_Ry_Rz_with_POSITIVE_signs(gariland_ram):
+    """The engine's own composed matrix, reproduced from the engine's own
+    angles. Neither side of this is computed by the addon."""
+    pitch, yaw, roll = struct.unpack_from(
+        "<3h", gariland_ram, CAMERA_ANGLES_AT - live_link.RAM_BASE)
+    stored = struct.unpack_from(
+        "<9h", gariland_ram, CAMERA_MATRIX_AT - live_link.RAM_BASE)
+
+    error = _matrix_error(live_link.camera_rotation(pitch, yaw, roll), stored)
+    assert error < MATRIX_FLOOR, (
+        f"Rx({pitch})*Ry({yaw})*Rz({roll}) misses the battle's own view "
+        f"matrix by {error:.5f}, past the {MATRIX_FLOOR:.5f} quantization "
+        f"floor")
+
+
+@live_ram
+def test_the_rival_rotation_ORDERS_do_not_reproduce_the_battles_matrix(
+        gariland_ram):
+    """`Ry*Rx*Rz` and `Rz*Ry*Rx` are the two orders a reader of the raw
+    disassembly would reach for; both land two orders of magnitude out."""
+    pitch, yaw, roll = struct.unpack_from(
+        "<3h", gariland_ram, CAMERA_ANGLES_AT - live_link.RAM_BASE)
+    stored = struct.unpack_from(
+        "<9h", gariland_ram, CAMERA_MATRIX_AT - live_link.RAM_BASE)
+
+    x = live_link.rotation_x(pitch)
+    y = live_link.rotation_y(yaw)
+    z = live_link.rotation_z(roll)
+    rivals = {
+        "Ry*Rx*Rz": live_link.mat3_multiply(live_link.mat3_multiply(y, x), z),
+        "Rz*Ry*Rx": live_link.mat3_multiply(live_link.mat3_multiply(z, y), x),
+    }
+    for name, rival in rivals.items():
+        error = _matrix_error(rival, stored)
+        assert error > 0.1, (
+            f"{name} reproduces the battle's matrix to {error:.5f} as well -- "
+            f"this savestate can no longer separate the orders")
+
+
+@live_ram
+def test_a_FLIPPED_sign_on_either_angle_does_not_reproduce_it(gariland_ram):
+    """Decision 12's signs are positive on both axes. Negating either one is
+    reachable through this same function, so the test drives it that way."""
+    pitch, yaw, roll = struct.unpack_from(
+        "<3h", gariland_ram, CAMERA_ANGLES_AT - live_link.RAM_BASE)
+    stored = struct.unpack_from(
+        "<9h", gariland_ram, CAMERA_MATRIX_AT - live_link.RAM_BASE)
+
+    for name, angles in (("pitch", (-pitch, yaw, roll)),
+                         ("yaw", (pitch, -yaw, roll))):
+        error = _matrix_error(live_link.camera_rotation(*angles), stored)
+        assert error > 0.1, (
+            f"negating {name} still reproduces the battle's matrix to "
+            f"{error:.5f}; the sign convention is not pinned by this fit")
+
+
+@live_ram
+def test_the_scratch_struct_holds_the_pose_at_a_FOUR_byte_stride(gariland_ram):
+    """The trap, and it is not the one decision 12 names.
+
+    Decision 12 reports the scratch struct's angle offsets as MISLABELLED --
+    `renames_high.tsv` calls `+0x74/78/7C` pitch/yaw/roll while the struct
+    reads `[302, 0, 4608]` against a camera yaw of 4608, so "the yaw is at
+    `+0x7C`, the slot labelled roll". That reading is at a TWO-byte stride.
+    The fields are four bytes apart -- `renames_high.tsv` says so itself, in
+    the aliases it gives for the same three fields (`camera_scratch_pitch`
+    `0x80057790`, `_yaw` `0x80057794`, `_roll` `0x80057798`) -- and at that
+    stride the struct reads `[302, 4608, 0]` and the labels are simply right.
+
+    So the mislabelling was an artifact of the stride, and this test is the
+    stride: it asserts the pose the scratch really holds AND reproduces the
+    `[302, 0, 4608]` a two-byte read yields, so neither claim can be made
+    against this savestate again without the other showing up beside it.
+    """
+    pose = struct.unpack_from(
+        "<3i", gariland_ram,
+        live_link.SCRATCH_ANGLES - live_link.RAM_BASE)
+    live = struct.unpack_from(
+        "<3h", gariland_ram, live_link.WORK_ROTATION - live_link.RAM_BASE)
+    assert pose == live, (
+        "the scratch struct's angles do not agree with `work_rotation` at a "
+        "four-byte stride; the labels really are wrong")
+
+    narrow = struct.unpack_from(
+        "<3h", gariland_ram, live_link.SCRATCH_ANGLES - live_link.RAM_BASE)
+    assert narrow == (302, 0, 4608), (
+        "the two-byte read no longer yields decision 12's triple, so this "
+        "savestate is not the one that finding was made against")
+
+
+@live_ram
+def test_the_scratch_struct_is_pinned_by_its_CONTENT_not_by_a_label(
+        gariland_ram):
+    """`0x8005771C` is reached through a pointer cell in the engine, so the
+    base is worth confirming rather than trusting. Its position and zoom are
+    byte-identical to `work_position` and `sprite_scale` in this battle, which
+    is three independent words agreeing at once."""
+    assert struct.unpack_from(
+        "<I", gariland_ram,
+        live_link.SCRATCH_STRUCT_PTR - live_link.RAM_BASE
+    )[0] == live_link.SCRATCH_STRUCT
+
+    assert struct.unpack_from(
+        "<3i", gariland_ram, live_link.SCRATCH_POSITION - live_link.RAM_BASE
+    ) == struct.unpack_from(
+        "<3i", gariland_ram, live_link.WORK_POSITION - live_link.RAM_BASE)
+
+    assert struct.unpack_from(
+        "<i", gariland_ram, live_link.SCRATCH_ZOOM - live_link.RAM_BASE
+    )[0] == struct.unpack_from(
+        "<i", gariland_ram, live_link.SPRITE_SCALE - live_link.RAM_BASE)[0]
+
+
+@live_ram
+def test_the_LABELLED_order_read_at_the_WRONG_stride_is_what_fails(
+        gariland_ram):
+    """Decision 12's 0.948 is real -- it is what a two-byte read of the scratch
+    struct composes to. Kept as an assertion because the number is what makes
+    the stride finding above legible: get the stride wrong and the camera model
+    looks broken rather than the read."""
+    stored = struct.unpack_from(
+        "<9h", gariland_ram, CAMERA_MATRIX_AT - live_link.RAM_BASE)
+    narrow = struct.unpack_from(
+        "<3h", gariland_ram, live_link.SCRATCH_ANGLES - live_link.RAM_BASE)
+    error = _matrix_error(live_link.camera_rotation(*narrow), stored)
+    assert 0.9 < error < 1.0, (
+        f"the two-byte read composes to {error:.3f}, not the ~0.948 decision "
+        f"12 measured")
+
+
+def test_the_camera_sink_addresses_are_the_RE_RECORDS():
+    """`live_link`'s sink constants against the addresses decision 12 cites.
+    Both spellings are here on purpose: the tests above read RAM through the
+    literals, so a drifted constant in the module would otherwise be graded by
+    nothing at all."""
+    assert live_link.WORK_ROTATION == CAMERA_ANGLES_AT
+    assert live_link.CAMERA_VIEW_MATRIX == CAMERA_MATRIX_AT
+    assert live_link.WORK_POSITION == 0x800E4E74
+    assert live_link.SPRITE_SCALE == 0x800C7CA0
+    assert live_link.CAMERA_TRACKED_TARGET == 0x800A77B0
+    assert live_link.CAMERA_VERTICAL_DATUM == 0x800A77B4
+
+
+@live_ram
+def test_the_vertical_datum_is_the_engines_own_160(gariland_ram):
+    """Decision 12's third part rests on `camera_tracked_target` reading
+    `{256, 160, 640}` -- the `160` being why the optical centre lands at screen
+    y=160 on a 240-line frame rather than at the midpoint 120. If that word is
+    not 160 there is no 40-unit gap to correct and the whole correction is
+    aimed at nothing."""
+    target = struct.unpack_from(
+        "<3i", gariland_ram,
+        live_link.CAMERA_TRACKED_TARGET - live_link.RAM_BASE)
+    assert target == (256, 160, 640)
+
+    datum = struct.unpack_from(
+        "<i", gariland_ram,
+        live_link.CAMERA_VERTICAL_DATUM - live_link.RAM_BASE)[0]
+    assert datum == target[1], "the datum constant does not address the 160"
+    assert live_link.SCREEN_CENTRE_DATUM == 120
+    assert datum - live_link.SCREEN_CENTRE_DATUM == 40, (
+        "the gap the sync corrects is not the 40 world units decision 12 "
+        "measured")
+
+
+@live_ram
+def test_camera_current_w_is_NOT_the_zoom_in_a_running_battle(gariland_ram):
+    """`renames_high.tsv` offers `camera_current_w` (`0x801B8B04`) and a design
+    was about to take it. It reads 0 in this battle -- the whole
+    `saved`/`start`/`current` block is an idle effect save/restore slot -- while
+    the live zoom is `sprite_scale`, at 1.0x. A push aimed at the labelled word
+    would write a scale nothing reads."""
+    current_w = struct.unpack_from(
+        "<i", gariland_ram, 0x801B8B04 - live_link.RAM_BASE)[0]
+    assert current_w == 0, (
+        "camera_current_w is non-zero here; the reason this sink was rejected "
+        "no longer holds")
+
+    scale = struct.unpack_from(
+        "<3i", gariland_ram, live_link.SPRITE_SCALE - live_link.RAM_BASE)
+    assert scale == (4096, 4096, 4096), "the battle is not at 1.0x zoom"
+
+
+# --- decision 12: a Blender view rotation becomes a pose --------------------
+# The sync's one piece of real arithmetic. Blender hands over `view_rotation`,
+# the rotation taking VIEW space to WORLD space, and the engine wants pitch and
+# yaw in its own units. The two spaces disagree about everything: Blender's
+# view space is +X right, +Y up, +Z toward the viewer; FFT's screen space is X
+# right, Y DOWN, Z into the screen; and their world axes are related by the
+# ratified frame above.
+#
+# There is no savestate for this half -- the savestate holds a pose the ENGINE
+# authored, and nothing in it says which Blender view it corresponds to. So the
+# oracle is geometry: the three axis-aligned viewports whose FFT pose can be
+# worked out by hand, and then a spec that says what "synced" MEANS for every
+# other view.
+
+#: Blender's three axis-aligned viewports as `view_rotation` matrices. The
+#: columns of each are the world directions of view +X (right), +Y (up) and
+#: +Z (toward the viewer), which is what `view_rotation` is.
+TOP_VIEW = ((1, 0, 0), (0, 1, 0), (0, 0, 1))
+FRONT_VIEW = ((1, 0, 0), (0, 0, -1), (0, 1, 0))
+RIGHT_VIEW = ((0, 0, 1), (1, 0, 0), (0, 1, 0))
+
+
+def test_a_TOP_viewport_is_pitch_straight_down(gariland_ram=None):
+    """Numpad 7. Blender looks down its own -Z; through `(x, z, -y)` that is
+    FFT +Y, and PSX Y is DOWN -- so the camera is looking straight down and the
+    pitch is a quarter turn, 1024. Yaw is nothing: the view's right is Blender
+    +X, which is FFT +X already."""
+    assert live_link.camera_angles(TOP_VIEW) == (1024, 0, 0)
+
+
+def test_a_FRONT_viewport_is_the_engines_ZERO_pose():
+    """Numpad 1. Blender looks along its own +Y, which is FFT +Z -- straight
+    into the screen with no pitch and no yaw. This is the one view where every
+    axis already agrees, so a sign error anywhere else still passes here; it is
+    in the set as the fixed point, not as the interesting case."""
+    assert live_link.camera_angles(FRONT_VIEW) == (0, 0, 0)
+
+
+def test_a_RIGHT_viewport_is_a_quarter_turn_of_YAW():
+    """Numpad 3. Blender looks along its own -X, which is FFT -X. For that to
+    come out of the screen's +Z the camera has turned a quarter turn about the
+    down axis: yaw 1024, pitch nothing. Negate the yaw and this lands on 3072."""
+    assert live_link.camera_angles(RIGHT_VIEW) == (0, 1024, 0)
+
+
+def _turntable(azimuth: float, elevation: float):
+    """A Blender turntable orbit as a `view_rotation`: spin about Blender +Z
+    (the world's up), then tilt about the view's own right axis. This is what
+    the default navigation produces and it never rolls, which is the family the
+    sync is defined on."""
+    z = live_link.rotation_z(azimuth)
+    x = live_link.rotation_x(elevation)
+    return live_link.mat3_multiply(z, x)
+
+
+def _apply(m, v):
+    return tuple(sum(m[i][j] * v[j] for j in range(3)) for i in range(3))
+
+
+def test_a_synced_pose_puts_the_viewports_own_AXES_where_they_belong():
+    """The specification, on 96 turntable views at once.
+
+    "Synced" means: whatever direction is to the RIGHT in the Blender viewport
+    is to the right on the emulator's screen, whatever is UP is up, and
+    whatever is going AWAY from the artist is going into the screen. Written
+    out, that is three direction identities -- and they are the definition, not
+    a second way of computing the answer, which is why they can disagree with
+    the arithmetic.
+
+    Screen +Y is DOWN and screen +Z is INTO the screen, so Blender's up and
+    toward-the-viewer both come out negated.
+    """
+    want = {"right": (1, 0, 0), "up": (0, -1, 0), "toward the viewer": (0, 0, -1)}
+    for azimuth in range(0, 4096, 256):
+        for elevation in (128, 302, 512, 900, 1024, 1500):
+            view = _turntable(azimuth, elevation)
+            rotation = live_link.camera_rotation(*live_link.camera_angles(view))
+            for axis, (name, expect) in enumerate(want.items()):
+                in_view = tuple(1 if i == axis else 0 for i in range(3))
+                in_world = _apply(view, in_view)
+                on_screen = _apply(rotation, live_link.fft_from_blender(in_world))
+                gap = max(abs(a - b) for a, b in zip(on_screen, expect))
+                assert gap < 0.002, (
+                    f"at azimuth {azimuth} elevation {elevation}, what is "
+                    f"{name} in Blender lands at {on_screen} on the emulator's "
+                    f"screen, not {expect}")
+
+
+def test_ROLL_is_clamped_to_zero_rather_than_pushed():
+    """Decision 12's exception, and the reason for it: FFT has a roll axis and
+    has never used it, so `Rz`'s placement in the composition is assumed and
+    never confirmed. A rolled Blender view is reachable -- trackball mode, or a
+    view-align -- and the sync answers it with the nearest unrolled pose rather
+    than making the artist the first person ever to drive an unverified path."""
+    rolled = live_link.mat3_multiply(_turntable(0, 512),
+                                     live_link.rotation_z(700))
+    assert live_link.camera_angles(rolled)[2] == 0
+
+
+# --- decision 12: zoom is a DIAL -------------------------------------------
+# The emulator's frame is a fixed 256x240 and a Blender viewport is whatever
+# shape the artist dragged it to, so the two can agree on at most one axis.
+# Rather than pick one, the push derives a zoom from the Blender view distance
+# and multiplies it by a factor the artist can turn -- which deliberately
+# removes the one contested number in the whole camera model from the design.
+# The RE record does not settle the horizontal store-to-pixel factor: F15
+# measured 1:1, F20's decomposition implies 2x, and F19's finding was that
+# godot's horizontal came out compressed 0.82x. Under a dial, nothing here
+# depends on which is right.
+
+def test_the_reference_distance_is_where_the_dial_reads_ONE_TIMES():
+    """The dial's origin: at the reference distance, with the dial at rest, the
+    push emits the engine's own 1.0x. Everything else is relative to this."""
+    assert live_link.camera_zoom(live_link.ZOOM_REFERENCE_DISTANCE) == 4096
+
+
+def test_zooming_IN_in_blender_zooms_in_on_the_emulator():
+    """The relationship the artist actually feels, stated without reference to
+    what the constant is: halve the view distance and the picture doubles.
+    An implementation that got the sense backwards would still pass the test
+    above."""
+    near = live_link.camera_zoom(live_link.ZOOM_REFERENCE_DISTANCE / 2)
+    far = live_link.camera_zoom(live_link.ZOOM_REFERENCE_DISTANCE * 4)
+    assert near == 8192
+    assert far == 1024
+
+
+def test_the_dial_MULTIPLIES_what_the_view_distance_derived():
+    """The dial calibrates the relationship once; it does not replace it.
+
+    Driven at the reference distance so the assertion is about the dial and
+    not about where the rounding of an awkward distance happens to land.
+    """
+    at_rest = live_link.camera_zoom(live_link.ZOOM_REFERENCE_DISTANCE)
+    assert live_link.camera_zoom(
+        live_link.ZOOM_REFERENCE_DISTANCE, 2.0) == 2 * at_rest
+    assert live_link.camera_zoom(
+        live_link.ZOOM_REFERENCE_DISTANCE, 0.5) == at_rest // 2
+
+
+def test_a_zoom_past_the_games_own_ENVELOPE_is_not_clamped():
+    """Decision 1: the pose is pushed faithfully. The pad can only reach
+    0xC00-0x1000, 0.75x to 1.0x, and clamping to that would hand the artist
+    back the same envelope that makes the map uninspectable in the first
+    place. This is what a well-meaning bounds check would break."""
+    close = live_link.camera_zoom(live_link.ZOOM_REFERENCE_DISTANCE / 8)
+    assert close == 8 * 4096, "the push clamped a zoom into the pad's envelope"
+    assert live_link.camera_zoom(live_link.ZOOM_REFERENCE_DISTANCE * 8) == 512
+
+
+def test_a_DEGENERATE_view_distance_does_not_emit_a_zero_scale():
+    """Blender will hand over a view distance of 0 -- it is what an orbit
+    driven all the way in reads. A scale of 0 collapses the map to a point and
+    an artist would read that as the sync being broken, so the guard is here
+    and not in the panel. It is a guard against a degenerate view, NOT the
+    envelope clamp the test above forbids."""
+    for distance in (0.0, -1.0, 1e-9):
+        raw = live_link.camera_zoom(distance)
+        assert raw > 0, f"view distance {distance} emitted scale {raw}"
+        assert raw <= live_link.ZOOM_RAW_MAX
+
+
+# --- decision 12: the pose, and the plan that writes it --------------------
+# The pose is the three things the engine needs -- where the camera is aimed,
+# which way it is turned, how much of the world it holds -- in the engine's own
+# raw words. It is a value rather than a write so that the continuous leg can
+# ask "has this changed?" without touching the emulator.
+
+TOP_OF_GARILAND = dict(
+    pivot=(182.0, 154.0, -4.75),        # the battle's own optical centre
+    view_rotation=TOP_VIEW,
+    view_distance=336.0,                # ZOOM_REFERENCE_DISTANCE, so 1.0x
+)
+
+
+def test_a_pose_is_the_three_things_the_engine_needs():
+    """Every word here is a literal, not a re-derivation: the position is the
+    savestate's own `work_position`, the angles are the hand-worked top view,
+    and the zoom is the engine's 1.0x."""
+    pose = live_link.camera_pose(**TOP_OF_GARILAND)
+    assert pose.position == (745472, 19456, 630784)
+    assert pose.angles == (1024, 0, 0)
+    assert pose.zoom == 4096
+
+
+def test_the_plan_writes_the_pose_at_the_ENGINES_widths():
+    """`work_position` is three WORDS and `work_rotation` is three SHORTS. A
+    plan that packed the angles as words would put the yaw eight bytes past
+    where anything reads it, and the map would still be there, turned wrong."""
+    plan = dict(live_link.plan_camera(live_link.camera_pose(**TOP_OF_GARILAND)))
+
+    assert plan[live_link.WORK_POSITION] == struct.pack(
+        "<3i", 745472, 19456, 630784)
+    assert plan[live_link.WORK_ROTATION] == struct.pack("<3h", 1024, 0, 0)
+    assert plan[live_link.SPRITE_SCALE] == struct.pack("<3i", 4096, 4096, 4096)
+
+
+def test_the_plan_pokes_the_engines_own_VERTICAL_DATUM():
+    """Decision 12's third part, as a write. Uncorrected, a pose that is right
+    in every other respect still leaves the two views 40 world units apart
+    vertically, because FFT frames the action two thirds down the frame -- the
+    artist's reported symptom, surviving everything else being right."""
+    plan = dict(live_link.plan_camera(live_link.camera_pose(**TOP_OF_GARILAND)))
+    assert plan[live_link.CAMERA_VERTICAL_DATUM] == struct.pack("<i", 120)
+
+
+def test_the_SCRATCH_sink_writes_its_angles_four_bytes_apart():
+    """The stride finding, as shipped behaviour rather than as a comment. The
+    scratch struct's angles are word slots; `work_rotation`'s are shorts. Both
+    plans exist because which one survives a live battle is the one thing
+    decision 12 leaves open, and a plan that got this width wrong would answer
+    that A/B with a false negative."""
+    pose = live_link.camera_pose(**TOP_OF_GARILAND)
+    scratch = dict(live_link.plan_camera(pose, live_link.CAMERA_SINK_SCRATCH))
+
+    assert scratch[live_link.SCRATCH_ANGLES] == struct.pack("<3i", 1024, 0, 0)
+    assert scratch[live_link.SCRATCH_POSITION] == struct.pack(
+        "<3i", 745472, 19456, 630784)
+    assert scratch[live_link.SCRATCH_ZOOM] == struct.pack("<i", 4096)
+    assert live_link.WORK_POSITION not in scratch, (
+        "the scratch plan also writes `work_position`, so an A/B between them "
+        "cannot tell which sink carried the picture")
+
+
+def test_the_default_sink_is_work_position_and_the_A_B_is_NAMED():
+    """F14 measured `work_position` sticking and camera-scratch pokes not, so
+    that is the default. Both are offered because F14 was measured on a
+    cinematic, where an interpolator is running, and the artist's loop is a
+    battle idle."""
+    assert live_link.CAMERA_SINK_DEFAULT == live_link.CAMERA_SINK_WORK
+    pose = live_link.camera_pose(**TOP_OF_GARILAND)
+    assert live_link.plan_camera(pose) == live_link.plan_camera(
+        pose, live_link.CAMERA_SINK_WORK)
+    with pytest.raises(live_link.LiveLinkError, match="sink"):
+        live_link.plan_camera(pose, "gte")
+
+
+def test_two_identical_views_make_an_identical_POSE():
+    """What lets the continuous leg skip a write. A pose is a value."""
+    assert (live_link.camera_pose(**TOP_OF_GARILAND)
+            == live_link.camera_pose(**TOP_OF_GARILAND))
+
+
+# --- decision 12: the one thing the sync refuses ---------------------------
+
+def test_a_FREE_viewport_syncs_whether_it_is_ortho_or_perspective():
+    """The ortho toggle is a prerequisite -- FFT is orthographic, so in a
+    perspective viewport no arithmetic can make the pictures match -- but it is
+    NOT forced. The addon does not reach in and change a view the artist set,
+    and the toggle is its own indicator, which is what the panel's rule
+    demands: *"you are putting console stuff in the ui area"*."""
+    live_link.check_view_syncable("ORTHO")          # must not raise
+    live_link.check_view_syncable("PERSP")
+
+
+def test_looking_through_a_SCENE_CAMERA_is_refused_and_says_so():
+    """`view_location` and `view_rotation` then describe the last FREE view,
+    not what is on screen. Pushing them would sync the emulator to a viewport
+    the artist is not looking at -- a stale pose that looks exactly like the
+    bug this feature exists to fix."""
+    with pytest.raises(live_link.LiveLinkError) as e:
+        live_link.check_view_syncable("CAMERA")
+    assert "scene camera" in str(e.value)
+
+
+# --- decision 12: the automatable half of "did the poke stick" -------------
+# A byte readback of a write is a readback of your own bytes. This is not that:
+# `CAMERA_VIEW_MATRIX` is rebuilt by the engine every frame from
+# `work_rotation`, so requiring it to equal the matrix the pushed pose implies
+# is BEHAVIOURAL -- the engine did the composing. It is the same distinction
+# decision 11 paid for, where a byte readback passed a dead animation.
+
+@live_ram
+def test_the_engines_own_matrix_AGREES_with_the_pose_that_produced_it(
+        gariland_ram):
+    """The savestate is a push that already landed: the angles at
+    `work_rotation` and the matrix at `CAMERA_VIEW_MATRIX` are the engine's
+    own, one composed from the other."""
+    stored = gariland_ram[live_link.CAMERA_VIEW_MATRIX - live_link.RAM_BASE:][:18]
+    angles = struct.unpack_from(
+        "<3h", gariland_ram, live_link.WORK_ROTATION - live_link.RAM_BASE)
+    agrees, error = live_link.camera_readback(stored, angles)
+    assert agrees, error
+
+
+@live_ram
+def test_a_pose_that_never_LANDED_is_reported_as_disagreeing(gariland_ram):
+    """The arm that matters. If the write goes to a sink the engine does not
+    rebuild from -- which is the one thing decision 12 leaves open -- the
+    matrix still holds the pose the game itself is using, and this is what
+    says so instead of a green button over an unchanged picture."""
+    stored = gariland_ram[live_link.CAMERA_VIEW_MATRIX - live_link.RAM_BASE:][:18]
+    agrees, error = live_link.camera_readback(stored, (302, 2048, 0))
+    assert not agrees
+    assert error > 0.1
+
+
+# --- the continuous sync's decisions, decision 12 part 2 -------------------
+#
+# The timer itself needs `bpy` and a socket; what it DECIDES needs neither, so
+# the decisions live here as a pure object and are graded here. Every test
+# below is a defect the ticker could plausibly ship: pushing an unchanged view,
+# forgetting that a failed write never landed, or saying the same thing sixty
+# times a second.
+
+def _pose(pitch, yaw=0, x=0):
+    return live_link.CameraPose(position=(x, 0, 0), angles=(pitch, yaw, 0),
+                                zoom=4096)
+
+
+def test_an_unchanged_view_is_not_pushed_again():
+    """A still viewport must cost no traffic at all.
+
+    This is what makes decision 12's "ON by default costs nothing" true. A
+    ticker that pushes every tick is 20 writes a second into a running battle
+    for a viewport nobody is touching."""
+    t = live_link.CameraSyncTicker()
+    p = _pose(300)
+    assert t.wants(p)
+    t.succeeded(p)
+    assert not t.wants(p)
+
+
+def test_a_moved_view_is_pushed_again():
+    t = live_link.CameraSyncTicker()
+    t.succeeded(_pose(300))
+    assert t.wants(_pose(301))
+
+
+def test_a_FAILED_write_does_not_count_as_pushed():
+    """The retry is the whole point: an emulator that was not up yet must get
+    the pose the moment it is, without the artist having to nudge the view."""
+    t = live_link.CameraSyncTicker()
+    p = _pose(300)
+    assert t.wants(p)
+    t.failed("connection refused")
+    assert t.wants(p)
+
+
+def test_a_failure_is_announced_ONCE_not_once_per_tick():
+    """At 20 Hz an unguarded report is 1,200 identical lines a minute in the
+    console and in the Log -- which is how a surface that is meant to carry
+    provenance becomes the thing you turn off."""
+    t = live_link.CameraSyncTicker()
+    first = t.failed("connection refused")
+    assert any("connection refused" in ln for ln in first)
+    assert t.failed("connection refused") == []
+    assert t.failed("connection refused") == []
+
+
+def test_a_failure_BACKS_OFF_the_tick_rate():
+    t = live_link.CameraSyncTicker()
+    assert t.interval() == live_link.CAMERA_SYNC_INTERVAL
+    t.failed("connection refused")
+    assert t.interval() == live_link.CAMERA_SYNC_BACKOFF
+    assert live_link.CAMERA_SYNC_BACKOFF > live_link.CAMERA_SYNC_INTERVAL
+
+
+def test_a_recovery_restores_the_rate_and_says_so_ONCE():
+    t = live_link.CameraSyncTicker()
+    t.failed("connection refused")
+    back = t.succeeded(_pose(300))
+    assert any("again" in ln for ln in back)
+    assert t.interval() == live_link.CAMERA_SYNC_INTERVAL
+    assert t.succeeded(_pose(301)) == []
+
+
+def test_a_success_with_no_failure_behind_it_says_NOTHING():
+    """The sync is meant to be invisible while it works. Only the transitions
+    are worth a line."""
+    t = live_link.CameraSyncTicker()
+    assert t.succeeded(_pose(300)) == []
+
+
+def test_reset_forgets_the_pose_so_re_enabling_pushes_at_once():
+    """Toggling the sync off and on again must resend, because the battle's
+    camera moved on its own while it was off."""
+    t = live_link.CameraSyncTicker()
+    p = _pose(300)
+    t.succeeded(p)
+    assert not t.wants(p)
+    t.reset()
+    assert t.wants(p)
+
+
+def test_an_IDLE_reason_is_announced_once_and_does_not_back_off():
+    """Looking through a scene camera is not an emulator problem, so it must
+    not slow the tick down -- the artist leaves camera view and the sync has to
+    be live again on the next frame, not two seconds later."""
+    t = live_link.CameraSyncTicker()
+    said = t.idle("the viewport is looking through a camera")
+    assert any("camera" in ln for ln in said)
+    assert t.idle("the viewport is looking through a camera") == []
+    assert t.interval() == live_link.CAMERA_SYNC_INTERVAL
+
+
+def test_leaving_an_idle_state_lets_it_be_announced_again():
+    """A once-only report keyed on nothing would go silent forever after the
+    first time; it is keyed on the STATE CHANGING."""
+    t = live_link.CameraSyncTicker()
+    t.idle("looking through a camera")
+    t.succeeded(_pose(300))
+    assert t.idle("looking through a camera") != []
+
+
+# --- decision 13: the unit list walk, against the battle savestate ----------
+# `unit_sprite_list_head` (0x80098A54) heads a singly-linked list of sprite
+# display objects. The shape is not this module's guess: `unit_sprite_object_find`
+# (0x8007A6E4) is the engine's own id -> node getter and the disassembly records
+# exactly how it reads the chain -- `lw node+0x0` for the next pointer, `lbu
+# node+0x4` for the id. A BYTE, which is the one thing the design left to the
+# label set: read as a word the id is 0x0061000A, and the report would name a
+# unit nothing else in the engine calls by that number.
+#
+# The oracle for "the walk lands on real units" is independent of this file and
+# of that disassembly: the F13 probe walked this same list against a running
+# battle and recorded Agrias's node address in the label set. Nothing here
+# computes 0x800B7748.
+
+AGRIAS_NODE = 0x800B7748          # fft-ghidra renames_high.tsv, 0x80098a54, F13
+
+
+import contextlib as _contextlib  # noqa: E402
+
+
+@_contextlib.contextmanager
+def _patched(module, **names):
+    """Swap module constants for the length of a rival reading."""
+    was = {n: getattr(module, n) for n in names}
+    for n, v in names.items():
+        setattr(module, n, v)
+    try:
+        yield
+    finally:
+        for n, v in was.items():
+            setattr(module, n, v)
+
+
+def _image_client(ram: bytes):
+    """A real `RamClient` answering from a RAM image -- the savestate, or one
+    the test has seeded a defect into. The client is real so the walk is
+    exercised through `hold()` and `write()` rather than through a duck."""
+    http = _FakeHttp()
+    http.ram = bytearray(ram)
+    return _ram_client(http)
+
+
+@live_ram
+def test_the_walk_finds_the_battles_units(gariland_ram):
+    """The whole walk, against RAM a real Gariland battle held."""
+    walk = live_link.walk_units(_image_client(gariland_ram))
+    assert walk.complete, walk.ended
+    assert AGRIAS_NODE in [u.address for u in walk.units]
+
+
+@live_ram
+def test_a_rival_reading_of_the_list_does_NOT_find_the_battles_units(
+        gariland_ram):
+    """The arm that gives the one above its meaning.
+
+    Three rival readings of the same bytes -- the head one word off, the next
+    pointer taken from `node+0x4` (where the id is) and the id from `node+0x0`
+    -- and none of them may reach Agrias's node with a clean walk. Without this
+    the test above is satisfied by any walk that happens to terminate.
+    """
+    client = _image_client(gariland_ram)
+    rivals = {
+        "head one word high": (live_link.UNIT_LIST_HEAD + 4,
+                               live_link.UNIT_NEXT, live_link.UNIT_ID),
+        "head one word low": (live_link.UNIT_LIST_HEAD - 4,
+                              live_link.UNIT_NEXT, live_link.UNIT_ID),
+        "next and id swapped": (live_link.UNIT_LIST_HEAD,
+                                live_link.UNIT_ID, live_link.UNIT_NEXT),
+    }
+    truth = live_link.walk_units(client)
+    for name, (head, nxt, ident) in rivals.items():
+        with _patched(live_link, UNIT_LIST_HEAD=head, UNIT_NEXT=nxt,
+                      UNIT_ID=ident):
+            rival = live_link.walk_units(client)
+        assert not (rival.complete and rival.units == truth.units), (
+            f"the rival reading {name!r} is indistinguishable from the "
+            f"engine's own")
+
+
+@live_ram
+def test_a_SEEDED_cycle_is_caught_and_what_it_reached_is_still_hidable(
+        gariland_ram):
+    """The artist's call: hide what you reached, then say the chain went bad.
+
+    The link out of the third node is bent back at the head, which is a cycle
+    no length cap would notice quickly and no null terminator would ever end.
+    Two units are behind it and they are still hidden -- but `complete` is
+    False and `ended` says so, because *"hid 3, then the chain went bad"* and
+    *"hid 8 of 8"* are different sentences.
+    """
+    ram = bytearray(gariland_ram)
+    walk = live_link.walk_units(_image_client(bytes(ram)))
+    assert walk.found > 3, "the savestate has to hold a chain to bend"
+    third = walk.units[2].address
+    struct.pack_into("<I", ram, third + live_link.UNIT_NEXT - live_link.RAM_BASE,
+                     walk.units[0].address)
+
+    bent = live_link.walk_units(_image_client(bytes(ram)))
+    assert not bent.complete
+    assert "loops back" in bent.ended
+    assert bent.found == 3
+    assert [u.address for u in bent.units] == [u.address for u in walk.units[:3]]
+
+
+@live_ram
+def test_a_SEEDED_overlong_chain_stops_at_the_cap(gariland_ram):
+    """A chain longer than a roster can be. `entd_to_roster_loader_16` loads 16
+    ENTD slots and `{47}` adds at most three ghosts, so past the cap the bytes
+    are not a unit list however well-formed they look. Seeded as a march
+    through untouched RAM, so every node passes the range and alignment gates
+    and only the cap can stop it."""
+    ram = bytearray(gariland_ram)
+    node = 0x80190000
+    struct.pack_into("<I", ram, live_link.UNIT_LIST_HEAD - live_link.RAM_BASE,
+                     node)
+    for _ in range(live_link.UNIT_WALK_CAP + 8):
+        struct.pack_into("<I", ram, node - live_link.RAM_BASE, node + 0x400)
+        node += 0x400
+
+    walk = live_link.walk_units(_image_client(bytes(ram)))
+    assert not walk.complete
+    assert "not a roster" in walk.ended
+    assert walk.found == live_link.UNIT_WALK_CAP
+
+
+@live_ram
+def test_a_chain_that_leaves_main_RAM_writes_to_nothing_it_did_not_validate(
+        gariland_ram):
+    """The rule the whole degrade-gracefully answer rests on: the walk stops
+    following a bad link, and never returns a node derived from one."""
+    ram = bytearray(gariland_ram)
+    walk = live_link.walk_units(_image_client(bytes(ram)))
+    second = walk.units[1].address
+    struct.pack_into("<I", ram, second + live_link.UNIT_NEXT - live_link.RAM_BASE,
+                     0x1234ABCD)
+
+    off = live_link.walk_units(_image_client(bytes(ram)))
+    assert not off.complete and "left main RAM" in off.ended
+    assert off.found == 2
+    assert 0x1234ABCD not in [u.address for u in off.units]
+
+
+def test_no_units_is_not_the_same_answer_as_no_bytes_changed():
+    """A null head is indistinguishable from *not in a battle*, and it must not
+    collide with the `0 changed` that already means *already isolated*. Found
+    is its own number for exactly this."""
+    walk = live_link.walk_units(_image_client(bytes(live_link.RAM_BYTES)))
+    assert walk.found == 0
+    assert walk.complete, "a null head is a well-formed empty list"
+    assert walk.units == []
+
+
+@live_ram
+def test_the_unit_id_is_the_BYTE_the_engine_matches_on(gariland_ram):
+    """Read as a word the first id is 0x0061000A, and the report would name a
+    unit by a number nothing in the engine uses.
+
+    Neither bound here is this module's. `unit_sprite_object_find` (0x8007A6E4)
+    matches with `lbu node+0x4`, and `unit_sprite_object_exists` (0x8008CBB4)
+    is called by the `{47}` free-slot scan over **slots 0..0x14** -- so a live
+    battle's ids are small, distinct handles in that range, which a word read
+    is not.
+    """
+    walk = live_link.walk_units(_image_client(gariland_ram))
+    ids = [u.id for u in walk.units]
+    assert ids and all(0 <= i <= 0x14 for i in ids), ids
+    assert len(set(ids)) == len(ids), f"ids collide, so find() could not resolve them: {ids}"
+
+
+# --- decision 13: the unit gate, and why restore is not a constant ----------
+
+@live_ram
+def test_hiding_a_unit_writes_the_two_halfwords_the_engine_zeroes(gariland_ram):
+    """`unit_sprite_object_hide` (0x8008D18C) is `sh zero,0xa(v1)` **and**
+    `sh zero,0x1d8(v1)`. The plan is the engine's own write, one node at a
+    time: two halfwords per unit and nothing else, so a plan for 11 units is 22
+    writes and every address is a node the walk validated."""
+    walk = live_link.walk_units(_image_client(gariland_ram))
+    plan = live_link.plan_hide_units(walk.units)
+
+    assert len(plan) == 2 * walk.found
+    assert all(data == b"\x00\x00" for _a, data in plan)
+    nodes = {u.address for u in walk.units}
+    for address, _data in plan:
+        assert (address - live_link.UNIT_SHOW in nodes
+                or address - live_link.UNIT_DISPATCH in nodes), (
+            f"0x{address:08X} is not an offset into a validated node")
+    assert {a for a, _ in plan} == (
+        {u.address + live_link.UNIT_SHOW for u in walk.units}
+        | {u.address + live_link.UNIT_DISPATCH for u in walk.units})
+
+
+def test_restore_writes_the_SAVED_value_and_not_the_constant_one():
+    """The defect this arm exists for: `unit_sprite_object_show` writes `1` to
+    both fields, and copying that would REVEAL a unit the game had legitimately
+    hidden -- not yet revealed, erased by a `{46}`, off-roster. Two units, one
+    visible and one the battle had already hidden, and the restore has to put
+    each one back the way it found it."""
+    node = live_link.RAM_BASE + 0x1000
+    units = [live_link.UnitNode(address=node, id=0, show=1, dispatch=1),
+             live_link.UnitNode(address=node + 0x440, id=1, show=0,
+                                dispatch=0)]
+    restore = dict(live_link.plan_restore_units(units))
+
+    assert restore[node + live_link.UNIT_SHOW] == b"\x01\x00"
+    assert restore[node + live_link.UNIT_DISPATCH] == b"\x01\x00"
+    assert restore[node + 0x440 + live_link.UNIT_SHOW] == b"\x00\x00"
+    assert restore[node + 0x440 + live_link.UNIT_DISPATCH] == b"\x00\x00"
+
+
+@live_ram
+def test_isolate_then_restore_leaves_the_battles_RAM_byte_for_byte(gariland_ram):
+    """The round trip, through a real `RamClient` against a real battle's RAM.
+    Hide every unit, then restore, and the image is the one the savestate held
+    -- which is the only statement that covers both plans at once."""
+    client = _image_client(gariland_ram)
+    walk = live_link.walk_units(client)
+    assert client.write(live_link.plan_hide_units(walk.units)) > 0
+
+    hidden = live_link.walk_units(client)
+    assert [u.address for u in hidden.units] == [u.address for u in walk.units]
+    assert all(u.show == 0 and u.dispatch == 0 for u in hidden.units)
+
+    client.write(live_link.plan_restore_units(walk.units))
+    assert client._get() == gariland_ram
+
+
+@live_ram
+def test_a_second_isolate_changes_nothing_which_is_what_re_pressable_means(
+        gariland_ram):
+    """Idempotent and re-pressable is the whole answer to the three ways the
+    emulator drifts out from under Blender. The second press has to be a
+    no-op the byte count can SAY is a no-op."""
+    client = _image_client(gariland_ram)
+    first = live_link.walk_units(client)
+    assert client.write(live_link.plan_hide_units(first.units)) > 0
+
+    again = live_link.walk_units(client)
+    assert client.write(live_link.plan_hide_units(again.units)) == 0
+
+
+# --- decision 13: the code poke, the first write to the instruction stream --
+
+def _walks_to_jr_ra_without_a_frame(client, address, limit=512):
+    """Does the function at `address` return without ever touching `sp`/`ra`?
+
+    Walks the real instruction stream from `address` to its first `jr ra` and
+    reports whether anything in between builds a frame (`addiu sp,sp,-N`),
+    saves the return address (`sw ra,...`), or calls out (`jal`/`jalr`). That
+    is the LEAF property, read from this battle's own RAM rather than asserted.
+
+    Returns `(is_leaf, reason)` so a failure can say which instruction spoiled
+    it instead of only that one did.
+    """
+    for i in range(limit):
+        (word,) = struct.unpack("<I", client.read(address + i * 4, 4))
+        op, rs, rt = word >> 26, (word >> 21) & 31, (word >> 16) & 31
+        if op == 0 and (word & 0x3F) == 0x08 and rs == 31:      # jr ra
+            return True, "reached jr ra"
+        if op == 3:                                             # jal
+            return False, f"jal at +0x{i * 4:X}"
+        if op == 0 and (word & 0x3F) == 0x09:                   # jalr
+            return False, f"jalr at +0x{i * 4:X}"
+        if op == 9 and rs == 29 and rt == 29:                   # addiu sp,sp,N
+            return False, f"sp adjust at +0x{i * 4:X}"
+        if op == 0x2B and rs == 29 and rt == 31:                # sw ra,N(sp)
+            return False, f"ra save at +0x{i * 4:X}"
+    return False, f"no jr ra within {limit} instructions"
+
+
+@live_ram
+def test_every_code_gate_targets_a_real_FUNCTION_ENTRY(gariland_ram):
+    """The one arm that says a poke target is not an address someone typed.
+
+    `jr ra; nop` over a function's first two instructions is safe *because it
+    returns before the frame is built* -- `sp` is never touched. Land it two
+    instructions into a prologue instead and the poke returns with a
+    half-adjusted stack.
+
+    There are TWO shapes that satisfy that, not one:
+
+    * a function that opens with `addiu sp,sp,-N` -- the poke jumps in FRONT of
+      the prologue. `0x27BDFDB8` at the vitals window is `addiu sp,sp,-0x248`,
+      the prologue the decision record cites, re-read here rather than quoted.
+    * a LEAF -- a function that never touches `sp` or `ra` and never calls out.
+      There is no frame to be half-built, so the poke is safe *a fortiori*.
+      The camera leash is one, and demanding a prologue of it would reject the
+      safer target of the two.
+
+    So each gate is classified and checked against its own shape. The
+    classification is asserted by name: widening this arm must not let a
+    prologue function quietly re-file itself as a leaf to escape the check.
+    """
+    client = _image_client(gariland_ram)
+    gates = live_link.save_code_gates(client)
+    assert len(gates) == 4, [g.name for g in gates]
+    assert {g.address for g in gates} == {live_link.HUD_RENDERER,
+                                          live_link.CURSOR_RENDERER,
+                                          live_link.CAMERA_LEASH,
+                                          live_link.DIALOGUE_BOX_RENDERER}
+
+    prologue = {live_link.HUD_RENDERER, live_link.CURSOR_RENDERER,
+                live_link.DIALOGUE_BOX_RENDERER}
+    leaf = {live_link.CAMERA_LEASH}
+    for gate in gates:
+        (word,) = struct.unpack("<I", gate.saved[:4])
+        if gate.address in prologue:
+            assert word >> 16 == 0x27BD, (
+                f"{gate.name} at 0x{gate.address:08X} does not open a frame: "
+                f"0x{word:08X}")
+        else:
+            assert gate.address in leaf, gate.name
+            assert word >> 16 != 0x27BD, (
+                f"{gate.name} opens a frame after all -- check it as a "
+                f"prologue gate, not a leaf: 0x{word:08X}")
+            is_leaf, why = _walks_to_jr_ra_without_a_frame(client, gate.address)
+            assert is_leaf, (
+                f"{gate.name} at 0x{gate.address:08X} is not a leaf: {why}")
+
+
+@live_ram
+def test_the_cursors_FALLBACK_is_also_a_function_entry(gariland_ram):
+    """The uncertainty is shipped, not hidden: the cursor's target is one named
+    constant and `CURSOR_RENDERER_FALLBACK` is the other candidate. It is
+    checked too, so the day the artist reports *knife still there* the swap is
+    one line and not a fresh investigation."""
+    client = _image_client(gariland_ram)
+    (word,) = struct.unpack(
+        "<I", client.read(live_link.CURSOR_RENDERER_FALLBACK, 4))
+    assert word >> 16 == 0x27BD, f"0x{word:08X}"
+    assert live_link.CURSOR_RENDERER != live_link.CURSOR_RENDERER_FALLBACK
+
+
+def test_the_poke_is_jr_ra_then_nop():
+    """`0x03E00008` is `jr ra`, `0x00000000` is `nop`. Eight bytes, asserted as
+    the ENCODED words rather than as a blob, because a byte-order slip here is
+    a jump to whatever the swapped word decodes to."""
+    assert live_link.RETURN_STUB == struct.pack("<II", 0x03E00008, 0x00000000)
+    assert len(live_link.RETURN_STUB) == 8
+
+
+@live_ram
+def test_poking_then_restoring_the_code_leaves_the_battles_RAM_byte_for_byte(
+        gariland_ram):
+    """The round trip. Restore writes back the eight SAVED bytes -- there is no
+    constant that could stand in for them here, which is the difference between
+    this gate and the unit flags."""
+    client = _image_client(gariland_ram)
+    gates = live_link.save_code_gates(client)
+    assert client.write(live_link.plan_hide_code(gates)) > 0
+
+    for gate in gates:
+        assert client.read(gate.address, 8) == live_link.RETURN_STUB
+
+    client.write(live_link.plan_restore_code(gates))
+    assert client._get() == gariland_ram
+
+
+@live_ram
+def test_a_second_poke_of_the_code_changes_nothing(gariland_ram):
+    """Re-pressable, the same way the unit gate is -- and the saved bytes must
+    come from a walk taken BEFORE the poke, or a second press would save the
+    stub and restore would leave the HUD gone for good."""
+    client = _image_client(gariland_ram)
+    first = live_link.save_code_gates(client)
+    assert client.write(live_link.plan_hide_code(first)) > 0
+
+    again = live_link.save_code_gates(client)
+    assert client.write(live_link.plan_hide_code(again)) == 0
+    assert all(g.saved == live_link.RETURN_STUB for g in again), (
+        "the second save reads the stub back, which is exactly why an isolate "
+        "must not overwrite the saved values it is holding")
+
+
+# --- decision 13: re-pressable, without losing the way back -----------------
+
+@live_ram
+def test_a_second_isolate_keeps_the_FIRST_saved_values(gariland_ram):
+    """The defect that would make Isolate a one-way door.
+
+    Isolate is idempotent and re-pressable -- that is the whole answer to the
+    three ways the emulator drifts out from under Blender. But the second walk
+    reads back what the FIRST press wrote, so a session memory that simply
+    replaced itself would save `show = 0` for every unit and the restore would
+    leave the battle empty. Merging keeps the first press's answer.
+    """
+    client = _image_client(gariland_ram)
+    first = live_link.walk_units(client).units
+    client.write(live_link.plan_hide_units(first))
+
+    second = live_link.walk_units(client).units
+    assert all(u.show == 0 for u in second), "the seed did not take"
+
+    kept = live_link.merge_saved(first, second)
+    assert all(u.show == 1 and u.dispatch == 1 for u in kept)
+
+    client.write(live_link.plan_restore_units(kept))
+    assert client._get() == gariland_ram
+
+
+def test_a_unit_that_SPAWNS_while_isolated_is_added_to_the_memory():
+    """The other half of re-pressable, and the reason the merge is not just
+    *"ignore the second walk"*. A unit spawning mid-battle appears on the
+    second press with its own real flags, and those are the values its restore
+    needs -- so it joins the memory rather than being dropped."""
+    node = live_link.RAM_BASE + 0x1000
+    born = live_link.RAM_BASE + 0x2000
+    first = [live_link.UnitNode(node, 0, 1, 1)]
+    second = [live_link.UnitNode(node, 0, 0, 0),
+              live_link.UnitNode(born, 7, 1, 1)]
+
+    kept = {u.address: u for u in live_link.merge_saved(first, second)}
+    assert len(kept) == 2
+    assert kept[node].show == 1, "the first press's saved value must win"
+    assert kept[born].show == 1 and kept[born].id == 7
+
+
+# --- decision 13: the report is a COUNT OF UNITS, not a count of bytes ------
+
+def test_a_null_head_says_found_no_units_and_not_zero_changed():
+    """The defect a refusal was going to protect against, avoided with a second
+    number instead. `0 changed` already means *already isolated*; if the
+    not-in-a-battle case reported the same thing, one sentence would mean two
+    opposite things."""
+    line = live_link.isolate_report(
+        live_link.UnitWalk([], "the list ended", True), hidden=0, changed=0)
+    assert "no units" in line
+    assert "already" not in line
+
+
+def test_a_complete_walk_says_hid_N_of_N():
+    walk = live_link.UnitWalk(
+        [live_link.UnitNode(live_link.RAM_BASE + i * 0x440, i, 1, 1)
+         for i in range(8)], "the list ended", True)
+    line = live_link.isolate_report(walk, hidden=8, changed=16)
+    assert "8 of 8" in line
+    assert "went bad" not in line
+
+
+def test_an_incomplete_walk_says_how_far_it_got_and_why():
+    """*"hid 8 of 8"* and *"hid 3, then the chain went bad"* are different
+    sentences, and the reason has to travel with the count -- a partial hide
+    the artist cannot see the edge of is the thing that reads as a broken
+    feature."""
+    walk = live_link.UnitWalk(
+        [live_link.UnitNode(live_link.RAM_BASE + i * 0x440, i, 1, 1)
+         for i in range(3)], "the chain loops back to 0x800B9D88", False)
+    line = live_link.isolate_report(walk, hidden=3, changed=6)
+    assert "3" in line
+    assert "loops back" in line
+
+
+def test_already_isolated_is_its_own_sentence():
+    """Zero bytes changed with units found is the re-press, and it must not
+    read as a failure."""
+    walk = live_link.UnitWalk(
+        [live_link.UnitNode(live_link.RAM_BASE, 0, 0, 0)], "the list ended",
+        True)
+    line = live_link.isolate_report(walk, hidden=1, changed=0)
+    assert "already" in line

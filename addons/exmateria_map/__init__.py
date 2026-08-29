@@ -10,11 +10,39 @@ so a map can go from the extracted disc tree into a scene and back out as a
 patcher bundle without a CLI trip. That leg lives in `gns_bundle`. Decision 6
 (the interchange shape) and decision 7's other half are untouched.
 """
+import sys
+
 import bpy
+
+# ADR-0186 Amendment 13 decision 54 -- the numpy guard lives HERE and nowhere
+# else.  The addon's own modules take a BARE `import numpy` (decision 52): a
+# retained pure-Python fallback that never runs is untested code, and two
+# implementations of a byte-identical transform drift silently the moment the
+# fast path always wins.  So thirteen modules would raise thirteen tracebacks;
+# one guard, at the package's own front door, raises one sentence instead.
+#
+# It sits ABOVE the submodule imports rather than inside `register()`, which is
+# where the decision put it: `from . import export_document` runs at import
+# time and would raise its own `ImportError` before `register()` was ever
+# called, so a guard in `register()` could not be reached.  Enabling an addon
+# imports the package and THEN registers it, so an import-time raise is what
+# Blender shows the artist -- which is the decision's actual requirement.
+#
+# `sys.executable` is named because the answer is entirely about WHICH Python
+# is running Blender, and that is the one thing a traceback would not say.
+try:
+    import numpy                                              # noqa: F401
+except ImportError as exc:
+    raise ImportError(
+        "ExMateria Map needs numpy and the Python running Blender has none: "
+        f"{sys.executable}. Install numpy for that interpreter -- Blender's "
+        "own bundled add-ons (Cycles, the FBX and glTF IO) import it too, so "
+        "a build without it cannot run those either."
+    ) from exc
 
 from . import (authoring, compile_op, convert_op, export_document,
                gns_bundle, import_document, lighting_bake, live_link_ui,
-               paint, workspace)
+               paint, settle_op, workspace)
 
 bl_info = {
     "name": "ExMateria Map",
@@ -71,11 +99,13 @@ def register():
     authoring.register()
     lighting_bake.register()
     live_link_ui.register()
+    settle_op.register()
     workspace.register()
 
 
 def unregister():
     workspace.unregister()
+    settle_op.unregister()
     live_link_ui.unregister()
     lighting_bake.unregister()
     authoring.unregister()

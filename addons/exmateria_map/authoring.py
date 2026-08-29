@@ -48,11 +48,12 @@ from bpy.app.handlers import persistent
 from bpy.props import IntProperty
 from bpy.types import Operator, Panel
 
-from .export_document import (GROWTH_AREA_MAX, GROWTH_AXIS_MAX, TILE_DRIFT,
-                              TILE_GROWTH, flagged, marker_collection,
-                              markers, section)
-from .import_document import (HEIGHT_STEP, TILE_PAYLOAD_FIELDS, TILE_UNITS,
-                              _new_material, _plain_quad_mesh, UNLIT_GREY)
+from .export_document import (GROWTH_AREA_MAX, GROWTH_AXIS_MAX, flagged,
+                              marker_collection, markers, section)
+from .import_document import (HEIGHT_STEP, TILE_DRIFT, TILE_GROWTH,
+                              TILE_PAYLOAD_FIELDS, TILE_UNITS, _new_material,
+                              _paint_tile, _plain_quad_mesh, _terrain_collection,
+                              _tile_material)
 
 FLOOR_COS = 0.5          # #438's |n_up| threshold for "floor-like"
 DRIFT_FIELDS = ("height", "slope_height", "slope_type")
@@ -225,6 +226,16 @@ def _quad(name, x, z, world_z, collection, material):
     return o
 
 
+def _set_tile_material(ob, material):
+    """Swap a tile's one material slot.  Colour is a display fact (ADR-0187
+    decision 10); nothing about the record moves with it."""
+    if material is None:
+        return
+    ob.data.materials.clear()
+    ob.data.materials.append(material)
+    ob.data.polygons[0].material_index = 0
+
+
 def _drift_material():
     mat = bpy.data.materials.get(DRIFT_MATERIAL)
     if mat is not None:
@@ -246,38 +257,48 @@ def _drift_material():
 # ---------------------------------------------------------------------------
 
 def sync_drift(ob):
-    """§6.2's TOTAL sync.  Returns (n_drifted, n_with_a_declared_fix)."""
+    """§6.2's TOTAL sync.  Returns (n_drifted, n_with_a_declared_fix).
+
+    Since ADR-0187 decision 3 this **creates and deletes nothing**.  Every tile
+    of the extent already carries an object built from `base.terrain_tiles`, so
+    a drift is MARKED on the tile that is already there and unmarked when it
+    clears.  Decision 4 is why: an authored fix lives on the object, so
+    deleting one destroys the artist's work.
+
+    **The `shadowed` set is gone, and that is the point of this rewrite.**  It
+    used to compute `set(_tile_objects(ob)) - set(_tile_objects(ob, TILE_DRIFT))`
+    -- under a comment saying it meant *tiles that declare something*, while it
+    actually tested *an object exists*.  The two agreed only because ~0 tile
+    objects existed.  With one object per tile that set is the whole grid, and
+    the checker would report zero drift forever while printing *"N more
+    drifted, but the document already declares those tiles"* -- green, silent
+    and false.  It is not repaired here, it is **removed**: it existed because
+    a drift handle and a document-declared tile were two objects at one
+    `(x, z, level)`, which schema §7.2 refuses at build time.  Decision 3 makes
+    that one object, so the hazard it guarded cannot arise.
+    """
     col = marker_collection(ob)
     if col is None:
         return 0, 0
     live = drifted(ob)
-    # A tile the DOCUMENT already declares carries its own record object, and
-    # two objects at one (x, z, level) would export two records for one tile --
-    # which schema §7.2 refuses at build time.  Decision 23's drift fix exists
-    # for tiles that have no record, and decision 22 makes that every tile of
-    # an untouched document, so this only ever bites a hand-authored one.
-    declared_here = set(_tile_objects(ob)) - set(_tile_objects(ob, TILE_DRIFT))
-    shadowed = {k for k in live if k in declared_here}
-    for k in shadowed:
-        del live[k]
-    have = _tile_objects(ob, TILE_DRIFT)
-    mat = _drift_material() if live else None
-    for key, o in list(have.items()):
-        if key not in live:
-            bpy.data.objects.remove(o, do_unlink=True)   # drift cleared
-            del have[key]
+    have = _tile_objects(ob)
     base = base_floor_steps(ob)
-    for (x, z), (step_now, step, bottom) in live.items():
+    mat = _drift_material() if live else None
+    for key, o in have.items():
+        if key in live or not o.get("exmateria_map/drift"):
+            continue
+        o["exmateria_map/drift"] = False       # drift cleared: unmark, keep
+        # Back to decision 10's shared colour material, NOT flat grey: the
+        # tile still has to read as terrain once it stops reading as drift.
+        _set_tile_material(o, _tile_material())
+    for (x, z), (step_now, step, _bottom) in live.items():
         o = have.get((x, z))
-        if o is None:
-            o = _quad(f"drift_{x}_{z}_L0", x, z, bottom, col, mat)
-            o["exmateria_map/tile"] = TILE_DRIFT
-            o["x"], o["z"], o["level"] = x, z, 0
-            o.display_type = "TEXTURED"
-            for f in TILE_PAYLOAD_FIELDS:
-                o[f + "_declared"] = False
-            have[(x, z)] = o
-        # The base values ride the handle so decision 17's panel can show them
+        if o is None:                          # outside the carried grid
+            continue
+        o["exmateria_map/drift"] = True
+        _set_tile_material(o, mat)
+        o.display_type = "TEXTURED"
+        # The base values ride the tile so decision 17's panel can show them
         # beside each field; they are shown, never declared (§6.3).
         b_step, b_sh, b_st = base[(x, z)]
         o["height_base"], o["slope_height_base"], o["slope_type_base"] = \
@@ -287,11 +308,10 @@ def sync_drift(ob):
             if f not in o.keys():
                 o[f] = {"height": step_now, "slope_height": b_sh,
                         "slope_type": b_st}[f]
-    fixed = sum(1 for o in have.values()
-                if any(is_declared(o, f) for f in DRIFT_FIELDS))
+    fixed = sum(1 for k, o in have.items()
+                if k in live and any(is_declared(o, f) for f in DRIFT_FIELDS))
     ob["exmateria_map/drift_count"] = len(live)
     ob["exmateria_map/drift_fixed"] = fixed
-    ob["exmateria_map/drift_shadowed"] = len(shadowed)
     return len(live), fixed
 
 
@@ -420,15 +440,10 @@ class MAP_OT_check_drift(Operator):
             else markers(context.scene)[0]
         _SIGNATURE.pop(ob.name, None)
         n, fixed = sync_drift(ob)
-        # Both counts, and the SHADOWED one the panel used to carry on its own
-        # row -- a tile that drifted but that the document already declares is
-        # not a problem, and an artist reading `3 drifted` without it goes
-        # looking for three.
-        shadowed = ob.get("exmateria_map/drift_shadowed") or 0
+        # The SHADOWED row is gone with ADR-0187 decision 3: one object per
+        # tile means one record per tile, so there is no longer a class of
+        # tile that drifted but whose fix the checker has to stand aside from.
         said = f"{n} drifted, {fixed} with a declared fix"
-        if shadowed:
-            said += (f"; {shadowed} more drifted, but the document already "
-                     f"declares those tiles")
         print(f"EXMATERIA-MAP terrain: {said}")
         self.report({"INFO"}, said)
         return {"FINISHED"}
@@ -636,13 +651,25 @@ class MAP_OT_apply_growth(Operator):
             self.report({"ERROR"}, "no terrain grid in this arrangement")
             return {"CANCELLED"}
         _g, sx, sz = ext
-        col = marker_collection(ob)
+        # ADR-0187 decision 13: a handle is a tile of the same grid, so it
+        # goes in the same nested `terrain` collection.  Linked beside the
+        # marker instead, the collection visibility that IS the toggle cannot
+        # hide it, and decision 14's "one toggle covers both levels" becomes
+        # one toggle covering most tiles.
+        col = _terrain_collection(marker_collection(ob))
         have = _tile_objects(ob)
-        mat = _new_material(UNLIT_GREY)
+        mat = _tile_material()
         was_x = _g.get("size_x_shadow", sx)
         was_z = _g.get("size_z_shadow", sz)
         made = 0
-        src = next(iter(have.values()), None)
+        # §7.2's seed is "an existing RECORD's values when there is one", and
+        # `have` is not that set.  It was, while ~0 tile objects existed; since
+        # ADR-0187 decision 3 it is the whole grid, so this used to pick an
+        # arbitrary CARRIED tile -- tile (0, 0) -- and dress every new handle
+        # in the base map's bytes.  A record is a tile that DECLARES something.
+        src = next((t for t in have.values()
+                    if any(is_declared(t, f) for f in TILE_PAYLOAD_FIELDS)),
+                   None)
         with suspended():
             for x, z in new_tiles(sx, sz, was_x, was_z, have):
                 o = _quad(f"tile_{x}_{z}_L0", x, z, 0.0, col, mat)
@@ -654,10 +681,19 @@ class MAP_OT_apply_growth(Operator):
                 # NOTHING, so an untouched handle exports no record at all.
                 for f in TILE_PAYLOAD_FIELDS:
                     o[f + "_declared"] = False
-                    if src is not None and f in src.keys():
+                    # ...and only the fields `src` DECLARES.  Every tile
+                    # carries all twenty values since decision 3, and on a
+                    # drift tile the other seventeen are still the base map's
+                    # bytes -- so copying `src`'s whole key set dresses the new
+                    # handle in the base map after all, by a longer route.
+                    if src is not None and is_declared(src, f):
                         o[f] = int(src[f])
                     else:
                         o[f] = 1 if f == "impassable" else 0
+                # Decision 10 again: a growth handle is a tile of the same
+                # grid, so it is coloured the same way.  Painted after the
+                # seed above, because the impassable bit decides `R += 32`.
+                _paint_tile(o, x, z, o.get("impassable"), o.get("unselectable"))
                 have[(x, z)] = o
                 made += 1
         said = (f"{made} tile handle(s) created; the extent itself grew when "
@@ -678,9 +714,9 @@ class MAP_PT_terrain(Panel):
     bl_region_type = "UI"
     bl_category = "Map"
     bl_label = "Terrain"
-    # Renumbered again when `What a push carries` was deleted; the
-    # remaining five keep their relative order.
-    bl_order = 3
+    # Renumbered again when `Isolate` joined Push and Camera at the top
+    # (decision 13); the relative order below them is unchanged.
+    bl_order = 5
 
     def draw(self, context):
         ob = context.object
@@ -725,22 +761,46 @@ class MAP_PT_terrain(Panel):
         layout.operator(MAP_OT_check_drift.bl_idname, icon="FILE_REFRESH")
 
     def _tile(self, layout, ob):
-        kind = ob.get("exmateria_map/tile")
+        """The three tile classes, and only two of them are writable.
+
+        ADR-0187 decision 11: on a **carried** tile every one of the twenty
+        checkboxes led to `build` refusing with *"that tile is still the
+        base's"*, so the panel offered the artist twenty ways to break their
+        own document.  Read-only is not blank -- the values still show, which
+        is the whole point of drawing the grid.
+
+        The class is DERIVED here, the way `export_document.tile_record`
+        derives it, because decision 3 deleted the stored kind: the flag now
+        says "imported" on a tile that has since drifted.
+
+        One checkbox does survive on a carried tile: a field it ALREADY
+        declares.  That state is reachable -- a drift fix stays declared when
+        the drift clears (decision 4) -- and without the box the artist's only
+        exit from the refusal is a re-import that throws the rest away.
+        """
+        drift = bool(ob.get("exmateria_map/drift"))
+        growth = ob.get("exmateria_map/tile") == TILE_GROWTH
+        kind = TILE_DRIFT if drift else (TILE_GROWTH if growth else "carried")
         layout.label(text=f"tile ({ob.get('x')}, {ob.get('z')}) "
                           f"L{ob.get('level')} — {kind}",
                      icon="MESH_PLANE")
-        fields = DRIFT_FIELDS if kind == TILE_DRIFT else TILE_PAYLOAD_FIELDS
-        if kind == TILE_DRIFT:
+        if drift:
             layout.label(text=f"floor now at step {ob.get('drift_step_now')}, "
                               f"base says {ob.get('height_base')}",
                          icon="INFO")
-        for f in fields:
+        elif not growth:
+            layout.label(text="the base map's own bytes — read-only",
+                         icon="LOCKED")
+        writable = DRIFT_FIELDS if drift else \
+            (TILE_PAYLOAD_FIELDS if growth else ())
+        for f in TILE_PAYLOAD_FIELDS:
             row = layout.row(align=True)
             on = is_declared(ob, f)
-            op = row.operator(MAP_OT_declare_field.bl_idname,
-                              text="", icon="CHECKBOX_HLT" if on
-                              else "CHECKBOX_DEHLT")
-            op.field, op.on = f, not on
+            if f in writable or on:
+                op = row.operator(MAP_OT_declare_field.bl_idname,
+                                  text="", icon="CHECKBOX_HLT" if on
+                                  else "CHECKBOX_DEHLT")
+                op.field, op.on = f, not on
             base = ob.get(f + "_base")
             row.label(text=f"{f} = {ob.get(f)}"
                            + (f"  (base {base})" if base is not None else "")

@@ -45,8 +45,14 @@ HEADER_BYTES = 196
 TEXTURE_BYTES = 131072
 PALETTE_CHUNK_BYTES = 512
 TERRAIN_CHUNK_BYTES = 4098          # 2 size bytes + two 2,048-byte levels
+#: Each level occupies a fixed 2,048 B, NOT ``size_x * size_z * 8`` packed:
+#: GaneshaDx's reader steps ``2048 - width*length*8`` past the end of each one
+#: (``MeshResourceData.ProcessTerrain``).  Measured over the 191 arrangements
+#: carrying a valid 0x68: the padded read finds 21,763 of 23,037 level-1 slots
+#: at the format default, the packed read 3,842.
 TERRAIN_LEVEL_BYTES = 2048
 TERRAIN_RECORD_BYTES = 8
+TERRAIN_LEVELS = 2
 VISIBLE_ANGLES_BYTES = 4096
 VISIBLE_ANGLES_HEADER_BYTES = 896
 LIGHT_RIG_BYTES = 45

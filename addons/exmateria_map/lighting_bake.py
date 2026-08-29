@@ -972,9 +972,9 @@ class MAP_PT_lighting_bake(bpy.types.Panel):
     bl_region_type = "UI"
     bl_category = "Map"
     bl_label = "Lighting Bake"
-    # Renumbered again when `What a push carries` was deleted; the
-    # remaining five keep their relative order.
-    bl_order = 4
+    # Renumbered again when `Isolate` joined Push and Camera at the top
+    # (decision 13); the relative order below them is unchanged.
+    bl_order = 6
 
     @classmethod
     def poll(cls, context):
