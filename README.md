@@ -37,7 +37,7 @@ and tested against.
 console:
 
 ```
-EXMATERIA-MAP: addon 0.1.0 loaded from /…/scripts/addons/exmateria_map
+EXMATERIA-MAP: addon 0.2.0 loaded from /…/scripts/addons/exmateria_map
 ```
 
 That line exists because "am I looking at my own work?" had no answer once and

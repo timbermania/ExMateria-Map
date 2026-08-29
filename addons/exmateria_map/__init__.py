@@ -47,7 +47,7 @@ from . import (authoring, compile_op, convert_op, export_document,
 bl_info = {
     "name": "ExMateria Map",
     "author": "timbermania",
-    "version": (0, 1, 0),
+    "version": (0, 2, 0),
     "blender": (4, 0, 0),
     "category": "Import-Export",
 }
