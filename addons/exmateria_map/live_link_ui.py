@@ -73,6 +73,7 @@ from bpy.types import Operator, Panel
 
 from . import live_link as L
 from . import live_vram as VR
+from . import worker
 from .export_document import (assemble, describe_divergence, find_marker,
                               markers)
 from .import_document import _prefs, marker_in_scene, state_rig
@@ -983,16 +984,72 @@ def push_report(ob, lines):
         print(f"EXMATERIA-MAP push: {line}")
 
 
+def push_aims_the_camera(context, say, client):
+    """The push's fourth leg: aim the battle where the viewport is aimed.
+
+    ADR-0186 Amendment 16 **decision 75**, which supersedes decision 73.  Asked
+    for by name once Manual mode existed: *"when I do push to pcsx I want it to
+    move the camera too -- it's basically like the same as if you had automatic
+    on, and did one push of everything"*.  That is the requirement stated
+    exactly: **one press delivers the picture the ticker would have delivered**,
+    so a Manual artist gets the whole of what Automatic gives them for one
+    click rather than two.
+
+    **Unconditional -- it does not read `live_camera_sync`.**  That switch is
+    labelled *"Sync camera CONTINUOUSLY"* and it gates the TIMER; a press is
+    the artist asking, which is the case it was never about.  With the sync on
+    this is a no-op in effect -- the ticker has already sent this pose -- and
+    with it off it is the whole point.
+
+    **It can never turn a delivered push into a failure.**  The geometry has
+    already landed by the time this runs, and a viewport that cannot be synced
+    is a normal state rather than an error: none open (a push driven from a
+    script or a search box), or one looking through a scene camera or a
+    perspective lens, which `check_view_syncable` refuses because no arithmetic
+    can make an orthographic engine agree with it.  Each is REPORTED and the
+    push still says FINISHED.  A camera leg that could cancel a push that had
+    already written 30,000 bytes would make this button less reliable than the
+    two it replaces, which is the opposite of what was asked for.
+
+    The `client` is the push's OWN -- the one `push_gather` built from the same
+    host and port -- so there is no second place for those to be read from and
+    no second connection to open.
+    """
+    rv3d = _region_3d(context)
+    if rv3d is None:
+        say("INFO", "camera: not aimed -- no 3D viewport to take one from")
+        return
+    dial = float(getattr(_prefs(context), "live_camera_zoom_dial", 1.0) or 1.0)
+    try:
+        _pose, lines = push_camera(client, rv3d, dial)
+    except Exception as exc:                                  # noqa: BLE001
+        # Every failure is the same story to the artist -- the map went, the
+        # camera did not -- and the message says which. Broad on purpose: a
+        # transport error, a refused view and a bug in the pose arithmetic must
+        # all leave a FINISHED push finished.
+        say("INFO", f"camera: not aimed -- {exc}")
+        return
+    for line in lines:
+        say("INFO", line)
+
+
 def push_now(context, ob, report=None, *, replace_loaded_map=False,
              skip_selfcheck=False):
     """The whole push, on THIS thread. What the button does.
 
     Returns `("FINISHED" | "CANCELLED", lines)`.
+
+    Four legs since Amendment 16 decision 75, not three: the camera is aimed
+    after the bytes land, and only after they land -- a push the emulator
+    refused has nothing to look at, and a second refusal line would say the
+    same thing twice.
     """
     say = _Say(report)
     kw = push_gather(context, ob, say, replace_loaded_map=replace_loaded_map,
                      skip_selfcheck=skip_selfcheck)
     status = "CANCELLED" if kw is None else push_transport(say, **kw)
+    if status == "FINISHED":
+        push_aims_the_camera(context, say, kw["client"])
     push_report(ob, say.lines)
     return status, say.lines
 
@@ -1072,9 +1129,10 @@ class MAP_OT_live_push(Operator):
     bl_idname = "map.live_push"
     bl_label = "Push to PCSX"
     bl_description = ("Push this map into a running PCSX-Redux battle over the "
-                      "Lua web server. Edits the picture the game is rendering "
-                      "-- it does not touch the ISO and does not survive a map "
-                      "reload")
+                      "Lua web server, and aim the battle's camera where this "
+                      "viewport is aimed. Edits the picture the game is "
+                      "rendering -- it does not touch the ISO and does not "
+                      "survive a map reload")
     bl_options = {"REGISTER"}
 
     #: There is no good reason to skip it, so the panel does not offer it; the
@@ -1180,6 +1238,19 @@ class MAP_PT_live_push(Panel):
         swap.replace_loaded_map = True
         prefs = _prefs(context)
         if prefs is not None:
+            # ADR-0186 Amendment 16 decision 71 -- all on, or all off, right
+            # here. Reported from use: *"i know there might be individual
+            # toggles but i want an all on or all off next to where the auto
+            # push button is."* Two positions and no prose, which is this
+            # panel's rule; and like the ortho toggle in the Camera panel it is
+            # drawn as the DERIVED state, so it is its own indicator and needs
+            # no line of text beside it saying which way it is set.
+            #
+            # The individual switches stay in the addon preferences. They are
+            # not deleted and they are not duplicated here: an artist who wants
+            # the settle off but the push on can still say so, and this control
+            # then reads `Mixed` rather than lying about it.
+            layout.prop(prefs, "live_mode", expand=True)
             row = layout.row(align=True)
             row.prop(prefs, "live_host", text="")
             row.prop(prefs, "live_port", text="")
@@ -1325,7 +1396,19 @@ _CAMERA_TICKER = L.CameraSyncTicker()
 
 def sync_camera(client, view, dial=1.0, ticker=None,
                 sink=L.CAMERA_SINK_DEFAULT):
-    """One tick of the continuous sync. Returns the lines worth printing.
+    """One tick of the continuous sync, SYNCHRONOUSLY. Returns the lines
+    worth printing.
+
+    ⚠ **The timer does not call this** — it calls `sync_camera_background`,
+    and wiring it back here reinstates the artist's *"blender is laggy when
+    panning"*: the transport is four HTTP round trips at ~32 ms each, and this
+    function takes all four on the calling thread (decision 16).
+
+    It is kept, and it has two jobs. It is the shape the ticker's decisions are
+    graded against one call at a time, which is far easier to read than the
+    worker path; and it is the **seeded defect** in
+    `tests/blender_camera_stall.py --seed`, which is what proves that harness's
+    floors can go red at all. Deleting it would take the seed with it.
 
     The same arithmetic and the same write plan as `push_camera`, with two
     differences, both `CameraSyncTicker`'s and both deliberate:
@@ -1341,14 +1424,9 @@ def sync_camera(client, view, dial=1.0, ticker=None,
     not asked for anything.
     """
     ticker = _CAMERA_TICKER if ticker is None else ticker
-    if view is None:
-        return ticker.idle("no 3D viewport to take a camera from")
-    try:
-        L.check_view_syncable(view.view_perspective)
-    except L.LiveLinkError as e:
-        return ticker.idle(str(e))
-    pose = L.camera_pose(view.view_location, view.view_rotation.to_matrix(),
-                         float(view.view_distance), dial)
+    pose, idle = camera_pose_of(view, dial)
+    if idle is not None:
+        return ticker.idle(idle)
     if not ticker.wants(pose):
         return []
     try:
@@ -1356,6 +1434,82 @@ def sync_camera(client, view, dial=1.0, ticker=None,
     except Exception as e:                   # any transport failure is the
         return ticker.failed(e)              # same story: it did not land
     return ticker.succeeded(pose)
+
+
+def camera_pose_of(view, dial=1.0):
+    """The `bpy` half of a tick: `(pose, None)`, or `(None, idle reason)`.
+
+    Split out because it is the ONLY part of a tick that has to happen on
+    Blender's own thread -- everything after it is a socket. `sync_camera` and
+    `sync_camera_background` share it so the two cannot drift on which
+    viewports they refuse.
+    """
+    if view is None:
+        return None, "no 3D viewport to take a camera from"
+    try:
+        L.check_view_syncable(view.view_perspective)
+    except L.LiveLinkError as e:
+        return None, str(e)
+    return L.camera_pose(view.view_location, view.view_rotation.to_matrix(),
+                         float(view.view_distance), dial), None
+
+
+def sync_camera_background(make_client, view, dial=1.0, ticker=None,
+                           sink=L.CAMERA_SINK_DEFAULT):
+    """One tick with the transport on a WORKER. What the timer calls.
+
+    **Why this exists, measured against the running emulator 2026-08-29.**
+    Every request to pcsx-redux costs a fixed **~32 ms service wait**: a 404
+    that does no work at all is as expensive as the 2 MB whole-RAM GET, whose
+    body then streams in half a millisecond. So the cost is the number of
+    REQUESTS, not the bytes -- and a changed-pose tick is four of them (the GET
+    for the before-image, then three POSTs, the datum coalescing into
+    `work_rotation`). ~128 ms, on Blender's thread, every 50 ms.
+
+    Measured on the latency-matched stub (`tests/blender_camera_stall.py`):
+    the main thread kept **0.26** of its Python throughput and froze for 136 ms
+    at a stretch, and the 20 Hz timer achieved 5.6 Hz. That is the artist's
+    *"blender is laggy when panning"*.
+
+    **A thread is the right answer HERE, and it was the wrong one for the
+    compile** -- which is the interesting half of the artist's question. The
+    compile was CPU-bound Python holding the GIL, where a worker took Blender
+    to 8.7 fps (`worker.py`'s table) and only numpy fixed it. A socket read
+    RELEASES the GIL, so this one really does leave the main thread free: the
+    same stub measures **0.99** and the full 20 Hz once the transport moves.
+
+    The emulator still sees ~128 ms of latency and that is allowed --
+    decision 15's bar is *the UI thread on top; the emulator may lag; the
+    number one goal is to not prevent the artist from painting.*
+
+    `make_client` is a factory, not a client: the client is built ON the worker
+    so nothing shared crosses the thread boundary.
+    """
+    ticker = _CAMERA_TICKER if ticker is None else ticker
+    # What the WORKERS reported since the last tick, turned into lines here on
+    # the main thread -- `landed` only records, because a worker may not touch
+    # the Log or `bpy`.
+    lines = ticker.drain()
+    pose, idle = camera_pose_of(view, dial)
+    if idle is not None:
+        return lines + ticker.idle(idle)
+    if not ticker.wants(pose):
+        return lines
+    if not ticker.begin(pose):
+        return lines          # in flight: COALESCE, never queue -- see `begin`
+
+    def job():
+        try:
+            make_client().write(L.plan_camera(pose, sink))
+        except Exception as e:               # any transport failure is the
+            ticker.landed(pose, e)           # same story: it did not land
+        else:
+            ticker.landed(pose, None)
+
+    # `worker.spawn`, never a bare `Thread`: it is what protects the UI's share
+    # of the GIL, and `tests/test_worker.py` fails the module that skips it.
+    worker.spawn("exmateria-map camera sync", job)
+    return lines
 
 
 def _first_region_3d():
@@ -1405,8 +1559,8 @@ def _camera_sync_timer():
     host = getattr(prefs, "live_host", "") or L.DEFAULT_HOST
     port = int(getattr(prefs, "live_port", 0) or L.DEFAULT_PORT)
     dial = float(getattr(prefs, "live_camera_zoom_dial", 1.0) or 1.0)
-    lines = sync_camera(L.RamClient(host=host, port=port), _first_region_3d(),
-                        dial)
+    lines = sync_camera_background(
+        lambda: L.RamClient(host=host, port=port), _first_region_3d(), dial)
     if lines:
         from .report_log import record
         record("Camera sync", "", lines)

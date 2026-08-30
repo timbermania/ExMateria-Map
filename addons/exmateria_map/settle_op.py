@@ -46,6 +46,7 @@ import zlib
 
 import bpy
 
+from . import crumbs
 from .compile_op import (_subject_of, animated_rows_of, animation_note_once,
                          compile_off_thread, land_compile, read_for_compile,
                          stamp_compile)
@@ -177,15 +178,22 @@ def lighting_digest(scene, ob):
     hashing them together loses nothing; folding them in with the canvas would
     lose the one distinction decision 58 turns on, and lose it silently.
 
-    **A -- `lighting_bake.lamp_signature`, and only while a map holds Lamp
+    **A -- `lighting_bake.lamp_signature`, and only while THIS map holds Lamp
     authority** (decision 60).  With authority off no lamp moves a normal:
     `_live_handler` returns before it even computes a signature.  Arming anyway
     would spend an `assemble` on every lamp nudge to report that there was
-    nothing to send, which the panel already says as *"not in charge"*.  The
-    authority holder is found the way `_live_handler` finds it -- the first map
-    in the scene holding it -- so the two cannot disagree about who is in
-    charge.  Scoped to A alone: an Override move involves no lamp, and pushes
-    with authority off.
+    nothing to send, which the panel already says as *"not in charge"*.  Scoped
+    to A alone: an Override move involves no lamp, and pushes with authority
+    off.
+
+    **`ob`'s own switch, not the scene's.**  Authority is a per-object property
+    and nothing makes it exclusive -- `_authority_update` bakes into `self`, so
+    two maps may hold it at once.  The question this witness asks is whether
+    the map ABOUT TO BE PUSHED has normals that a lamp can move, and only its
+    own switch answers that.  Asking the scene for "whoever is in charge", the
+    way `_live_handler` does when it is looking for something to bake, would
+    push map A because someone nudged map B's lamp -- a push of bytes nobody
+    changed, which is the exact cost decision 60 exists to refuse.
 
     Switching authority ON moves this, and correctly -- `_authority_update`
     re-solves on the ON edge, so there really are new normals to send.
@@ -206,11 +214,8 @@ def lighting_digest(scene, ob):
     the two.  Pushing is not solving, and nothing this function feeds can bake.
     """
     from . import lighting_bake
-    holder = next((cand for cand in scene.objects
-                   if lighting_bake._is_map(cand)
-                   and getattr(cand, "exmateria_map_lamp_authority", False)),
-                  None)
-    lamps = "" if holder is None else lighting_bake.lamp_signature(scene, holder)
+    lamps = (lighting_bake.lamp_signature(scene, ob)
+             if getattr(ob, "exmateria_map_lamp_authority", False) else "")
     return json.dumps([
         lamps,
         [editing_units(ov)
@@ -257,6 +262,15 @@ def _launch(ob, state, sheet, painting, idx, rows, digest):
     """
     polygons, floats = read_for_compile(ob, painting)
     animated = animated_rows_of(ob, state)
+    # The names are taken HERE, on the main thread, because the paragraph above
+    # is a rule this function used to break: `work` closed over `ob`, `painting`
+    # and `idx` and read `.name` off all three FROM THE WORKER, seconds later.
+    # That is a `bpy` read on a non-main thread -- the one thing `worker.py` and
+    # `compile_off_thread`'s docstring both forbid -- and it is a read through a
+    # pointer Blender was free to move or free in the meantime. `_land` below
+    # already shows the shape that is correct: carry names, look them up again,
+    # and cope with the map having gone away.
+    names = (ob.name, painting.name, idx.name)
 
     def work():
         try:
@@ -265,17 +279,19 @@ def _launch(ob, state, sheet, painting, idx, rows, digest):
             traceback.print_exc()
             _RESULT.append(None)
             return
-        _RESULT.append((ob.name, state, sheet, painting.name, idx.name,
+        ob_name, painting_name, idx_name = names
+        _RESULT.append((ob_name, state, sheet, painting_name, idx_name,
                         polygons, off, digest))
 
     # `worker.spawn`, never a bare `Thread`: a compile thread that does not
     # protect the UI's share of the GIL drops Blender to 8.7 fps for its whole
     # length, which is the freeze this settle was built to remove.
-    spawn(f"exmateria-settle:{ob.name}", work)
+    spawn(f"exmateria-settle:{names[0]}", work)
 
 
 def _land(clock):
     """MAIN THREAD -- put the finished compile into the scene, then push."""
+    crumbs.drop("land.begin")
     done = _RESULT.pop(0)
     if done is None:
         clock.abandoned()
@@ -293,6 +309,16 @@ def _land(clock):
     print(f"EXMATERIA-MAP settle: compiled {sheet} -- {len(off.atoms)} charts, "
           f"error {off.before_mean:.2f} -> {off.compiled.error:.2f}, "
           + ("binding unmoved" if off.chosen.is_incumbent else "re-bound"))
+    # The whole point, said out loud: this compile writes the mesh and calls
+    # `me.update()`, and it landed within a tick of a gesture closing. Before
+    # the guard that write ran INSIDE the open stroke, on the evaluated mesh
+    # `ProjPaintState` was still holding pointers into.
+    closed_at = _GESTURE["closed_at"]
+    if closed_at and time.monotonic() - closed_at < CAUGHT_WINDOW:
+        _GESTURE["caught"] += 1
+        _GESTURE["closed_at"] = 0.0
+        print(f"EXMATERIA-MAP settle: ^ that mesh write was held out of an "
+              f"open stroke ({_GESTURE['caught']} so far this session)")
     note = animation_note_once((ob.name, state), polygons, off.atoms,
                                off.animated)
     if note:
@@ -491,10 +517,94 @@ def _clear_a_stale_bit_nothing_else_can(ob, sheet, painting, clock, digest):
     stamp_compile(ob, sheet, painting, image_rgb(painting))
 
 
+#: What the guard actually CATCHES, reported to the artist's own console.
+#:
+#: Waiting for a segfault is a bad way to grade this fix.  The record is bursty
+#: -- three crashes in 11 minutes on the morning of 2026-08-29, then nothing for
+#: the whole day before it -- so an hour of quiet painting is what the UNFIXED
+#: addon looks like most of the time, and reading it as "fixed" is the mistake
+#: this exists to prevent.
+#:
+#: So the addon reports the PRECONDITION instead, which fires constantly rather
+#: than rarely: how long the settle held off because a gesture was open, and --
+#: the line that matters -- whether a compile landed the moment it closed.  A
+#: hold immediately followed by a land is a mesh write that WOULD have run
+#: inside an open stroke, which is the crash in `docs/paint-crash-diagnosis.md`.
+_GESTURE = {"open": False, "ticks": 0, "since": 0.0, "closed_at": 0.0,
+            "holds": 0, "caught": 0}
+
+#: A land this soon after a gesture closed was one the guard was holding.  Two
+#: ticks: long enough that the settle's own 4 Hz cadence cannot miss it, short
+#: enough that an unrelated later compile is not miscounted as a catch.
+CAUGHT_WINDOW = TICK * 2
+
+
+def gesture_report():
+    """`(holds, caught)` -- for the harnesses, and for asking mid-session."""
+    return _GESTURE["holds"], _GESTURE["caught"]
+
+
+def _mid_gesture():
+    """Is a modal operator running RIGHT NOW -- i.e. is a gesture still open?
+
+    This is the witness `settle_clock`'s docstring says Amendment 7 wanted and
+    could not find.  It exists: `Window.modal_operators` is real in 5.2.  The
+    reason it read as absent is that `hasattr(bpy.types.Window, ...)` is False
+    for an RNA property -- it has to be asked of a window INSTANCE.
+
+    **Why the settle needs it, and why the digest alone is not enough.** The
+    canvas digest answers *"has the picture stopped changing"*, and the settle
+    treats that as *"the artist has stopped painting"*.  Those are different
+    claims, and a live stroke can satisfy the first: a drag held still for the
+    quiet period, or a drag over texels that are already the brush's colour,
+    moves no texel at all.  When they disagree, the settle fires INSIDE an open
+    stroke -- and `land_compile` then runs `_write_binding` plus `me.update()`
+    on the original mesh, which tags the depsgraph and frees the EVALUATED
+    mesh.  Blender's projective texture paint caches that evaluated mesh's
+    corner and UV arrays in `ProjPaintState` for the whole stroke, so the next
+    dab reads freed memory.  That is the SIGSEGV in
+    `docs/paint-crash-diagnosis.md`: the freed index array had been reused for
+    float pixel coordinates, and project paint read a float back as a corner
+    index.
+
+    Measured before this guard existed: 3 settle lands in a paint session, 3 of
+    them with the object in `TEXTURE_PAINT` and a mesh write in each.
+
+    Deferring costs nothing.  `SettleClock` keeps tracking `_seen` while this
+    returns True, so paint that lands during a gesture is caught by the next
+    tick after it ends -- the compile is delayed, never dropped.
+    """
+    wm = getattr(bpy.context, "window_manager", None)
+    if wm is None:
+        return False
+    for window in wm.windows:
+        if getattr(window, "modal_operators", None):
+            return True
+    return False
+
+
 def _tick():
     # A timer that raises is UNREGISTERED, silently, and the loop stops
     # closing itself with nothing said. Everything is caught and printed.
     try:
+        # Both halves are guarded, not just the compile: `_drain_push` lands a
+        # finished push, which comes back through `ensure_compiled` and can
+        # reach `land_compile` -- the same mesh write, by the other route.
+        now = time.monotonic()
+        # Every tick, with the guard's verdict on it. This is the line that was
+        # missing: the settle runs from `bpy.app.timers`, so Blender's own crash
+        # trail -- which logs OPERATORS -- cannot see it at all.
+        held = _mid_gesture()
+        crumbs.drop("tick", gesture=held, pending=len(_RESULT))
+        if held:
+            if not _GESTURE["open"]:
+                _GESTURE.update(open=True, ticks=0, since=now)
+            _GESTURE["ticks"] += 1
+            return TICK
+        if _GESTURE["open"]:
+            _GESTURE.update(open=False, closed_at=now, holds=_GESTURE["holds"] + 1)
+            print(f"EXMATERIA-MAP settle: held off {_GESTURE['ticks']} tick(s) "
+                  f"({now - _GESTURE['since']:.1f}s) -- a gesture was open")
         _drain_push()
         _step()
     except Exception:                                     # noqa: BLE001

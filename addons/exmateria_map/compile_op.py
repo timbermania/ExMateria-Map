@@ -27,6 +27,7 @@ from . import compile_map
 from .convert_op import (_face_ordered, clut_rows_of, source_art_name,
                          write_clut_rows_of)
 from . import resample
+from . import crumbs
 from .export_document import (image_floats, image_rgb, master_key,
                               readable_mesh, remember_master, rgb_from_floats,
                               set_image_indices)
@@ -472,11 +473,22 @@ def land_compile(ob, state, sheet, painting, idx, master, polygons, chosen,
         # that a 25 ms key lookup instead of a 1.2 s walk.
         remember_master(key, painting.size[0], painting.size[1], master)
     me = ob.data
-    with readable_mesh(ob):
-        moved = _write_binding(me, polygons, chosen.binding)
-    _land(ob, state, idx, compiled)
-    stamp_compile(ob, sheet, painting, master)
-    me.update()
+    # `me.update()` is crumbed ON ITS OWN because it is the suspect: it tags the
+    # depsgraph, which frees the EVALUATED mesh, and `ProjPaintState` caches
+    # that mesh's corner and UV arrays for the whole of a modal stroke.  A trail
+    # that ends on `mesh.update.enter` is the crash happening inside it; one
+    # that ends just after `mesh.update.exit` is the next dab reading what it
+    # freed.  Those are different findings and a single `land` span cannot tell
+    # them apart.
+    with crumbs.span("land_compile", mode=getattr(ob, "mode", "?"),
+                     faces=len(polygons)):
+        with readable_mesh(ob):
+            with crumbs.span("write_binding"):
+                moved = _write_binding(me, polygons, chosen.binding)
+        _land(ob, state, idx, compiled)
+        stamp_compile(ob, sheet, painting, master)
+        with crumbs.span("mesh.update"):
+            me.update()
     return moved
 
 

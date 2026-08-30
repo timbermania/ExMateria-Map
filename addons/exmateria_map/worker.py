@@ -39,6 +39,16 @@ the other half of the same report.
 import sys
 import threading
 
+try:
+    from . import crumbs
+except ImportError:                 # pragma: no cover -- see the comment below
+    # `tests/test_worker.py` imports this module STANDALONE, on purpose: the
+    # package `__init__` pulls in `bpy`, so the only way to test the GIL rule
+    # without a Blender is to put the addon directory on `sys.path` and import
+    # `worker` by itself. That makes a relative import an ImportError, and the
+    # crumb trail is not worth costing this module its `bpy`-free test seam.
+    import crumbs
+
 #: Measured above.  Not a tunable: the table is the argument for it, and a
 #: number an artist can move is a number that can put them back at 8.7 fps.
 SWITCH_INTERVAL = 0.0001
@@ -74,13 +84,25 @@ def spawn(name, fn):
     The refcount is taken BEFORE the thread starts, so a worker that finishes
     immediately cannot drop the interval back before it was ever raised.
     """
+    # BEFORE `_enter()`, and it has to stay there: `tests/test_worker.py`
+    # seeds this function by swapping `_enter()` past `thread.start()`, and its
+    # seed anchors on `    _enter()\n\n    def run():` being contiguous. A crumb
+    # dropped between them makes the seed miss and the guard pass on code that
+    # no longer holds -- the instrumentation would have silently disarmed the
+    # test it shares a file with.
+    crumbs.drop("worker.spawn", name=name)
     _enter()
 
     def run():
+        # Crumbed from INSIDE the thread: `spawn` returning says a thread was
+        # created, not that it started, and the gap between those is exactly
+        # where a scheduling question lives.
+        crumbs.drop("worker.begin", name=name, live=_STATE["live"])
         try:
             fn()
         finally:
             _leave()
+            crumbs.drop("worker.end", name=name)
 
     thread = threading.Thread(target=run, daemon=True, name=name)
     thread.start()

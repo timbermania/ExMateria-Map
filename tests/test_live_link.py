@@ -2622,6 +2622,81 @@ def test_leaving_an_idle_state_lets_it_be_announced_again():
     assert t.idle("looking through a camera") != []
 
 
+# --- the transport leaves the main thread (live-link amendment) ------------
+# MEASURED against the running emulator on 2026-08-29: EVERY request to
+# pcsx-redux costs a fixed ~32 ms service wait -- a 404 that does no work at
+# all is as expensive as a 2 MB RAM read, and the 2 MB body itself streams in
+# 0.5 ms. A changed-pose tick is FOUR requests, so it takes ~128 ms against a
+# 50 ms timer period, and it takes them on Blender's own thread. That is the
+# artist orbiting into a frozen UI.
+#
+# The flight slot is what makes the worker safe. It is graded here, with no
+# `bpy` and no socket, for the same reason the rest of the ticker is.
+
+
+def test_a_write_IN_FLIGHT_coalesces_the_next_pose_rather_than_queueing_it():
+    """A queue would send the emulator a pose the artist has already orbited
+    past -- the same rule `background_push_start` follows for the sheet.
+
+    One slot: the second claim is refused, and the tick that is refused simply
+    drops its pose. The NEXT tick offers the latest one instead, so what the
+    emulator gets is always where the viewport is now."""
+    t = live_link.CameraSyncTicker()
+    assert t.begin(_pose(300)) is True
+    assert t.begin(_pose(301)) is False
+    assert t.begin(_pose(302)) is False
+
+
+def test_the_pose_is_remembered_only_when_the_WORKER_says_it_landed():
+    """`wants` is the retry, and handing a pose to a thread is not evidence it
+    arrived. Remembering it at hand-off would drop the pose whose write failed
+    -- exactly the bug `test_a_FAILED_write_does_not_count_as_pushed` covers,
+    reintroduced one layer up."""
+    t = live_link.CameraSyncTicker()
+    p = _pose(300)
+    t.begin(p)
+    assert t.wants(p), "handing it to a worker is not landing it"
+    t.landed(p, None)
+    t.drain()
+    assert not t.wants(p)
+
+
+def test_a_worker_that_FAILED_frees_the_slot_and_still_retries():
+    t = live_link.CameraSyncTicker()
+    p = _pose(300)
+    t.begin(p)
+    t.landed(p, "connection refused")
+    said = t.drain()
+    assert any("connection refused" in ln for ln in said)
+    assert t.wants(p), "a failed write is not a push"
+    assert t.begin(p) is True, "the slot must be free again"
+    assert t.interval() == live_link.CAMERA_SYNC_BACKOFF
+
+
+def test_the_slot_is_freed_by_landing_so_the_sync_cannot_wedge():
+    """A slot that is claimed and never released stops the sync forever, and
+    it does it SILENTLY -- the ticker would report nothing at all."""
+    t = live_link.CameraSyncTicker()
+    t.begin(_pose(300))
+    assert t.begin(_pose(301)) is False
+    t.landed(_pose(300), None)
+    assert t.begin(_pose(301)) is True
+
+
+def test_drain_says_nothing_when_no_worker_has_reported():
+    t = live_link.CameraSyncTicker()
+    assert t.drain() == []
+
+
+def test_reset_frees_the_flight_slot_too():
+    """Toggling the sync off mid-write must not leave the slot claimed, or
+    switching it back on syncs nothing and says nothing about why."""
+    t = live_link.CameraSyncTicker()
+    t.begin(_pose(300))
+    t.reset()
+    assert t.begin(_pose(301)) is True
+
+
 # --- decision 13: the unit list walk, against the battle savestate ----------
 # `unit_sprite_list_head` (0x80098A54) heads a singly-linked list of sprite
 # display objects. The shape is not this module's guess: `unit_sprite_object_find`

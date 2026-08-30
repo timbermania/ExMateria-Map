@@ -1914,6 +1914,107 @@ def build(doc, context=None, doc_path=None):
     return ob
 
 
+# --- ADR-0186 Amendment 16: ONE control over the three live switches --------
+#
+# Amendment 14 decision 62 refuses a THIRD switch, on the ground that three
+# would make the artist debug which of them is off.  That is right, and this is
+# not a fourth one: **`live_mode` stores nothing.**  It READS the three
+# booleans below and WRITES all three, so there is no state it can hold that
+# disagrees with them -- which is the failure decision 62 named, not the count.
+#
+# Reported from use: *"i know there might be individual toggles but i want an
+# all on or all off next to where the auto push button is."*  So the positions
+# are the two ENDS -- everything by itself, or nothing without a button -- and
+# `MIXED` is a READING rather than a position the artist can move to.
+#
+# The three are not interchangeable and the mode does not pretend they are:
+# `settle_on` gates a COMPILE (`me.update()` on the artist's mesh),
+# `auto_push` gates only the transport, `live_camera_sync` gates a ticker that
+# talks to the emulator with the artist's hands off the keyboard entirely.
+# Manual is worth having precisely because it is all three: gating the
+# transport alone leaves the mesh write -- and `docs/paint-crash-diagnosis.md`
+# is what a mesh write inside an open stroke costs.
+
+#: The switches the mode is one control over, in the order the preferences
+#: draw them.  A list rather than three lines of code because "all of them" is
+#: the whole idea, and a fourth switch added below must not need this file
+#: edited in two places to be covered.
+LIVE_MODE_SWITCHES = ("settle_on", "auto_push", "live_camera_sync")
+
+MODE_AUTOMATIC, MODE_MANUAL, MODE_MIXED = 0, 1, 2
+
+#: Built ONCE at module scope, and `_live_mode_items` returns slices of it.  An
+#: `items` callback that builds its strings per call hands Blender memory
+#: Python then frees, and the enum draws garbage; keeping the tuples alive up
+#: here is the documented workaround, so these are deliberately not inline.
+_MODE_ITEM = {
+    MODE_AUTOMATIC: (
+        "AUTOMATIC", "Automatic",
+        "Painting, the lighting and the camera reach a running emulator by "
+        "themselves, with no button pressed",
+        "PLAY", MODE_AUTOMATIC),
+    MODE_MANUAL: (
+        "MANUAL", "Manual",
+        "Nothing recompiles and nothing reaches the emulator until you press "
+        "a button. Push to PCSX, the two compile buttons and Match camera all "
+        "still work -- in this mode they are the only things that act",
+        "PAUSE", MODE_MANUAL),
+    MODE_MIXED: (
+        "MIXED", "Mixed",
+        "The three switches this sets are not all the same -- the addon "
+        "preferences draw them one by one. Press Automatic or Manual to put "
+        "all three together again",
+        "DOT", MODE_MIXED),
+}
+#: MIXED goes LAST and never in the middle: the two positions an artist presses
+#: must not slide sideways under the cursor when a third one appears.
+_MODE_ITEMS = (_MODE_ITEM[MODE_AUTOMATIC], _MODE_ITEM[MODE_MANUAL])
+_MODE_ITEMS_MIXED = _MODE_ITEMS + (_MODE_ITEM[MODE_MIXED],)
+
+
+def live_mode_of(prefs):
+    """Which position the three switches are in.  DERIVED, never stored.
+
+    `MIXED` is reachable and is therefore REPORTED rather than hidden: the
+    three stay independent properties and the preferences draw all three, so a
+    half-on state exists.  A mode that read one as "Manual" would be the
+    disagreement decision 62 refuses, wearing a mode's clothes.
+    """
+    on = [bool(getattr(prefs, name, True)) for name in LIVE_MODE_SWITCHES]
+    if all(on):
+        return MODE_AUTOMATIC
+    if not any(on):
+        return MODE_MANUAL
+    return MODE_MIXED
+
+
+def set_live_mode(prefs, mode):
+    """Put all three switches in `mode`.  Returns whether anything was set.
+
+    `MIXED` is a reading and not a destination, so it is a no-op rather than an
+    error: there is no "the way they were" to return to that the artist has not
+    just left, and an enum drawn `expand=True` makes every item pressable.
+    """
+    if int(mode) == MODE_MIXED:
+        return False
+    for name in LIVE_MODE_SWITCHES:
+        setattr(prefs, name, int(mode) == MODE_AUTOMATIC)
+    return True
+
+
+def _live_mode_items(self, context):
+    return (_MODE_ITEMS_MIXED if live_mode_of(self) == MODE_MIXED
+            else _MODE_ITEMS)
+
+
+def _live_mode_get(self):
+    return live_mode_of(self)
+
+
+def _live_mode_set(self, value):
+    set_live_mode(self, value)
+
+
 class MAP_AddonPreferences(AddonPreferences):
     """Where the artist last imported from, and last exported to.
 
@@ -1974,6 +2075,15 @@ class MAP_AddonPreferences(AddonPreferences):
     # `auto_push`'s own comment already argued -- one gate on ACTING WITHOUT A
     # BUTTON, one gate on REACHING THE EMULATOR -- and a third switch is
     # refused, because three would make the artist debug which of them is off.
+    # **Amendment 16 decision 71.**  ONE control over the three, drawn beside
+    # the push button.  Not the third switch decision 62 refuses -- see the
+    # module block above `live_mode_of`: it stores nothing and can hold no
+    # opinion of its own, so there is nothing here for the artist to debug.
+    live_mode: EnumProperty(
+        name="Live",
+        description="Whether this addon acts on its own or only when you "
+                    "press a button. Sets all three live switches together",
+        items=_live_mode_items, get=_live_mode_get, set=_live_mode_set)
     settle_on: BoolProperty(
         name="Act on a settle",
         description="When painting or the lighting stops changing, act on it "
@@ -2073,6 +2183,18 @@ class MAP_AddonPreferences(AddonPreferences):
         row = self.layout.row(align=True)
         row.prop(self, "live_host")
         row.prop(self, "live_port")
+        # **Amendment 16 decision 72.**  Before this, `settle_on`, `auto_push`
+        # and `settle_quiet` were drawn NOWHERE: three preferences with no
+        # surface anywhere in the addon, which is a large part of why a mode
+        # was asked for at all.  The mode is the artist's control and lives
+        # beside the push button; these are what it sets, and they are here so
+        # a `Mixed` reading has somewhere it can be authored and undone.
+        box = self.layout.box()
+        box.prop(self, "live_mode", expand=True)
+        col = box.column(align=True)
+        for _switch in LIVE_MODE_SWITCHES:
+            col.prop(self, _switch)
+        box.prop(self, "settle_quiet")
         # PCSX-Redux will not load the live link's Lua handlers by itself, and
         # three routes get them in. Laid out worst-effort-last on purpose: the
         # artist should take the first one that fits and never read the rest.

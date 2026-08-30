@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "exmateria-map"
-version = "0.2.1"
+version = "0.3.0"
 description = "FFT PSX map resources: read, write, and prove byte-exactness against the disc."
 readme = "README.md"
 # 3.11 satisfies fft-iso-patcher (3.11), the godot-learning tools venv (3.13)

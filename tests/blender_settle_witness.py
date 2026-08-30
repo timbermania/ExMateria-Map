@@ -22,6 +22,13 @@ Three properties, and the third is the one that moved:
    factor of six; this asks for three, which no reasonable machine turns into
    a coin flip and which blake2b cannot reach against itself.
 
+These are property arms over a pure function.  **The settle's other witnesses
+-- the lamps, the rig Overrides and the previewed state (ADR-0186 Amendment 14)
+-- are graded end to end in `tests/blender_lighting_push.py`**, which asks a
+different question: did a change reach a *push*.  Kept apart so a property
+check does not pay a map import and a convert, and an end-to-end arm does not
+pay an 89 ms hash over 67 MB.
+
 Not a `pytest` file: `settle_op` imports `bpy` at module scope, and the buffer
 under test is a real `Image.pixels`, which is the thing the 85.8 ms is about.
 

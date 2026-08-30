@@ -19,5 +19,9 @@ tests/.blender_convert/
 tests/.blender_userres/
 tests/.blender_settle_witness/
 tests/.blender_settle_stall/
+tests/.blender_camera_stall/
+tests/.blender_paint_crash/
 tests/.blender_lighting_push/
 dist/
+tests/.blender_settle_modal_guard/
+tests/.blender_live_mode/

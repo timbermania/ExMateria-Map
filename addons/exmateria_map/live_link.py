@@ -3271,10 +3271,52 @@ class CameraSyncTicker:
         self._pushed = None      # the last pose the emulator ACKNOWLEDGED
         self._said = None        # the state already reported, so it is not again
         self._failing = False
+        self._flight = None      # the pose a WORKER is writing right now
+        self._done = []          # what that worker reported, drained on main
 
     def wants(self, pose) -> bool:
         """Is this pose worth a write? Only if it is not the one that landed."""
         return pose != self._pushed
+
+    def begin(self, pose) -> bool:
+        """Claim the ONE flight slot for `pose`. False means a write is
+        already going and this tick must drop its pose.
+
+        Dropping it is the point. A queue would hand the emulator a pose the
+        artist has already orbited past, and at 20 Hz against a ~128 ms round
+        trip it would grow without bound -- the sync would fall further behind
+        the longer the artist moved, which is the failure the button's
+        `background_push_start` avoids the same way. `wants` makes the drop
+        free: the pose was never remembered, so the NEXT tick offers wherever
+        the viewport is by then.
+        """
+        if self._flight is not None:
+            return False
+        self._flight = pose
+        return True
+
+    def landed(self, pose, error) -> None:
+        """The worker finished. **Called from the WORKER thread**, so it only
+        records -- every decision and every line is `drain`'s, on the main
+        thread, where `bpy` and the Log can be touched.
+
+        The result is recorded BEFORE the slot is freed, so a tick that sees
+        the slot free cannot also miss the outcome that freed it.
+        """
+        self._done.append((pose, error))
+        self._flight = None
+
+    def drain(self) -> list:
+        """Main thread: turn what the workers reported into the lines worth
+        saying. This is the only place `succeeded`/`failed` are called from on
+        the continuous path -- handing a pose to a thread is not evidence it
+        arrived, and remembering it at hand-off would silently drop the write
+        that failed."""
+        lines = []
+        while self._done:
+            pose, error = self._done.pop(0)
+            lines += self.failed(error) if error else self.succeeded(pose)
+        return lines
 
     def interval(self) -> float:
         """Seconds until the next look. Backed off only by a FAILED write --

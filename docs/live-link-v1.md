@@ -1767,6 +1767,15 @@ timer the same sink strobes, which is the hardest failure to read and the easies
 broken arithmetic. The enable toggle then gates the timer only, so **ON by default** costs
 nothing when no emulator is running.
 
+⚠ **And, since 2026-08-29, a THIRD door: *Push to PCSX* aims the camera too** —
+ADR-0186 Amendment 16 decision 75, asked for by name once Manual mode existed
+(*"it's basically like the same as if you had automatic on, and did one push of
+everything"*). The leg is unconditional, it does **not** read the continuous
+toggle — that toggle gates the TIMER, and a press is the artist asking — and it
+can never fail a delivered push: a viewport this arithmetic refuses is reported
+as `camera: not aimed -- <why>` under a `FINISHED`. *Match camera* is unchanged;
+it is no longer the only way in.
+
 **3. The centres agree, and the engine's own constant is what makes them.** F20 decomposes the
 GTE translation exactly: `TR = camera_tracked_target − R·work_position`, with
 `camera_tracked_target` = `0x800A77B0` = `{256, 160, 640}`. The `160` at **`0x800A77B4`** *is*
@@ -2436,6 +2445,111 @@ touches no `bpy` and imports only the stdlib, so it could run in a child process
 plain data, and a child process has its own GIL. That is an architecture change with a 50 MB
 pickle on each leg, and it should not be started before someone measures whether 25 % of the
 main thread's Python for a second is something the artist can still feel.
+
+
+### Decision 16 — the camera sync's cost is ROUND TRIPS, not bytes, and its transport runs on a worker
+
+Reported from use, on the continuous camera sync: *"blender is laggy when panning and moving
+the camera and auto sync is on for the camera (which is default - I think) can we do a similar
+kind of async-thing for camera movement - or is that different?"*
+
+**It is different, and the difference is the decision.** Decision 15 found that a worker thread
+does *not* free Blender's UI — the compile was CPU-bound Python holding the GIL, a worker took
+Blender from 586 fps to 8.7, and only numpy fixed it. The obvious reading of the artist's
+question is *"do for the camera what you did for the compile"*, and the obvious reading is
+wrong in both directions: the camera's problem is not the compile's, and the compile's
+treatment is not the camera's. A blocking socket read **releases** the GIL. For this leg the
+thread that failed decision 15 is exactly the right answer.
+
+**The measurement first, against the running emulator — because the plan was wrong.** The
+design read off the source said the cost was the whole-RAM GET, *because it is 2 MB*: decision
+14's table prices one at 31 ms, and `sync_camera` throws its changed-byte count away, so
+deleting the read looked like ~31 ms of ~35 removed for a few lines. That is not what is
+happening. Timing a socket by hand rather than a `urlopen` by wall clock separates the two
+halves, and they are not the halves the plan named:
+
+| request | median time to FIRST byte |
+|---|---|
+| `GET /api/v1/cpu/ram/raw` — 2 MB | **31.9 ms** |
+| `GET /api/v1/gpu/vram/raw` — 1 MB | **32.3 ms** |
+| `GET /api/v1/nonexistent` — a 404 that does **no work at all** | **36.1 ms** |
+| `POST /api/v1/nonexistent` — a 404 that **writes nothing** | **32.3 ms** |
+
+The 2 MB body then streams in **0.5 ms**. So the ~31 ms decision 14 attributed to *"a whole-RAM
+GET"* is not the RAM and not the megabytes — it is a fixed **service wait** every request pays,
+whatever it asks for and whatever it carries. A 404 is as expensive as the whole of main RAM.
+
+**What that makes a camera tick.** `plan_camera` is four runs; the vertical datum sits 42 bytes
+past `work_rotation`, inside `COALESCE_GAP`, so `cluster_writes` merges those two and leaves
+three. One GET plus three POSTs — **four round trips, ~128 ms**, on Blender's own thread, asked
+for every 50 ms. The artist orbiting changes the pose on every single tick by construction, so
+the worst case is the normal case.
+
+**Two of the four candidates die on that table, and one of them is the cheap one.**
+
+* **Dropping the before-image GET is worth zero.** It looked like the cheapest fix by a wide
+  margin. But the GET is what *pays for the clustering*: without an image there is nothing to
+  fill the 42-byte gap from, and stock has no partial GET (`offset`/`size` are on the POST
+  only), so the plan goes out as four separate POSTs. `0 GET + 4 POSTs` is the same four
+  requests as `1 GET + 3 POSTs`. Measured on the rig below: ratio **0.263** against **0.265**.
+* **Keep-alive is worth nothing either.** A fresh TCP connect per request is real, but it is
+  not the cost — the 404 above pays the full wait on a connection that did no work.
+
+**The instrument, and the one thing that makes it honest.** `tests/blender_camera_stall.py`
+is `blender_settle_stall.py`'s shape — a main-thread heartbeat counting Python iterations,
+because Blender's main loop is made of Python entries — driving the tick function the timer
+calls, inside real Blender, with a viewport that orbits every tick. Its stub is
+**latency-matched** to the table above. That is not a detail: a plain `http.server` on loopback
+answers in **1.1 ms** and reports a throughput ratio of **0.96**, i.e. *no bug at all*. The
+fake emulator in `blender_live_push.py` monkeypatches the transport and is blind to this by
+construction, which is why every camera arm that already existed was green throughout.
+
+| | main-thread ratio | achieved sync rate | worst freeze | requests/tick |
+|---|---|---|---|---|
+| the transport on Blender's thread (**seeded**) | **0.250** | 5.4 Hz of 20 | **146 ms** | 4.0 |
+| the transport on a worker | **0.990** | **20.0 Hz** | 6 ms | 1.3 |
+
+The seeded row is kept as an arm (`--seed`), not as a memory: it runs the pre-amendment
+blocking tick and the harness *fails if the floors stay green*, which is the only way a floor
+is shown to be able to go red. 1.3 requests per tick is the coalescing working — 60 ticks
+became 20 writes, each carrying the pose the viewport held at the moment it was sent.
+
+**The decisions the move creates, and they are the risky part.** The transport moving is
+plumbing; what a tick decides while a write is in flight is not. `CameraSyncTicker` gains the
+flight slot, and it stays `bpy`-free and socket-free so plain `pytest` grades it, for the same
+reason the rest of that class is there.
+
+* **One slot, and a tick that finds it taken COALESCES its pose — it does not queue.** A queue
+  would hand the emulator a pose the artist has already orbited past, and at 20 Hz against a
+  128 ms round trip it would grow without bound: the longer the artist moved, the further
+  behind the sync would fall. The drop is free because `wants` never remembered the pose, so
+  the next tick offers wherever the viewport is by then. Same rule as
+  `background_push_start` and `SettleClock._flight`.
+* **The pose is remembered only when the WORKER reports it landed.** Handing a pose to a thread
+  is not evidence it arrived. Remembering it at hand-off would reintroduce, one layer up, the
+  exact defect *"a failed write is not a push"* exists to prevent.
+* **`landed` only records; every line is `drain`'s, on the main thread.** A worker may touch
+  neither `bpy` nor the Log. It appends the result *before* it frees the slot, so a tick that
+  sees the slot free cannot also miss the outcome that freed it.
+* **`reset` frees the slot too**, or toggling the sync off mid-write leaves it claimed and the
+  sync is wedged forever, silently.
+
+**What is deliberately not fixed.** The emulator still sees ~128 ms of latency, and the four
+round trips are still four. Getting below them would mean coalescing writes 251 KB apart into
+one request — a read-modify-write over a quarter of main RAM every tick, which is precisely the
+collateral hazard `COALESCE_GAP`'s comment exists to bound, against an engine that is running.
+That trade is refused, and it is refused *by the artist's own bar*, quoted in decision 15: **the
+UI thread on top; the emulator may lag; the number one goal is to not prevent the artist from
+painting.** Orbiting is the same claim as painting.
+
+**Acceptance is the artist's, not the harness's** — the standing rule in this document, and the
+way decision 15 actually closed (*"its better"*). Four green floors are a precondition for
+asking, not the answer.
+
+**A note for the next reader of decision 14's table.** Its per-trip latencies are right and its
+attribution is not: *"whole-RAM GETs, 16 × 31 ms"* reads as a claim about 2 MB, and the same
+sixteen requests would cost the same 498 ms if they fetched one byte each. Wherever the push's
+traffic is being reasoned about, the quantity that matters is the **number of requests**.
 
 
 ## 5. What is not proven yet

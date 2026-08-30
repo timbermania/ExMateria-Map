@@ -40,7 +40,7 @@ REPORT = TMP / "report.json"
 
 #: A run that stops early has caught nothing. `live_normals_audit.py` learned
 #: this the hard way — it printed PASS directly under "the audit itself broke".
-EXPECTED_CHECKS = 258
+EXPECTED_CHECKS = 274
 
 SCRIPT_TEMPLATE = r'''
 import json
@@ -596,6 +596,23 @@ try:
     def _no_bundle(*a, **k):
         raise AssertionError("the push wrote a bundle")
     export_document.write_bundle = _no_bundle
+
+    # ---- the camera leg is OFF for every geometry arm below --------------
+    # Amendment 16 decision 75 has *Push to PCSX* aim the battle's camera as
+    # part of the same press. `--background` Blender holds a window with a
+    # VIEW_3D area, so `_region_3d` finds a real `region_3d` HERE -- the same
+    # launch artifact `_camera_sync_timer`'s own `bpy.app.background` guard
+    # exists for -- and every arm below would then be graded against RAM
+    # carrying `--factory-startup`'s default view: 26 bytes at the camera
+    # sinks and one more whole-RAM GET, neither of which is the geometry those
+    # arms are about.
+    #
+    # So the leg is turned off by the state the product itself treats as
+    # normal -- no viewport -- and turned back on in its own section below,
+    # against an explicit `FakeView`. That is how every other camera arm in
+    # this file is already driven, and for the same reason.
+    _REAL_REGION_3D = UI._region_3d
+    UI._region_3d = lambda context: None
 
     # ---- refusal 1: no emulator ------------------------------------------
     RAM = fresh_ram()
@@ -1990,6 +2007,11 @@ try:
     # viewport the sync refuses, and whether a match REPORTS a pose that did
     # not land rather than going green over an unchanged picture.
 
+    # The stub above goes back: from here down the section drives the
+    # viewport explicitly, through `Ctx` and `FakeView`, and the panel reads
+    # `_region_3d` to decide whether it has an ortho toggle to draw.
+    UI._region_3d = _REAL_REGION_3D
+
     class Ctx:
         """`bpy.context` with a viewport bolted on.
 
@@ -2229,6 +2251,150 @@ try:
           UI._camera_sync_timer() is None and bytes(RAM.mem) == _before,
           "returning None unregisters it; a tick that ran would have written "
           "the pose of a viewport nobody is looking at")
+
+    # ---- the transport is OFF the main thread (live-link amendment) ------
+    # The cost is round trips, not bytes: every request to pcsx-redux pays a
+    # fixed ~32 ms service wait, and a changed-pose tick makes four of them.
+    # `tests/blender_camera_stall.py` owns that MEASUREMENT, against a
+    # latency-matched stub; what is graded here is that the timer really takes
+    # the background path and that the path's decisions hold inside Blender.
+    RAM = fresh_ram()
+    _bg_ticker = L.CameraSyncTicker()
+    _spawned = []
+    _real_spawn = UI.worker.spawn
+    UI.worker.spawn = lambda name, fn: _spawned.append((name, fn))
+    try:
+        _bg_view = FakeView()
+        _lines = UI.sync_camera_background(L.RamClient, _bg_view,
+                                           ticker=_bg_ticker)
+        check("a background tick hands the transport to a worker and returns "
+              "at once, writing NOTHING on the calling thread",
+              len(_spawned) == 1 and bytes(RAM.mem) == bytes(fresh_ram().mem),
+              f"{len(_spawned)} worker(s), lines {_lines}")
+        check("...through `worker.spawn`, which is what protects the UI's "
+              "share of the GIL",
+              _spawned[0][0].startswith("exmateria-map"), str(_spawned[0][0]))
+
+        # A tick while one is in flight must COALESCE. A queue would send the
+        # emulator a pose the artist has already orbited past, and at 20 Hz
+        # against a ~128 ms round trip it would grow without bound.
+        _bg_view.view_location = _bg_view.view_location.copy()
+        _bg_view.view_location.x += 40.0
+        UI.sync_camera_background(L.RamClient, _bg_view, ticker=_bg_ticker)
+        UI.sync_camera_background(L.RamClient, _bg_view, ticker=_bg_ticker)
+        check("a tick while a write is IN FLIGHT coalesces rather than "
+              "queueing another worker",
+              len(_spawned) == 1, f"{len(_spawned)} workers spawned")
+
+        # Handing a pose to a thread is not evidence it arrived.
+        RAM = fresh_ram()
+        _spawned[0][1]()                       # run the worker's job body
+        check("the worker really does the write it was handed",
+              RAM.read(L.WORK_ROTATION, 6) == struct.pack("<3h", 1024, 0, 0),
+              RAM.read(L.WORK_ROTATION, 6).hex())
+        _said = UI.sync_camera_background(L.RamClient, _bg_view,
+                                          ticker=_bg_ticker)
+        check("...and the next tick drains its result and frees the slot, so "
+              "the sync cannot wedge",
+              len(_spawned) == 2, f"{len(_spawned)} workers spawned")
+    finally:
+        UI.worker.spawn = _real_spawn
+
+    # The timer is what the artist actually runs, and a background tick that
+    # the timer does not call is a fix nobody gets.
+    import inspect as _inspect
+    _timer_src = _inspect.getsource(UI._camera_sync_timer)
+    check("the TIMER takes the background path, not the blocking one",
+          "sync_camera_background" in _timer_src, _timer_src[-260:])
+
+    # ---- Amendment 16 decision 75: one press carries the camera too ------
+    # Asked for by name: *"when I do push to pcsx I want it to move the camera
+    # too -- it's basically like the same as if you had automatic on, and did
+    # one push of everything."* So a press has to deliver what the two tickers
+    # would have delivered between them. Decision 73 said the opposite and is
+    # superseded; these arms are what stops it drifting back.
+    #
+    # The load-bearing half is not that the camera moves -- it is that the new
+    # leg can never take a DELIVERED push down with it. The camera is a
+    # courtesy on top of a delivery that already succeeded, and every way it
+    # can fail has to end in a FINISHED push that says what did not happen.
+    UI._region_3d = lambda context: _view
+    try:
+        RAM = fresh_ram()
+        UI._LAST_PUSH.clear()
+        res, err = push()
+        check("a push FINISHES with the camera leg on", res == {"FINISHED"},
+              f"{res} {err}")
+        # At the SINK, not on the report line: a leg that composed a perfect
+        # message and never reached `client.write` would pass a grep.
+        check("...and the SAME press aimed the battle's camera",
+              RAM.read(L.WORK_ROTATION, 6) == struct.pack("<3h", 1024, 0, 0)
+              and RAM.read(L.WORK_POSITION, 12) == struct.pack(
+                  "<3i", 745472, 19456, 630784),
+              RAM.read(L.WORK_ROTATION, 6).hex())
+        check("...and said so in the same report as the geometry",
+              any("camera: pitch" in ln for ln in last_push())
+              and len(last_push()) > 1, str(last_push()[-3:]))
+        # The zoom dial is the Camera panel's own control. A leg that
+        # hardcoded 1.0 would draw a dial that moves nothing on a push.
+        _prefs_now.live_camera_zoom_dial = 2.0
+        try:
+            RAM = fresh_ram()
+            UI._LAST_PUSH.clear()
+            push()
+            check("...at the artist's zoom dial, not a hardcoded 1.0",
+                  RAM.read(L.SPRITE_SCALE, 4) == struct.pack("<i", 8192),
+                  RAM.read(L.SPRITE_SCALE, 4).hex())
+        finally:
+            _prefs_now.live_camera_zoom_dial = 1.0
+
+        RAM = fresh_ram()
+        UI._LAST_PUSH.clear()
+        # The marker holds the LAST push's lines, so a leg that raised before
+        # `push_report` ran would leave a "not aimed" from the arm above for
+        # the two report arms below to pass on. Clear it, or a fatal leg is
+        # graded by a stale string.
+        ob[UI.LAST_PUSH_KEY] = "[]"
+        UI._region_3d = lambda context: None
+        res, err = push()
+        check("no 3D viewport does not cost the artist the push",
+              res == {"FINISHED"}, f"{res} {err}")
+        check("...and it SAYS the camera was not aimed rather than going "
+              "quiet", any("not aimed" in ln for ln in last_push()),
+              str(last_push()[-3:]))
+
+        # A viewport looking through a scene camera is the one pose the
+        # arithmetic refuses -- `push_camera` RAISES for it, unlike the
+        # ticker's standing offer -- so this is the branch where an unguarded
+        # leg would turn a delivered push into a red operator.
+        RAM = fresh_ram()
+        UI._LAST_PUSH.clear()
+        ob[UI.LAST_PUSH_KEY] = "[]"
+        UI._region_3d = lambda context: FakeView(perspective="CAMERA")
+        _cam_before = RAM.read(L.WORK_ROTATION, 6)
+        res, err = push()
+        check("a viewport the arithmetic REFUSES does not cost it either",
+              res == {"FINISHED"}, f"{res} {err}")
+        check("...and the refusal reaches the report, with its reason",
+              any("not aimed" in ln for ln in last_push()), str(last_push()))
+        check("...and nothing was written to the camera sinks",
+              RAM.read(L.WORK_ROTATION, 6) == _cam_before,
+              RAM.read(L.WORK_ROTATION, 6).hex())
+
+        # The other direction, which is the one an artist would notice: the
+        # emulator never got the map, so aiming at it would point the battle
+        # camera at geometry that is not there.
+        RAM = fresh_ram()
+        RAM.up = False
+        UI._LAST_PUSH.clear()
+        UI._region_3d = lambda context: _view
+        _all_before = bytes(RAM.mem)
+        res, err = push()
+        check("a REFUSED push does not aim the camera",
+              res == {"CANCELLED"} and bytes(RAM.mem) == _all_before,
+              f"{res} {err}")
+    finally:
+        UI._region_3d = lambda context: None
 
     # ---- decision 13: isolate the map ------------------------------------
     # An ACT, not a ticker. The walk and the gate arithmetic are the core's and
